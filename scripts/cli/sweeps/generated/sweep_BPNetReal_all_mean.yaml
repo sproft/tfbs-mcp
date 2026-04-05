@@ -1,0 +1,44 @@
+program: /sc-projects/sc-proj-cc17-P09_TFBS/scripts/cli/train_cli.py
+method: bayes
+metric:
+  goal: minimize
+  name: val_loss
+parameters:
+  model.n_filters:
+    distribution: int_uniform
+    min: 32
+    max: 128
+  model.n_layers:
+    distribution: int_uniform
+    min: 4
+    max: 16
+  model.n_control_tracks:
+    distribution: int_uniform
+    min: 0
+    max: 1
+  model.count_output_bias:
+    distribution: categorical
+    values:
+      - true
+      - false
+
+early_terminate:
+  type: hyperband
+  s: 2
+  eta: 3
+  max_iter: 27
+
+command:
+- ${env}
+- /home/profts/.conda/envs/mamba/envs/sams/bin/python
+- ${program}
+- fit
+- --model=BPNetReal
+- --model.input_length=24
+- --data.data_path=/sc-projects/sc-proj-cc17-P09_TFBS/data/tensors/all_mean
+- --data.scaling_method=standardize
+- --trainer=/sc-projects/sc-proj-cc17-P09_TFBS/scripts/cli/yamls/trainers/default.yaml
+- --trainer.logger.init_args.project=P09_all_mean_standardize_BPNetReal
+- --trainer.callbacks.init_args.dirpath=/sc-projects/sc-proj-cc17-P09_TFBS/saved_models_tuned/all_mean/standardize
+- --trainer.callbacks.init_args.filename=best_BPNetReal
+- ${args}

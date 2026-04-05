@@ -1,0 +1,3 @@
+sbatch do_train_all_core.sh
+sbatch do_train_all_flanking.sh
+sbatch do_train_all_all.sh

@@ -1,0 +1,4 @@
+model:
+  class_path: SimpleCNN
+  init_args:
+    input_length: 70

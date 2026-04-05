@@ -1,0 +1,102 @@
+program: run_sweep.py
+method: bayes
+metric:
+  name: val_loss
+  goal: minimize
+parameters:
+  # --- General/Optimizer Parameters ---
+  lr:
+    distribution: log_uniform_values
+    min: 0.00001 # FIXED: Using standard float notation (1e-5)
+    max: 0.001 # FIXED: Using standard float notation (1e-3)
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.000001 # FIXED: Using standard float notation (1e-6)
+    max: 0.0001 # FIXED: Using standard float notation (1e-4)
+  dropout:
+    distribution: uniform
+    min: 0.1
+    max: 0.5
+    
+  # Fixed parameters passed via CLI in the SLURM script need to be included 
+  # here with a placeholder value, or the WandB agent will complain about 
+  # missing keys when checking the fixed_config arguments.
+  model:
+    value: RNN # Placeholder
+  data_path:
+    value: /path/
+  data_name:
+    value: data
+  scaling_method:
+    value: standardize
+  batch_size:
+    value: 64
+  checkpoint_dir:
+    value: /path/
+  wandb_project:
+    value: ProjectName
+
+  # --- RNN Specific Parameters (Using 'RNN_' prefix for clarity/isolation) ---
+  conv_out_channels: # Changed from RNN_conv_out_channels to match python code (config.conv_out_channels)
+    distribution: int_uniform
+    min: 64
+    max: 256
+  RNN_kernel_size:
+    distribution: categorical
+    values: [5, 9, 13]
+  pool_size: # Changed from RNN_pool_size to match python code (config.pool_size)
+    distribution: categorical
+    values: [2, 4]
+  dropout_conv:
+    distribution: uniform
+    min: 0.1
+    max: 0.5
+  gru_hidden_size:
+    distribution: int_uniform
+    min: 64
+    max: 256
+  gru_num_layers:
+    distribution: categorical
+    values: [1, 2, 3]
+  bidirectional:
+    distribution: categorical
+    values: [True, False]
+  RNN_dense_size:
+    distribution: int_uniform
+    min: 64
+    max: 256
+  dropout_fc:
+    distribution: uniform
+    min: 0.3
+    max: 0.7
+
+  # --- VCNNBpnet Specific Parameters (Multi-part and Prefixed) ---
+  num_channels: # Changed from VCNN_num_channels to match python code (config.num_channels)
+    distribution: int_uniform
+    min: 32
+    max: 128
+  VCNN_kernel_size:
+    distribution: categorical
+    values: [15, 21, 25]
+  pool_output_size: # Changed from VCNN_pool_output_size to match python code (config.pool_output_size)
+    distribution: int_uniform
+    min: 64
+    max: 256
+  VCNN_dense_size_1:
+    distribution: int_uniform
+    min: 64
+    max: 256
+  VCNN_dense_size_2:
+    distribution: int_uniform
+    min: 32
+    max: 128
+
+  # --- BPNetReal Specific Parameters ---
+  BPNet_n_filters:
+    distribution: categorical
+    values: [32, 64, 96, 128]
+  BPNet_n_layers:
+    distribution: categorical
+    values: [4, 6, 8, 10]
+  BPNet_count_output_bias:
+    value: True

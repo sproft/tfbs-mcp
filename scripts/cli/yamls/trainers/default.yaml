@@ -1,0 +1,19 @@
+max_epochs: 500
+num_nodes: 1
+log_every_n_steps: 10
+callbacks:
+  - class_path: pytorch_lightning.callbacks.EarlyStopping
+    init_args:
+      monitor: val_loss
+      patience: 5
+  - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+    init_args:
+      monitor: val_loss
+      mode: min
+      save_top_k: 1
+      dirpath: /sc-projects/sc-proj-cc17-P09_TFBS/saved_models/test
+      filename: "best_model_{epoch:02d}-{val_loss:.2f}"
+logger:
+  - class_path: pytorch_lightning.loggers.WandbLogger
+    init_args:
+      project: test

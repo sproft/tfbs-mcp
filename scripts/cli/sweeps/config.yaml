@@ -1,0 +1,129 @@
+# pytorch_lightning==2.5.0.post0
+seed_everything: 42
+trainer:
+  accelerator: auto
+  strategy: auto
+  devices: auto
+  num_nodes: 1
+  precision: null
+  logger:
+  - class_path: pytorch_lightning.loggers.WandbLogger
+    init_args:
+      name: null
+      save_dir: .
+      version: null
+      offline: false
+      dir: null
+      id: null
+      anonymous: null
+      project: P09_combined_mean_standardize_RNN
+      log_model: false
+      experiment: null
+      prefix: ''
+      checkpoint_name: null
+      job_type: null
+      config: null
+      entity: null
+      reinit: null
+      tags: null
+      group: null
+      notes: null
+      magic: null
+      config_exclude_keys: null
+      config_include_keys: null
+      mode: null
+      allow_val_change: null
+      resume: null
+      force: null
+      tensorboard: null
+      sync_tensorboard: null
+      monitor_gym: null
+      save_code: null
+      fork_from: null
+      resume_from: null
+      settings: null
+  callbacks:
+  - class_path: pytorch_lightning.callbacks.EarlyStopping
+    init_args:
+      monitor: val_loss
+      min_delta: 0.0
+      patience: 5
+      verbose: false
+      mode: min
+      strict: true
+      check_finite: true
+      stopping_threshold: null
+      divergence_threshold: null
+      check_on_train_epoch_end: null
+      log_rank_zero_only: false
+  - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+    init_args:
+      dirpath: /sc-projects/sc-proj-cc17-P09_TFBS/saved_models_tuned/combined_mean/standardize
+      filename: best_RNN
+      monitor: val_loss
+      verbose: false
+      save_last: null
+      save_top_k: 1
+      save_weights_only: false
+      mode: min
+      auto_insert_metric_name: true
+      every_n_train_steps: null
+      train_time_interval: null
+      every_n_epochs: null
+      save_on_train_epoch_end: null
+      enable_version_counter: true
+  fast_dev_run: false
+  max_epochs: 500
+  min_epochs: null
+  max_steps: -1
+  min_steps: null
+  max_time: null
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: null
+  log_every_n_steps: 10
+  enable_checkpointing: null
+  enable_progress_bar: null
+  enable_model_summary: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: null
+  gradient_clip_algorithm: null
+  deterministic: null
+  benchmark: null
+  inference_mode: true
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: null
+data:
+  data_path: /sc-projects/sc-proj-cc17-P09_TFBS/data/tensors/combined_mean
+  batch_size: 64
+  num_workers: 24
+  preprocess: false
+  scaling_method: standardize
+ckpt_path: null
+model:
+  class_path: classes.nn.models.RNN
+  init_args:
+    input_channels: 4
+    conv_out_channels: 180
+    kernel_size: 9
+    pool_size: 2
+    dropout_conv: 0.21326683035009553
+    gru_hidden_size: 177
+    gru_num_layers: 1
+    bidirectional: true
+    dense_size: 163
+    dropout_fc: 0.05040591871818256
+    input_length: 24
+    learning_rate: 0.001
+    classify: false
