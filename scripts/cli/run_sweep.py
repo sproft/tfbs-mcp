@@ -11,14 +11,9 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
-# Assume the project structure is preserved for imports
-project_root = os.path.abspath(os.path.join(os.getcwd(), '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
 # Local Imports
-from classes.dataloaders.SeqDataset import TFBSDataModule
-from classes.nn import models
+from tfbs.dataloaders.SeqDataset import TFBSDataModule
+from tfbs.nn import models
 
 # Initialize WandB for logging
 import wandb

@@ -112,7 +112,7 @@ data:
   scaling_method: standardize
 ckpt_path: null
 model:
-  class_path: classes.nn.models.VCNNBpnet
+  class_path: tfbs.nn.models.VCNNBpnet
   init_args:
     input_channels: 4
     num_channels: 82

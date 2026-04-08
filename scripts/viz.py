@@ -16,14 +16,9 @@ import re
 import html
 import pathlib
 
-# Assume the project structure is preserved for imports
-project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
 # Custom model classes and tangermeme imports
 try:
-    import classes.nn.models as models
+    import tfbs.nn.models as models
     from captum.attr import DeepLiftShap, InputXGradient
     
     # Import necessary functions from tangermeme
