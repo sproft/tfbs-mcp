@@ -92,7 +92,7 @@ class AnalysisConfig:
                             help="If set, uses Tangermeme's DeepLiftShap implementation instead of Captum's.")
         # New CLI arg to pick analyses
         parser.add_argument('--analyses', type=str, default='all',
-                            help="Comma-separated list of analyses to run. Options: sequence,marginalization,seqlet,mutagenesis,rc,epistasis,epistasis_3d,comparison,conv_filters. Default: all")
+                    help="Comma-separated list of analyses to run. Options: sequence,marginalization,seqlet,mutagenesis,rc,epistasis,epistasis_3d,comparison,conv_filters,ambiguous_sequence,tad_scan. Default: all")
         parser.add_argument('--max-seqs', type=int, default=100,
                             help="Maximum number of sequences to process for genome-wide analyses (default: 100).")
         parser.add_argument('--html-report', action='store_true',
@@ -379,6 +379,29 @@ class DataPreparer:
         self.input_length = input_length
         self.device = device
 
+    def get_ambiguous_sequence(self) -> str:
+        """Returns the built-in ambiguous sequence template used for expansion analyses."""
+        return "CACTGNNNNNNNNNGTGTTCTTGA"
+
+    def get_tad_region(self) -> Tuple[str, int, int, str]:
+        """Returns the built-in genomic region used for the TAD scan analysis."""
+        return "chr14", 36000000, 37250000, "LARGE_TAD"
+
+    def fetch_genomic_region_sequence(self, genome_fasta: str, chrom: str, start: int, end: int) -> str:
+        """Fetches a genomic interval from the reference genome as an uppercase DNA string."""
+        from pyfaidx import Fasta
+
+        genome = Fasta(genome_fasta, as_raw=True, sequence_always_upper=True)
+        return str(genome[chrom][start:end])
+
+    def split_sequence_into_chunks(self, sequence: str, chunk_size: int, step_size: int = 1) -> List[Tuple[int, str]]:
+        """Splits a sequence into sliding chunks of fixed size."""
+        chunks = []
+        for chunk_start in range(0, len(sequence) - chunk_size + 1, step_size):
+            chunk_end = chunk_start + chunk_size
+            chunks.append((chunk_start, sequence[chunk_start:chunk_end]))
+        return chunks
+
     def get_consensus_sequence(self) -> str:
         """Returns a fixed consensus sequence truncated to input_length."""
         original_consensus_seqs = {
@@ -405,6 +428,33 @@ class DataPreparer:
                 return default_long_seq[start:start + self.input_length]
             else:
                 raise ValueError("Consensus sequence for length 70 is missing.")
+
+    def expand_ambiguous_sequence(self, sequence: str) -> List[str]:
+        """Expand a sequence containing N into all concrete A/C/G/T sequences."""
+        cleaned_sequence = sequence.strip().upper()
+        if len(cleaned_sequence) != self.input_length:
+            raise ValueError(
+                f"Ambiguous sequence length must match input_length ({self.input_length}); got {len(cleaned_sequence)}."
+            )
+
+        invalid_bases = sorted(set(re.sub(r"[ACGTN]", "", cleaned_sequence)))
+        if invalid_bases:
+            raise ValueError(
+                f"Ambiguous sequence contains invalid characters: {''.join(invalid_bases)}. Only A, C, G, T, and N are allowed."
+            )
+
+        n_positions = [index for index, base in enumerate(cleaned_sequence) if base == 'N']
+        if not n_positions:
+            return [cleaned_sequence]
+
+        concrete_sequences = []
+        for replacement_bases in itertools.product('ACGT', repeat=len(n_positions)):
+            seq_list = list(cleaned_sequence)
+            for position, base in zip(n_positions, replacement_bases):
+                seq_list[position] = base
+            concrete_sequences.append(''.join(seq_list))
+
+        return concrete_sequences
 
     def load_promotor_sequences(self) -> Tuple[torch.Tensor, List[str]]:
         """Loads the collection of test sequences and names."""
@@ -615,6 +665,8 @@ class GenomicInterpreter:
         if 'all' in requested:
             order = [
                 ('sequence', self.run_sequence_analysis),
+                ('ambiguous_sequence', self.run_ambiguous_sequence_analysis),
+                ('tad_scan', self.run_tad_scan_analysis),
                 ('marginalization', self.run_marginalization_analysis),
                 ('seqlet', self.run_seqlet_analysis),
                 ('mutagenesis', self.run_mutagenesis_analysis),
@@ -627,6 +679,8 @@ class GenomicInterpreter:
         else:
             mapping = {
                 'sequence': self.run_sequence_analysis,
+                'ambiguous_sequence': self.run_ambiguous_sequence_analysis,
+                'tad_scan': self.run_tad_scan_analysis,
                 'marginalization': self.run_marginalization_analysis,
                 'seqlet': self.run_seqlet_analysis,
                 'mutagenesis': self.run_mutagenesis_analysis,
@@ -695,6 +749,185 @@ class GenomicInterpreter:
         #     self._plot_attributions(X_attr_maria, names, "DeepLiftShap")
         # else:
         #     print("Skipping Maria sequence analysis (no sequences loaded).")
+
+    def run_ambiguous_sequence_analysis(self):
+        """Expands an N-containing sequence, predicts all variants, and plots DeepLiftShap for each one."""
+        print("\n" + "="*50)
+        print("--- 2. Ambiguous Sequence Expansion (Prediction + DeepLiftShap) ---")
+
+        ambiguous_sequence = self.data_prep.get_ambiguous_sequence()
+        print(f"Using built-in ambiguous sequence template: {ambiguous_sequence}")
+
+        concrete_sequences = self.data_prep.expand_ambiguous_sequence(ambiguous_sequence)
+        print(f"Expanded ambiguous sequence into {len(concrete_sequences)} concrete sequences.")
+
+        sequence_records = []
+        expanded_tensors = []
+
+        for index, sequence in enumerate(concrete_sequences, start=1):
+            sequence_name = f"Ambiguous_Seq_{index:03d}"
+            X_sequence = one_hot_encode(sequence).unsqueeze(0).float().to(self.device)
+            expanded_tensors.append(X_sequence)
+
+            prediction = tpred(self.model, X_sequence, device=self.device).detach().cpu().numpy().item()
+            sequence_records.append({
+                "Sequence_Name": sequence_name,
+                "Sequence": sequence,
+                "Prediction": prediction,
+            })
+            print(f"{sequence_name}: {sequence} -> Prediction = {prediction:.4f}")
+
+        if self.config.output_dir:
+            pred_df = pd.DataFrame(sequence_records)
+            pred_path = os.path.join(self.config.output_dir, "ambiguous_sequence_predictions.csv")
+            pred_df.to_csv(pred_path, index=False)
+            print(f"Ambiguous sequence predictions saved to: {pred_path}")
+
+        X_expanded = torch.cat(expanded_tensors, dim=0)
+        X_attr = self.attr_core.run_deep_lift_shap(X_expanded, self.config.n_shuffles, verbose=True)
+
+        for index, record in enumerate(sequence_records):
+            plt.figure(figsize=(10, 2))
+            ax = plt.subplot(111)
+            plot_logo(X_attr[index].detach().cpu().numpy().astype(float), ax=ax)
+            plt.xlabel("Genomic Position")
+            plt.ylabel("Attribution")
+            plt.title(f"DeepLiftShap Attributions for {record['Sequence_Name']}")
+            plt.tight_layout()
+            save_or_show_plot(f"DeepLiftShap_{record['Sequence_Name']}.png", self.config.output_dir)
+
+    def run_tad_scan_analysis(self):
+        """Scans the built-in TAD region with overlapping 24-mers and writes a summary heatmap."""
+        print("\n" + "="*50)
+        print("--- 3. TAD 24-mer Scan (Prediction + DeepLiftShap Summary) ---")
+
+        if not self.config.output_dir:
+            print("Skipping TAD scan because --output-dir was not provided. This analysis writes a summary figure.")
+            return
+
+        chrom, region_start, region_end, region_name = self.data_prep.get_tad_region()
+        region_sequence = self.data_prep.fetch_genomic_region_sequence(
+            self.config.genome_fasta,
+            chrom,
+            region_start,
+            region_end,
+        )
+
+        window_size = self.config.input_length
+        chunks = self.data_prep.split_sequence_into_chunks(region_sequence, window_size, step_size=1)
+
+        print(
+            f"Loaded {region_name}: {chrom}:{region_start}-{region_end} ({len(region_sequence)} bp). "
+            f"Generated {len(chunks)} overlapping {window_size}-mers with step 1."
+        )
+
+        if not chunks:
+            print("No full 24-mer windows could be generated from the TAD region.")
+            return
+
+        batch_size = 256
+        prediction_records = []
+        attribution_rows: List[np.ndarray] = []
+        window_starts: List[int] = []
+        prediction_values: List[float] = []
+
+        for batch_start in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[batch_start:batch_start + batch_size]
+            batch_sequences = [sequence for _, sequence in batch_chunks]
+
+            X_batch = torch.stack([one_hot_encode(sequence) for sequence in batch_sequences]).float().to(self.device)
+            batch_predictions = tpred(self.model, X_batch, device=self.device).detach().cpu().view(-1).numpy()
+
+            batch_attributions = self.attr_core.run_deep_lift_shap(X_batch, self.config.n_shuffles, verbose=False)
+
+            for local_index, (offset, sequence) in enumerate(batch_chunks):
+                genomic_start = region_start + offset
+                genomic_end = genomic_start + window_size
+                prediction_value = float(batch_predictions[local_index])
+
+                prediction_records.append({
+                    "Region": region_name,
+                    "Chromosome": chrom,
+                    "Start": genomic_start,
+                    "End": genomic_end,
+                    "Sequence": sequence,
+                    "Prediction": prediction_value,
+                })
+                attribution_rows.append(batch_attributions[local_index].detach().cpu().numpy().astype(float).sum(axis=0))
+                window_starts.append(genomic_start)
+                prediction_values.append(prediction_value)
+
+            print(f"Processed {min(batch_start + batch_size, len(chunks))}/{len(chunks)} TAD windows.")
+
+        prediction_df = pd.DataFrame(prediction_records)
+        prediction_path = os.path.join(self.config.output_dir, "tad_24mer_predictions.csv")
+        prediction_df.to_csv(prediction_path, index=False)
+        print(f"TAD 24-mer predictions saved to: {prediction_path}")
+
+        attribution_matrix = np.vstack(attribution_rows)
+        heatmap_path = os.path.join(self.config.output_dir, "tad_24mer_summary_heatmap.png")
+
+        prediction_matrix = np.asarray(prediction_values, dtype=float)[np.newaxis, :]
+
+        fig, (ax_pred, ax_heat) = plt.subplots(2, 1, figsize=(16, 10), constrained_layout=True)
+
+        if prediction_matrix.size:
+            pred_min = float(np.min(prediction_matrix))
+            pred_max = float(np.max(prediction_matrix))
+            pred_center = float(np.median(prediction_matrix))
+            pred_norm = None if pred_min == pred_max else TwoSlopeNorm(vmin=pred_min, vcenter=pred_center, vmax=pred_max)
+        else:
+            pred_norm = None
+
+        pred_im = ax_pred.imshow(
+            prediction_matrix,
+            aspect="auto",
+            origin="lower",
+            cmap="viridis",
+            norm=pred_norm,
+            interpolation="nearest",
+        )
+        ax_pred.set_title(f"{region_name} prediction intensity across overlapping {window_size}-mers")
+        ax_pred.set_ylabel("Prediction")
+        ax_pred.set_yticks([])
+
+        max_abs_attr = float(np.max(np.abs(attribution_matrix))) if attribution_matrix.size else 1.0
+        if max_abs_attr == 0:
+            max_abs_attr = 1.0
+        norm = TwoSlopeNorm(vmin=-max_abs_attr, vcenter=0, vmax=max_abs_attr)
+
+        im = ax_heat.imshow(
+            attribution_matrix,
+            aspect="auto",
+            origin="lower",
+            cmap="coolwarm",
+            norm=norm,
+            interpolation="nearest",
+        )
+        ax_heat.set_title(f"{region_name} signed DeepLiftShap summary heatmap")
+        ax_heat.set_xlabel("Position within 24-mer")
+        ax_heat.set_ylabel("Window start position")
+
+        x_tick_positions = np.arange(0, window_size, 4)
+        ax_heat.set_xticks(x_tick_positions)
+        ax_heat.set_xticklabels([str(pos + 1) for pos in x_tick_positions])
+
+        if len(window_starts) > 10:
+            y_tick_positions = np.linspace(0, len(window_starts) - 1, 8, dtype=int)
+        else:
+            y_tick_positions = np.arange(len(window_starts))
+        ax_heat.set_yticks(y_tick_positions)
+        ax_heat.set_yticklabels([str(window_starts[pos]) for pos in y_tick_positions])
+
+        pred_cbar = fig.colorbar(pred_im, ax=ax_pred, fraction=0.025, pad=0.04)
+        pred_cbar.set_label("Prediction intensity")
+
+        attr_cbar = fig.colorbar(im, ax=ax_heat, fraction=0.025, pad=0.04)
+        attr_cbar.set_label("Signed summed DeepLiftShap attribution")
+
+        plt.savefig(heatmap_path, bbox_inches="tight")
+        print(f"TAD summary heatmap saved to: {heatmap_path}")
+        plt.close(fig)
 
         # Medium Maria sequences
         print("\n" + "="*50)
