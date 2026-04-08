@@ -39,7 +39,8 @@ sys.modules['tangermeme.ism'] = mock_ism
 sys.modules['captum'] = types.ModuleType('captum')
 sys.modules['captum.attr'] = types.ModuleType('captum.attr')
 
-# Import the module under test
+# Ensure the scripts directory is importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 viz = importlib.import_module("scripts.viz")
 
 def test_get_consensus_sequence_exact_match():

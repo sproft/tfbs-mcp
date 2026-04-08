@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tfbs-nn"
+version = "0.1.0"
+description = "Neural network models for transcription factor binding site prediction"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "pytorch-lightning>=2.0",
+    "torchmetrics>=1.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+viz = [
+    "captum>=0.7",
+    "tangermeme>=0.4",
+    "logomaker>=0.8",
+    "seaborn>=0.13",
+]
+genomics = [
+    "pyfaidx>=0.7",
+    "tangermeme>=0.4",
+]
+tracking = [
+    "wandb>=0.16",
+]
+dev = [
+    "pytest>=7.0",
+]
+all = [
+    "tfbs-nn[viz,genomics,tracking,dev]",
+]
+
+[project.scripts]
+tfbs-train = "scripts.cli.train_cli:cli_main"
+tfbs-predict = "tfbs.predict:main"
+
+[tool.setuptools.packages.find]
+include = ["tfbs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

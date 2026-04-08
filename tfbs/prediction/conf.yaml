@@ -1,0 +1,145 @@
+# -----------------------------------------------------------------
+# Configuration for ChIP-seq Analysis Pipeline
+# -----------------------------------------------------------------
+# Store paths and model details here to avoid hardcoding them in scripts.
+
+# Path to the reference genome FASTA file
+genome_fasta_path: "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa"
+
+# --- Model Definitions ---
+# Each key is a unique model name used with the --model_name argument.
+# 'path': Full path to the model checkpoint (.ckpt) file.
+# 'type': The model class to use ('SimpleCNN' or 'EquiNet').
+
+models:
+  # Standard Models
+  all_0.5:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.5/best_SimpleCNN_epoch=07-val_loss=0.1111.ckpt"
+    type: "SimpleCNN"
+  core_0.1:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.1/best_SimpleCNN_epoch=39-val_loss=0.0623.ckpt"
+    type: "SimpleCNN"
+  core_0.2:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.2/best_SimpleCNN_epoch=45-val_loss=0.0354.ckpt"
+    type: "SimpleCNN"
+  flank_0.1:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.1/best_SimpleCNN_epoch=07-val_loss=0.1952.ckpt"
+    type: "SimpleCNN"
+  flank_0.2:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.2/best_SimpleCNN_epoch=13-val_loss=0.1353.ckpt"
+    type: "SimpleCNN"
+
+  # Short Models
+  all_0.5_short:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.5_short/best_SimpleCNN_epoch=05-val_loss=0.1128.ckpt"
+    type: "SimpleCNN"
+  core_0.1_short:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.1_short/best_SimpleCNN_epoch=47-val_loss=0.0521.ckpt"
+    type: "SimpleCNN"
+  core_0.2_short:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.2_short/best_SimpleCNN_epoch=29-val_loss=0.0373.ckpt"
+    type: "SimpleCNN"
+  flank_0.1_short:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.1_short/best_SimpleCNN_epoch=20-val_loss=0.1919.ckpt"
+    type: "SimpleCNN"
+  flank_0.2_short:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.2_short/best_SimpleCNN_epoch=08-val_loss=0.1333.ckpt"
+    type: "SimpleCNN"
+
+  # Equivariant Models
+  all_0.5_equi:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.5/best_EquiNet_epoch=19-val_loss=0.1264.ckpt"
+    type: "EquiNet"
+  core_0.1_equi:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.1/best_EquiNet_epoch=45-val_loss=0.2723.ckpt"
+    type: "EquiNet"
+  core_0.2_equi:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.2/best_EquiNet_epoch=75-val_loss=0.1392.ckpt"
+    type: "EquiNet"
+  flank_0.1_equi:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.1/best_EquiNet_epoch=16-val_loss=0.2556.ckpt"
+    type: "EquiNet"
+  flank_0.2_equi:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.2/best_EquiNet_epoch=15-val_loss=0.2138.ckpt"
+    type: "EquiNet"
+
+  # Subtraction Models
+  all_0.5_sub:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.5_subtraction/best_SimpleCNN_epoch=00-val_loss=17.0385.ckpt"
+    type: "SimpleCNN"
+  core_0.1_sub:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.1_subtraction/best_SimpleCNN_epoch=17-val_loss=613095047168.0000.ckpt"
+    type: "SimpleCNN"
+  core_0.2_sub:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.2_subtraction/best_SimpleCNN_epoch=09-val_loss=9990773760.0000.ckpt"
+    type: "SimpleCNN"
+  flank_0.1_sub:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.1_subtraction/best_SimpleCNN_epoch=24-val_loss=408.4007.ckpt"
+    type: "SimpleCNN"
+  flank_0.2_sub:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.2_subtraction/best_SimpleCNN_epoch=21-val_loss=419.6168.ckpt"
+    type: "SimpleCNN"
+
+  # Proportion Score Models
+  all_0.5_prop:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.5_proportion_score/best_SimpleCNN_epoch=13-val_loss=0.4660.ckpt"
+    type: "SimpleCNN"
+  core_0.1_prop:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.1_proportion_score/best_SimpleCNN_epoch=37-val_loss=3.5079.ckpt"
+    type: "SimpleCNN"
+  core_0.2_prop:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.2_proportion_score/best_SimpleCNN_epoch=15-val_loss=0.0658.ckpt"
+    type: "SimpleCNN"
+  flank_0.1_prop:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.1_proportion_score/best_SimpleCNN_epoch=04-val_loss=0.0087.ckpt"
+    type: "SimpleCNN"
+  flank_0.2_prop:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.2_proportion_score/best_SimpleCNN_epoch=02-val_loss=0.0099.ckpt"
+    type: "SimpleCNN"
+
+  # 24 Models
+  all_0.1_24:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.1_24/best_SimpleCNN_epoch=14-val_loss=0.0071.ckpt"
+    type: "SimpleCNN"
+  all_0.2_24:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.2_24/best_SimpleCNN_epoch=05-val_loss=0.0045.ckpt"
+    type: "SimpleCNN"
+  all_0.5_24:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.5_24/best_SimpleCNN_epoch=13-val_loss=0.0026.ckpt"
+    type: "SimpleCNN"
+  core_0.1_24:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.1_24/best_SimpleCNN_epoch=66-val_loss=0.0017.ckpt"
+    type: "SimpleCNN"
+  core_0.2_24:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.2_24/best_SimpleCNN_epoch=60-val_loss=0.0017.ckpt"
+    type: "SimpleCNN"
+  flank_0.1_24:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.1_24/best_SimpleCNN_epoch=10-val_loss=0.0014.ckpt"
+    type: "SimpleCNN"
+  flank_0.2_24:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.2_24/best_SimpleCNN_epoch=07-val_loss=0.0008.ckpt"
+    type: "SimpleCNN"
+
+  # 24_rc Models
+  all_0.1_24_rc:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.1_24_rc/best_SimpleCNN_epoch=15-val_loss=0.0072.ckpt"
+    type: "SimpleCNN"
+  all_0.2_24_rc:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.2_24_rc/best_SimpleCNN_epoch=12-val_loss=0.0044.ckpt"
+    type: "SimpleCNN"
+  all_0.5_24_rc:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/all_0.5_24_rc/best_SimpleCNN_epoch=05-val_loss=0.0026.ckpt"
+    type: "SimpleCNN"
+  core_0.1_24_rc:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.1_24_rc/best_SimpleCNN_epoch=51-val_loss=0.0020.ckpt"
+    type: "SimpleCNN"
+  core_0.2_24_rc:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/core_0.2_24_rc/best_SimpleCNN_epoch=54-val_loss=0.0018.ckpt"
+    type: "SimpleCNN"
+  flank_0.1_24_rc:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.1_24_rc/best_SimpleCNN_epoch=23-val_loss=0.0014.ckpt"
+    type: "SimpleCNN"
+  flank_0.2_24_rc:
+    path: "/sc-projects/sc-proj-cc17-P09_TFBS/saved_models/flank_0.2_24_rc/best_SimpleCNN_epoch=03-val_loss=0.0009.ckpt"
+    type: "SimpleCNN"
+

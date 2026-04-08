@@ -18,7 +18,6 @@ Key functionalities:
 
 import argparse
 import os
-import sys
 from pathlib import Path
 from typing import List, Tuple
 
@@ -256,22 +255,9 @@ def main() -> None:
     parser.add_argument('--window_size', type=int, default=70,
                         help='Sliding window size for model input.')
     
-    # Add this argument if you need to locate a local 'classes' module
-    parser.add_argument('--project_root', type=Path, default='../',
-                        help='Path to the project root directory containing the "classes" module.')
-
     args = parser.parse_args()
 
-    # Dynamically import the models module
-    project_root = args.project_root.resolve()
-    if str(project_root) not in sys.path:
-        sys.path.append(str(project_root))
-    try:
-        import classes.nn.models as models
-    except ImportError:
-        print(f"Error: Could not import 'classes.nn.models' from '{project_root}'.")
-        print("Please ensure --project_root points to the correct directory.")
-        sys.exit(1)
+    import tfbs.nn.models as models
 
     # --- Load Model ---
     print(f"Loading model '{args.model_type}' from '{args.model_path}'")

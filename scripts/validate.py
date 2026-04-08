@@ -1,17 +1,11 @@
 import argparse
 import os
-import sys
 import torch
 import pytorch_lightning as pl
-import csv # Import the csv module for writing results
+import csv
 
-# 1. Add current directory to path to allow importing the DataModule
-# and the models file we just created.
-# Assuming 'tfbs_datamodule.py' and 'models.py' are in the same directory.
-# If they are not, you would need to adjust the path or module structure.
-sys.path.append(os.path.dirname("../"))
-from classes.dataloaders.SeqDataset import TFBSDataModule
-import classes.nn.models as models # Import a sample model class
+from tfbs.dataloaders.SeqDataset import TFBSDataModule
+import tfbs.nn.models as models
 
 
 # --- Helper function to dynamically retrieve the Model class ---
