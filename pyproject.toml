@@ -34,19 +34,23 @@ genomics = [
 tracking = [
     "wandb>=0.16",
 ]
+mcp = [
+    "mcp>=1.0",
+]
 dev = [
     "pytest>=7.0",
 ]
 all = [
-    "tfbs-nn[viz,genomics,tracking,dev]",
+    "tfbs-nn[viz,genomics,tracking,mcp,dev]",
 ]
 
 [project.scripts]
 tfbs-train = "scripts.cli.train_cli:cli_main"
 tfbs-predict = "tfbs.predict:main"
+tfbs-mcp = "tfbs.mcp.server:main"
 
 [tool.setuptools.packages.find]
-include = ["tfbs*"]
+include = ["tfbs*", "classes*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
