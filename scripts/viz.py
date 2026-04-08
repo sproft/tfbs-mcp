@@ -37,7 +37,7 @@ try:
     import seaborn
     seaborn.set_style('whitegrid')
 except ImportError as e:
-    print(f"Failed to import necessary libraries. Please ensure 'tangermeme', 'captum', and your local 'classes.nn.models' are installed and accessible.")
+    print(f"Failed to import necessary libraries. Please ensure 'tangermeme', 'captum', and 'tfbs' are installed (pip install '.[viz]').")
     print(f"Error: {e}")
     sys.exit(1)
 
@@ -186,7 +186,7 @@ class ModelLoader:
             model = model_cls.load_from_checkpoint(self.config.model_path)
             
         except AttributeError:
-            raise RuntimeError(f"Model type '{self.config.model_type}' not found in 'classes.nn.models'.")
+            raise RuntimeError(f"Model type '{self.config.model_type}' not found in 'tfbs.nn.models'.")
         except FileNotFoundError:
             raise RuntimeError(f"Model checkpoint not found at {self.config.model_path}")
         except Exception as e:
