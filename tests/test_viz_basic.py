@@ -36,8 +36,16 @@ sys.modules['tangermeme.variant_effect'] = mock_variant
 sys.modules['tangermeme.ism'] = mock_ism
 
 # Also ensure captum is minimally present if viz imports it
-sys.modules['captum'] = types.ModuleType('captum')
-sys.modules['captum.attr'] = types.ModuleType('captum.attr')
+mock_captum = types.ModuleType('captum')
+mock_captum_attr = types.ModuleType('captum.attr')
+mock_captum_attr.DeepLiftShap = type('DeepLiftShap', (), {})
+mock_captum_attr.InputXGradient = type('InputXGradient', (), {})
+sys.modules['captum'] = mock_captum
+sys.modules['captum.attr'] = mock_captum_attr
+
+# Mock seaborn
+mock_seaborn = types.SimpleNamespace(set_style=lambda *a: None)
+sys.modules['seaborn'] = mock_seaborn
 
 # Ensure the scripts directory is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
