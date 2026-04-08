@@ -258,7 +258,7 @@ if __name__ == '__main__':
                         help='Label scaling method.')
     parser.add_argument('--batch-size', type=int, default=64,
                         help='Fixed batch size for all trials in this run.')
-    parser.add_argument('--checkpoint-dir', type=str, default='/sc-projects/sc-proj-cc17-P09_TFBS/saved_models_tuned/',
+    parser.add_argument('--checkpoint-dir', type=str, default='saved_models_tuned/',
                         help='Base directory for saving model checkpoints.')
     parser.add_argument('--project-name', type=str, required=True,
                         help='WandB project name for this sweep (must match SLURM setting).') # <--- NEW ARGUMENT
