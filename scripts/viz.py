@@ -122,11 +122,14 @@ class AnalysisConfig:
 
 def save_or_show_plot(filename: str, output_dir: Optional[str]):
     """Saves the current Matplotlib plot or displays it interactively.
+       PNGs are saved to an 'images' subfolder within output_dir.
        Also records saved images for the HTML report if enabled.
     """
     if output_dir and filename:
+        images_dir = os.path.join(output_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
         safe_filename = filename.replace(' ', '_').replace('/', '_').replace(':', '')
-        full_path = os.path.join(output_dir, safe_filename)
+        full_path = os.path.join(images_dir, safe_filename)
 
         plt.savefig(full_path, bbox_inches='tight')
         print(f"Plot saved to: {full_path}")
@@ -135,8 +138,8 @@ def save_or_show_plot(filename: str, output_dir: Optional[str]):
             AnalysisConfig._report_collector.record(full_path)
     else:
         plt.show()
-    
-    plt.close() 
+
+    plt.close()
 
 # --- New: simple HTML report collector ---
 class ReportCollector:
@@ -802,8 +805,8 @@ class GenomicInterpreter:
             print("Skipping TAD scan because --output-dir was not provided. This analysis writes a summary figure.")
             return
 
-        tad_dir = os.path.join(self.config.output_dir, "tad_scan")
-        os.makedirs(tad_dir, exist_ok=True)
+        images_dir = os.path.join(self.config.output_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
 
         chrom, region_start, region_end, region_name = self.data_prep.get_tad_region()
         region_sequence = self.data_prep.fetch_genomic_region_sequence(
@@ -861,12 +864,12 @@ class GenomicInterpreter:
             print(f"Processed {min(batch_start + batch_size, len(chunks))}/{len(chunks)} TAD windows.")
 
         prediction_df = pd.DataFrame(prediction_records)
-        prediction_path = os.path.join(tad_dir, "tad_predictions.csv")
+        prediction_path = os.path.join(self.config.output_dir, "tad_predictions.csv")
         prediction_df.to_csv(prediction_path, index=False)
         print(f"TAD predictions saved to: {prediction_path}")
 
         attribution_matrix = np.vstack(attribution_rows)
-        heatmap_path = os.path.join(tad_dir, "tad_summary_heatmap.png")
+        heatmap_path = os.path.join(images_dir, "tad_summary_heatmap.png")
 
         prediction_matrix = np.asarray(prediction_values, dtype=float)[np.newaxis, :]
 
