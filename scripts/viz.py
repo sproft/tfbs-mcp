@@ -798,6 +798,80 @@ class GenomicInterpreter:
             plt.tight_layout()
             save_or_show_plot(f"DeepLiftShap_{record['Sequence_Name']}.png", self.config.output_dir, subfolder="deeplift")
 
+        # --- PWM comparison: top vs bottom 10% of predicted sequences ---
+        self._run_ambiguous_pwm_comparison(sequence_records, ambiguous_sequence)
+
+    def _run_ambiguous_pwm_comparison(self, sequence_records: List[dict], ambiguous_sequence: str):
+        """Build PWMs from the top and bottom 10% of ambiguous sequence predictions and compare."""
+        from logomaker import Logo, transform_matrix
+
+        print("\n--- Ambiguous Sequence PWM Comparison (Top vs Bottom 10%) ---")
+
+        df = pd.DataFrame(sequence_records)
+        n_total = len(df)
+        n_percentile = max(1, n_total // 10)
+
+        df_sorted = df.sort_values("Prediction", ascending=False)
+        top_seqs = df_sorted.head(n_percentile)["Sequence"].tolist()
+        bottom_seqs = df_sorted.tail(n_percentile)["Sequence"].tolist()
+
+        print(f"Total sequences: {n_total}, Top 10%: {len(top_seqs)} (score >= {df_sorted.iloc[n_percentile-1]['Prediction']:.4f}), "
+              f"Bottom 10%: {len(bottom_seqs)} (score <= {df_sorted.iloc[-n_percentile]['Prediction']:.4f})")
+
+        def seqs_to_pwm(sequences: List[str]) -> pd.DataFrame:
+            """Convert a list of equal-length DNA sequences to a PWM (probability matrix)."""
+            seq_len = len(sequences[0])
+            counts = {base: [0] * seq_len for base in "ACGT"}
+            for seq in sequences:
+                for pos, base in enumerate(seq):
+                    counts[base][pos] += 1
+            pwm = pd.DataFrame(counts)
+            pwm = pwm.div(pwm.sum(axis=1), axis=0)
+            return pwm
+
+        pwm_top = seqs_to_pwm(top_seqs)
+        pwm_bottom = seqs_to_pwm(bottom_seqs)
+        pwm_diff = pwm_top - pwm_bottom
+
+        # Identify ambiguous (N) positions
+        n_positions = [i for i, base in enumerate(ambiguous_sequence) if base == 'N']
+
+        # Save PWMs to CSV
+        if self.config.output_dir:
+            pwm_top.to_csv(os.path.join(self.config.output_dir, "ambiguous_pwm_top10.csv"), index_label="Position")
+            pwm_bottom.to_csv(os.path.join(self.config.output_dir, "ambiguous_pwm_bottom10.csv"), index_label="Position")
+            pwm_diff.to_csv(os.path.join(self.config.output_dir, "ambiguous_pwm_diff.csv"), index_label="Position")
+
+        # --- Plot: Top vs Bottom PWMs side by side ---
+        fig, axes = plt.subplots(3, 1, figsize=(12, 8), constrained_layout=True)
+
+        # Information content logos (bits) for top and bottom
+        info_top = transform_matrix(pwm_top, from_type="probability", to_type="information")
+        info_bottom = transform_matrix(pwm_bottom, from_type="probability", to_type="information")
+
+        Logo(info_top, ax=axes[0], color_scheme="classic")
+        axes[0].set_title(f"Top 10% sequences (n={len(top_seqs)}, mean score={top_seqs and df_sorted.head(n_percentile)['Prediction'].mean():.4f})")
+        axes[0].set_ylabel("Bits")
+        for pos in n_positions:
+            axes[0].axvspan(pos - 0.5, pos + 0.5, alpha=0.1, color="grey")
+
+        Logo(info_bottom, ax=axes[1], color_scheme="classic")
+        axes[1].set_title(f"Bottom 10% sequences (n={len(bottom_seqs)}, mean score={bottom_seqs and df_sorted.tail(n_percentile)['Prediction'].mean():.4f})")
+        axes[1].set_ylabel("Bits")
+        for pos in n_positions:
+            axes[1].axvspan(pos - 0.5, pos + 0.5, alpha=0.1, color="grey")
+
+        # Differential logo (top - bottom)
+        Logo(pwm_diff, ax=axes[2], color_scheme="classic")
+        axes[2].set_title("Differential PWM (Top 10% − Bottom 10%)")
+        axes[2].set_ylabel("Δ Frequency")
+        axes[2].set_xlabel("Position")
+        axes[2].axhline(y=0, color='black', linewidth=0.5, linestyle='-')
+        for pos in n_positions:
+            axes[2].axvspan(pos - 0.5, pos + 0.5, alpha=0.1, color="grey")
+
+        save_or_show_plot("Ambiguous_PWM_Comparison.png", self.config.output_dir)
+
     def run_tad_scan_analysis(self):
         """Scans the TAD region with a moving window and writes predictions + summary heatmap."""
         print("\n" + "="*50)
