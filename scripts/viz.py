@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import itertools
 from matplotlib.colors import TwoSlopeNorm
+from matplotlib.patches import Circle, Rectangle
 import argparse 
 import warnings
 from typing import Optional, List, Dict, Tuple, Any
@@ -46,6 +47,8 @@ except ImportError as e:
 
 class AnalysisConfig:
     """Handles command-line argument parsing and configuration storage."""
+    _report_collector: Optional["ReportCollector"] = None
+
     def __init__(self):
         self.parser = self._setup_parser()
         self.args = self.parser.parse_args()
@@ -233,7 +236,7 @@ class AttributionCore:
                 self.model, X_input, args=None, target=0, batch_size=128,
                 n_shuffles=n_shuffles, return_references=False,
                 hypothetical=hypothetical, warning_threshold=1000, raw_outputs=raw_outputs,
-                device=self.device, random_state=random_state, verbose=verbose
+                device=str(self.device), random_state=random_state, verbose=verbose
             )
 
         if verbose:
@@ -252,10 +255,8 @@ class AttributionCore:
         max_pairs = 256
 
         # result containers on CPU to reduce GPU pressure
-        if raw_outputs:
-            result_raw = torch.zeros((N, n_shuffles, C, L), dtype=X_input.dtype, device='cpu')
-        else:
-            result_sum = torch.zeros((N, C, L), dtype=X_input.dtype, device='cpu')
+        result_raw = torch.zeros((N, n_shuffles, C, L), dtype=X_input.dtype, device='cpu')
+        result_sum = torch.zeros((N, C, L), dtype=X_input.dtype, device='cpu')
 
         i = 0
         while i < N:
@@ -342,7 +343,7 @@ class AttributionCore:
             return result_raw
         else:
             # 1. Average the summed attributions.
-            avg_attributions = (result_sum / float(n_shuffles))
+            avg_attributions = result_sum / n_shuffles
 
             # 2. Apply final input multiplication if not hypothetical, and move to device.
             if not hypothetical:
@@ -713,17 +714,17 @@ class GenomicInterpreter:
         print("--- 1. Promoter Sequence Analysis (DeepLiftShap) ---")
         
         X_promotor, names = self.data_prep.load_promotor_sequences()
-        predictions = tpred(self.model, X_promotor, device=self.device)
+        predictions = tpred(self.model, X_promotor, device=str(self.device))  # type: ignore[arg-type]
         # Save predictions to file if output_dir is specified
         if self.config.output_dir:
             pred_df = pd.DataFrame({
             "Sequence_Name": names,
-            "Prediction": predictions.detach().cpu().numpy().flatten()
+            "Prediction": predictions.detach().cpu().numpy().flatten()  # type: ignore[union-attr]
             })
             pred_path = os.path.join(self.config.output_dir, "promoter_predictions.csv")
             pred_df.to_csv(pred_path, index=False)
             print(f"Promoter predictions saved to: {pred_path}")
-        for i in range(predictions.shape[0]):
+        for i in range(predictions.shape[0]):  # type: ignore[union-attr]
             print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
 
         X_attr = self.attr_core.run_deep_lift_shap(X_promotor, self.config.n_shuffles, verbose=True)
@@ -771,7 +772,7 @@ class GenomicInterpreter:
             X_sequence = one_hot_encode(sequence).unsqueeze(0).float().to(self.device)
             expanded_tensors.append(X_sequence)
 
-            prediction = tpred(self.model, X_sequence, device=self.device).detach().cpu().numpy().item()
+            prediction = tpred(self.model, X_sequence, device=str(self.device)).detach().cpu().numpy().item()  # type: ignore[union-attr]
             sequence_records.append({
                 "Sequence_Name": sequence_name,
                 "Sequence": sequence,
@@ -915,7 +916,7 @@ class GenomicInterpreter:
             batch_sequences = [sequence for _, sequence in batch_chunks]
 
             X_batch = torch.stack([one_hot_encode(sequence) for sequence in batch_sequences]).float().to(self.device)
-            batch_predictions = tpred(self.model, X_batch, device=self.device).detach().cpu().view(-1).numpy()
+            batch_predictions = tpred(self.model, X_batch, device=str(self.device)).detach().cpu().view(-1).numpy()  # type: ignore[union-attr]
 
             batch_attributions = self.attr_core.run_deep_lift_shap(X_batch, self.config.n_shuffles, verbose=False)
 
@@ -1045,16 +1046,16 @@ class GenomicInterpreter:
         if X.shape[0] == 0:
             print(f"Skipping {label} analysis (no sequences loaded).")
             return
-        predictions = tpred(self.model, X, device=self.device)
+        predictions = tpred(self.model, X, device=str(self.device))  # type: ignore[arg-type]
         if self.config.output_dir:
             pred_df = pd.DataFrame({
                 "Sequence_Name": names,
-                "Prediction": predictions.detach().cpu().numpy().flatten()
+                "Prediction": predictions.detach().cpu().numpy().flatten()  # type: ignore[union-attr]
             })
             pred_path = os.path.join(self.config.output_dir, csv_name)
             pred_df.to_csv(pred_path, index=False)
             print(f"{label} predictions saved to: {pred_path}")
-        for i in range(predictions.shape[0]):
+        for i in range(predictions.shape[0]):  # type: ignore[union-attr]
             print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
         X_attr = self.attr_core.run_deep_lift_shap(X, self.config.n_shuffles, verbose=True)
         self._plot_attributions(X_attr, names, "DeepLiftShap")
@@ -1103,7 +1104,7 @@ class GenomicInterpreter:
         print("\nPrediction Marginalization (Delta Prediction):")
         for name, pwm in motifs.items():
             consensus = pwm_consensus(pwm).unsqueeze(0).to(self.device)
-            y_before, y_after = marginalize(self.model, X_marginal_test, consensus, device=self.device)
+            y_before, y_after = marginalize(self.model, X_marginal_test, consensus, device=str(self.device))
             delta = (y_after - y_before).mean().item()
             print(f"{name}: {delta:.4f}")
 
@@ -1154,7 +1155,7 @@ class GenomicInterpreter:
         
         # Load sequences from peaks file if paths are valid
         peaks = pd.read_csv(self.config.peaks_file, sep="\t", usecols=(0, 1, 2), names=['chrom', 'start', 'end'])
-        X_peaks = extract_loci(peaks, self.config.genome_fasta, in_window=self.config.peak_length).float()
+        X_peaks = extract_loci(peaks, self.config.genome_fasta, in_window=self.config.peak_length).float()  # type: ignore[union-attr]
         X_peaks = X_peaks[X_peaks.sum(dim=(1, 2)) == self.config.peak_length].to(self.device) 
         X_analysis = X_peaks[:min(10 if self.config.test else self.config.max_seqs, X_peaks.shape[0])]
         print(f"Using {X_analysis.shape[0]} sequences extracted from peaks.")
@@ -1251,8 +1252,8 @@ class GenomicInterpreter:
             pos_indices = torch.arange(L).repeat_interleave(C)
             X_ism[torch.arange(C * L), :, pos_indices] = 0.0
             X_ism[torch.arange(C * L), base_indices, pos_indices] = 1.0
-            y_mut = tpred(model, X_ism, device=device)
-            diff_attr = y_mut.detach().cpu().numpy().squeeze() - y_orig
+            y_mut = tpred(model, X_ism, device=str(device))
+            diff_attr = y_mut.detach().cpu().numpy().squeeze() - y_orig  # type: ignore[union-attr]
             diff_attr = diff_attr.reshape(L, C).T
             return torch.tensor(diff_attr, dtype=torch.float32).unsqueeze(0)
     
@@ -1261,9 +1262,9 @@ class GenomicInterpreter:
         X_mut_test = one_hot_encode(consensus_seq).unsqueeze(0).float().to(self.device)
 
         # 5a. ISM Plot
-        X_ism_attr = saturation_mutagenesis(self.model, X_mut_test.cpu(), batch_size=128, device=self.device)
+        X_ism_attr = saturation_mutagenesis(self.model, X_mut_test.cpu(), batch_size=128, device=str(self.device))
         plt.figure(figsize=(12, 3))
-        plot_logo(X_ism_attr[0].detach().cpu().numpy().astype(float), ax=plt.subplot(111))
+        plot_logo(X_ism_attr[0].detach().cpu().numpy().astype(float), ax=plt.subplot(111))  # type: ignore[union-attr]
         plt.title("ISM (Prediction Difference)")
         save_or_show_plot("ISM_Attribution.png", self.config.output_dir)
 
@@ -1290,11 +1291,11 @@ class GenomicInterpreter:
         # Complement A->T, C->G, G->C, T->A (Index: 0->3, 1->2, 2->1, 3->0)
         X_rc = torch.index_select(X_rc, 1, torch.tensor([3, 2, 1, 0], dtype=torch.long, device=self.device))
 
-        y = tpred(self.model, X_orig, device=self.device)
-        y_rc = tpred(self.model, X_rc, device=self.device)
+        y = tpred(self.model, X_orig, device=str(self.device))
+        y_rc = tpred(self.model, X_rc, device=str(self.device))
 
         plt.figure(figsize=(12, 3))
-        plt.scatter(y.detach().cpu().numpy(), y_rc.detach().cpu().numpy(), alpha=0.5)
+        plt.scatter(y.detach().cpu().numpy(), y_rc.detach().cpu().numpy(), alpha=0.5)  # type: ignore[union-attr]
         plt.xlabel("Forward Prediction")
         plt.ylabel("Reverse Complement Prediction")
         plt.title("Forward vs Reverse Complement Prediction")
@@ -1446,7 +1447,7 @@ class GenomicInterpreter:
                 x = legend_x0 + i * cell_size
                 y = legend_y0 - j * cell_size
                 # Draw a circle instead of a rectangle
-                circ = plt.Circle((x + cell_size / 2, y - cell_size / 2), cell_size / 2.2, fill=False, edgecolor='k', linewidth=0.7)
+                circ = Circle((x + cell_size / 2, y - cell_size / 2), cell_size / 2.2, fill=False, edgecolor='k', linewidth=0.7)
                 plt.gca().add_patch(circ)
                 plt.text(x + cell_size / 2, y - cell_size / 2, f"{base_y}/{base_x}", 
                         ha='center', va='center', fontsize=8)
@@ -1464,7 +1465,7 @@ class GenomicInterpreter:
         # add red box around the middle four bases at the diagonal
         # the rectangle should be centered around the middle of the zoomed region and also diagonal
         middle = (zoom_start + zoom_end) // 2 - 1
-        rect = plt.Rectangle((middle, middle-0.5), 5, 0.8, linewidth=2, edgecolor='red', facecolor='none', linestyle='--', alpha=0.5)
+        rect = Rectangle((middle, middle-0.5), 5, 0.8, linewidth=2, edgecolor='red', facecolor='none', linestyle='--', alpha=0.5)
         # tilt the rectangle to match the diagonal
         rect.set_angle(45)  # Rotate the rectangle by 45 degrees
         plt.gca().add_patch(rect)
@@ -1608,6 +1609,7 @@ class GenomicInterpreter:
         norm = TwoSlopeNorm(vmin=-max_val, vcenter=0, vmax=max_val)
 
         # For each position in the range, create a slice
+        im = None
         for idx, fixed_k in enumerate(region_range):
             ax = axes[idx]
             
@@ -1662,6 +1664,10 @@ class GenomicInterpreter:
             axes[i].axis('off')
 
         # Global Colorbar
+        if im is None:
+            print("No data to plot for 3rd-order epistasis slices.")
+            plt.close(fig)
+            return
         cbar = fig.colorbar(im, ax=axes.ravel().tolist(), orientation='vertical', fraction=0.02, pad=0.04)
         cbar.set_label('Max 3rd Order Epistasis (ΔΔΔ)', fontsize=12)
 
@@ -1701,7 +1707,7 @@ class GenomicInterpreter:
         plot_logo(ixg_attr_np, ax=ax2)
         ax2.set_title("InputXGradient Attributions")
         plt.suptitle(f"Comparison of Attribution Methods for: {seq_name}", fontsize=14)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
         save_or_show_plot(f"comparison_{seq_name}.png", self.config.output_dir)
 
     def run_conv_filter_visualization(self):
@@ -1717,7 +1723,7 @@ class GenomicInterpreter:
         # --- 1. Load Data ---
         try:
             peaks = pd.read_csv(self.config.peaks_file, sep="\t", usecols=(0, 1, 2), names=['chrom', 'start', 'end'])
-            X_peaks = extract_loci(peaks, self.config.genome_fasta, in_window=self.config.peak_length).float()
+            X_peaks = extract_loci(peaks, self.config.genome_fasta, in_window=self.config.peak_length).float()  # type: ignore[union-attr]
             X_peaks = X_peaks[X_peaks.sum(dim=(1, 2)) == self.config.peak_length].to(self.device)
             X_analysis = X_peaks[:min(500 if self.config.test else self.config.max_seqs, X_peaks.shape[0])]
             
