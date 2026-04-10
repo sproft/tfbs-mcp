@@ -232,7 +232,7 @@ class AttributionCore:
         """
         # If the user did not request the tangermeme backend keep the captum function
         if self.tangermeme:
-            return tangermeme_deep_lift_shap(
+            return tangermeme_deep_lift_shap(  # type: ignore[return-value]
                 self.model, X_input, args=None, target=0, batch_size=128,
                 n_shuffles=n_shuffles, return_references=False,
                 hypothetical=hypothetical, warning_threshold=1000, raw_outputs=raw_outputs,
@@ -1105,7 +1105,7 @@ class GenomicInterpreter:
         for name, pwm in motifs.items():
             consensus = pwm_consensus(pwm).unsqueeze(0).to(self.device)
             y_before, y_after = marginalize(self.model, X_marginal_test, consensus, device=str(self.device))
-            delta = (y_after - y_before).mean().item()
+            delta = (y_after - y_before).mean().item()  # type: ignore[operator]
             print(f"{name}: {delta:.4f}")
 
         print("\nAttribution Marginalization (Delta Attribution * Input):")
