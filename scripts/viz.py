@@ -87,7 +87,7 @@ class AnalysisConfig:
                             help="If set, uses Tangermeme's DeepLiftShap implementation instead of Captum's.")
         # New CLI arg to pick analyses
         parser.add_argument('--analyses', type=str, default='all',
-                    help="Comma-separated list of analyses to run. Options: sequence,marginalization,seqlet,mutagenesis,rc,epistasis,epistasis_3d,comparison,conv_filters,ambiguous_sequence,tad_scan. Default: all")
+                    help="Comma-separated list of analyses to run. Options: sequence,ambiguous_sequence,tad_scan,experimental_sequences,marginalization,seqlet,mutagenesis,rc,epistasis,epistasis_3d,comparison,conv_filters. Default: all")
         parser.add_argument('--max-seqs', type=int, default=100,
                             help="Maximum number of sequences to process for genome-wide analyses (default: 100).")
         parser.add_argument('--html-report', action='store_true',
@@ -662,6 +662,7 @@ class GenomicInterpreter:
                 ('sequence', self.run_sequence_analysis),
                 ('ambiguous_sequence', self.run_ambiguous_sequence_analysis),
                 ('tad_scan', self.run_tad_scan_analysis),
+                ('experimental_sequences', self.run_experimental_sequences_analysis),
                 ('marginalization', self.run_marginalization_analysis),
                 ('seqlet', self.run_seqlet_analysis),
                 ('mutagenesis', self.run_mutagenesis_analysis),
@@ -676,6 +677,7 @@ class GenomicInterpreter:
                 'sequence': self.run_sequence_analysis,
                 'ambiguous_sequence': self.run_ambiguous_sequence_analysis,
                 'tad_scan': self.run_tad_scan_analysis,
+                'experimental_sequences': self.run_experimental_sequences_analysis,
                 'marginalization': self.run_marginalization_analysis,
                 'seqlet': self.run_seqlet_analysis,
                 'mutagenesis': self.run_mutagenesis_analysis,
@@ -924,15 +926,9 @@ class GenomicInterpreter:
         print(f"TAD summary heatmap saved to: {heatmap_path}")
         plt.close(fig)
 
-        # Medium Maria sequences
-        print("\n" + "="*50)
-        print("--- 2a. Medium Maria Sequences Analysis (DeepLiftShap) ---")
-        X_medium_maria = self.data_prep.load_medium_maria_sequences()
-
-        # --- Calculate Minimum Length (Receptive Field) ---
-        target_len = 0
+    def _calculate_receptive_field(self, cap_to_input_length: bool = True) -> int:
+        """Calculate the model's receptive field from its conv layers."""
         model_obj = self.model.module if hasattr(self.model, "module") else self.model
-
         if hasattr(model_obj, 'conv_layers'):
             rf = 1
             for layer in model_obj.conv_layers:
@@ -940,135 +936,70 @@ class GenomicInterpreter:
                     k = layer.kernel_size[0] if isinstance(layer.kernel_size, tuple) else layer.kernel_size
                     d = layer.dilation[0] if isinstance(layer.dilation, tuple) else layer.dilation
                     rf += (k - 1) * d
-            # Cap the target length to the configured input length to avoid
-            # excessive padding and extremely long plot x-axes
-            target_len = min(rf, self.config.input_length)
-            print(f"Calculated Model Receptive Field: {rf} bp (capped to {target_len} for plotting)")
-        else:
-            target_len = min(1000, self.config.input_length) # Fallback (capped)
-            print(f"Warning: Could not determine RF from model layers. Using fallback capped to {target_len}bp.")
+            target = min(rf, self.config.input_length) if cap_to_input_length else rf
+            print(f"Calculated Model Receptive Field: {rf} bp" + (f" (capped to {target} for plotting)" if cap_to_input_length else ""))
+            return target
+        print(f"Warning: Could not determine RF from model layers. Using fallback {self.config.input_length}bp.")
+        return self.config.input_length
 
-        # --- PADDING LOGIC (Handles both Tensor and NumPy) ---
-        current_len = X_medium_maria.shape[-1]
-        
-        if X_medium_maria.shape[0] > 0 and current_len < target_len:
+    def _pad_sequences(self, X: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Pad one-hot encoded sequences to target_len with zeros (N bases)."""
+        current_len = X.shape[-1]
+        if X.shape[0] > 0 and current_len < target_len:
             pad_amount = target_len - current_len
             print(f"Padding sequences with {pad_amount} 'N' bases (Current: {current_len}, Target: {target_len})...")
-            
-            # CHECK: Is it a PyTorch Tensor?
-            if isinstance(X_medium_maria, torch.Tensor):
-                padding = torch.full((X_medium_maria.shape[0], 4, pad_amount), 0, dtype=X_medium_maria.dtype, device=X_medium_maria.device)
-                X_medium_maria = torch.cat([X_medium_maria, padding], dim=2)
+            if isinstance(X, torch.Tensor):
+                padding = torch.full((X.shape[0], 4, pad_amount), 0, dtype=X.dtype, device=X.device)
+                X = torch.cat([X, padding], dim=2)
             else:
-                padding = np.full((X_medium_maria.shape[0], 4, pad_amount), 0, dtype=X_medium_maria.dtype)
-                X_medium_maria = np.concatenate([X_medium_maria, padding], axis=2)
-        # -----------------------------------------------------------
+                padding = np.full((X.shape[0], 4, pad_amount), 0, dtype=X.dtype)
+                X = np.concatenate([X, padding], axis=2)
+        return X
 
-
-        print(f"Loaded {X_medium_maria.shape[0]} medium Maria sequences for analysis.")
-        names = [f"Medium_Maria_Seq_{i+1}" for i in range(X_medium_maria.shape[0])]
-        if X_medium_maria.shape[0] > 0:
-            predictions = tpred(self.model, X_medium_maria, device=self.device)
-            if self.config.output_dir:
-                pred_df = pd.DataFrame({
+    def _run_sequence_set(self, X: torch.Tensor, label: str, prefix: str, csv_name: str):
+        """Run prediction + DeepLiftShap attribution on a set of sequences."""
+        print(f"Loaded {X.shape[0]} {label} sequences for analysis.")
+        names = [f"{prefix}_{i+1}" for i in range(X.shape[0])]
+        if X.shape[0] == 0:
+            print(f"Skipping {label} analysis (no sequences loaded).")
+            return
+        predictions = tpred(self.model, X, device=self.device)
+        if self.config.output_dir:
+            pred_df = pd.DataFrame({
                 "Sequence_Name": names,
                 "Prediction": predictions.detach().cpu().numpy().flatten()
-                })
-                pred_path = os.path.join(self.config.output_dir, "medium_maria_predictions.csv")
-                pred_df.to_csv(pred_path, index=False)
-                print(f"Medium Maria predictions saved to: {pred_path}")
-            for i in range(predictions.shape[0]):
-                print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
-            X_attr_medium_maria = self.attr_core.run_deep_lift_shap(X_medium_maria, self.config.n_shuffles, verbose=True)
-            self._plot_attributions(X_attr_medium_maria, names, "DeepLiftShap")
-        else:
-            print("Skipping medium Maria sequence analysis (no sequences loaded).")
+            })
+            pred_path = os.path.join(self.config.output_dir, csv_name)
+            pred_df.to_csv(pred_path, index=False)
+            print(f"{label} predictions saved to: {pred_path}")
+        for i in range(predictions.shape[0]):
+            print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
+        X_attr = self.attr_core.run_deep_lift_shap(X, self.config.n_shuffles, verbose=True)
+        self._plot_attributions(X_attr, names, "DeepLiftShap")
+
+    def run_experimental_sequences_analysis(self):
+        """Runs prediction and attribution on medium/short Maria and Fabbro sequences."""
+        print("\n" + "="*50)
+        print("--- Experimental Sequences Analysis (DeepLiftShap) ---")
+
+        target_len = self._calculate_receptive_field(cap_to_input_length=True)
+
+        # Medium Maria sequences
+        print("\n--- Medium Maria Sequences ---")
+        X_medium_maria = self.data_prep.load_medium_maria_sequences()
+        X_medium_maria = self._pad_sequences(X_medium_maria, target_len)
+        self._run_sequence_set(X_medium_maria, "medium Maria", "Medium_Maria_Seq", "medium_maria_predictions.csv")
 
         # Fabbro sequences
-        print("\n" + "="*50)
-        print("--- 2b. Fabbro Sequences Analysis (DeepLiftShap) ---")
+        print("\n--- Fabbro Sequences ---")
         X_fabbro = self.data_prep.load_fabbro_sequences()
-        print(f"Loaded {X_fabbro.shape[0]} Fabbro sequences for analysis.")
-        names = [f"Fabbro_Seq_{i+1}" for i in range(X_fabbro.shape[0])]
-        if X_fabbro.shape[0] > 0:
-            predictions = tpred(self.model, X_fabbro, device=self.device)
-            if self.config.output_dir:
-                pred_df = pd.DataFrame({
-                "Sequence_Name": names,
-                "Prediction": predictions.detach().cpu().numpy().flatten()
-                })
-                pred_path = os.path.join(self.config.output_dir, "fabbro_predictions.csv")
-                pred_df.to_csv(pred_path, index=False)
-                print(f"Fabbro predictions saved to: {pred_path}")
-            for i in range(predictions.shape[0]):
-                print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
-            X_attr_fabbro = self.attr_core.run_deep_lift_shap(X_fabbro, self.config.n_shuffles, verbose=True)
-            self._plot_attributions(X_attr_fabbro, names, "DeepLiftShap")
-        else:
-            print("Skipping Fabbro sequence analysis (no sequences loaded).")
+        self._run_sequence_set(X_fabbro, "Fabbro", "Fabbro_Seq", "fabbro_predictions.csv")
 
         # Short Maria sequences
-        print("\n" + "="*50)
-        print("--- 2c. Short Maria Sequences Analysis (DeepLiftShap) ---")
+        print("\n--- Short Maria Sequences ---")
         X_short_maria = self.data_prep.load_short_maria_sequences()
-
-        # --- NEW BLOCK: Calculate Minimum Length (Receptive Field) ---
-        target_len = 0
-        model_obj = self.model.module if hasattr(self.model, "module") else self.model
-
-        if hasattr(model_obj, 'conv_layers'):
-            rf = 1
-            for layer in model_obj.conv_layers:
-                if isinstance(layer, torch.nn.Conv1d):
-                    k = layer.kernel_size[0] if isinstance(layer.kernel_size, tuple) else layer.kernel_size
-                    d = layer.dilation[0] if isinstance(layer.dilation, tuple) else layer.dilation
-                    rf += (k - 1) * d
-            target_len = rf
-            print(f"Calculated Model Receptive Field: {target_len} bp")
-        else:
-            target_len = 1000 # Fallback
-            print("Warning: Could not determine RF from model layers. Using fallback 1000bp.")
-
-        # --- PADDING LOGIC (Handles both Tensor and NumPy) ---
-        current_len = X_short_maria.shape[-1]
-        
-        if X_short_maria.shape[0] > 0 and current_len < target_len:
-            pad_amount = target_len - current_len
-            print(f"Padding sequences with {pad_amount} 'N' bases (Current: {current_len}, Target: {target_len})...")
-            
-            # CHECK: Is it a PyTorch Tensor?
-            if isinstance(X_short_maria, torch.Tensor):
-                # Use TORCH functions
-                # Create padding on the same device as input data
-                padding = torch.full((X_short_maria.shape[0], 4, pad_amount), 0, dtype=X_short_maria.dtype, device=X_short_maria.device)
-                X_short_maria = torch.cat([X_short_maria, padding], dim=2)
-            
-            # CHECK: Is it a NumPy Array?
-            else:
-                # Use NUMPY functions
-                padding = np.full((X_short_maria.shape[0], 4, pad_amount), 0, dtype=X_short_maria.dtype)
-                X_short_maria = np.concatenate([X_short_maria, padding], axis=2)
-        # -----------------------------------------------------------
-
-
-        print(f"Loaded {X_short_maria.shape[0]} short Maria sequences for analysis.")
-        names = [f"Short_Maria_Seq_{i+1}" for i in range(X_short_maria.shape[0])]
-        if X_short_maria.shape[0] > 0:
-            predictions = tpred(self.model, X_short_maria, device=self.device)
-            if self.config.output_dir:
-                pred_df = pd.DataFrame({
-                "Sequence_Name": names,
-                "Prediction": predictions.detach().cpu().numpy().flatten()
-                })
-                pred_path = os.path.join(self.config.output_dir, "short_maria_predictions.csv")
-                pred_df.to_csv(pred_path, index=False)
-                print(f"Short Maria predictions saved to: {pred_path}")
-            for i in range(predictions.shape[0]):
-                print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
-            X_attr_short_maria = self.attr_core.run_deep_lift_shap(X_short_maria, self.config.n_shuffles, verbose=True)
-            self._plot_attributions(X_attr_short_maria, names, "DeepLiftShap")
-        else:
-            print("Skipping short Maria sequence analysis (no sequences loaded).")
+        X_short_maria = self._pad_sequences(X_short_maria, self._calculate_receptive_field(cap_to_input_length=False))
+        self._run_sequence_set(X_short_maria, "short Maria", "Short_Maria_Seq", "short_maria_predictions.csv")
 
     def run_marginalization_analysis(self):
         """Performs motif marginalization for prediction and attribution."""
