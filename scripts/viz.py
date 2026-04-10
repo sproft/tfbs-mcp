@@ -120,16 +120,18 @@ class AnalysisConfig:
         """Allows config.attr access instead of config.args.attr."""
         return getattr(self.args, name)
 
-def save_or_show_plot(filename: str, output_dir: Optional[str]):
+def save_or_show_plot(filename: str, output_dir: Optional[str], subfolder: Optional[str] = None):
     """Saves the current Matplotlib plot or displays it interactively.
-       PNGs are saved to an 'images' subfolder within output_dir.
        Also records saved images for the HTML report if enabled.
+
+       Args:
+           subfolder: Optional subfolder within output_dir (e.g. "deeplift").
     """
     if output_dir and filename:
-        images_dir = os.path.join(output_dir, "images")
-        os.makedirs(images_dir, exist_ok=True)
+        target_dir = os.path.join(output_dir, subfolder) if subfolder else output_dir
+        os.makedirs(target_dir, exist_ok=True)
         safe_filename = filename.replace(' ', '_').replace('/', '_').replace(':', '')
-        full_path = os.path.join(images_dir, safe_filename)
+        full_path = os.path.join(target_dir, safe_filename)
 
         plt.savefig(full_path, bbox_inches='tight')
         print(f"Plot saved to: {full_path}")
@@ -655,7 +657,7 @@ class GenomicInterpreter:
             seq_name = names[i]
             plt.title(f"{prefix} Attributions for {seq_name}")
             plt.tight_layout()
-            save_or_show_plot(f"{prefix}_{seq_name}.png", self.config.output_dir) 
+            save_or_show_plot(f"{prefix}_{seq_name}.png", self.config.output_dir, subfolder="deeplift")
 
     def run_all_analysis(self):
         """Runs the pipeline depending on requested analyses."""
@@ -794,7 +796,7 @@ class GenomicInterpreter:
             plt.ylabel("Attribution")
             plt.title(f"DeepLiftShap Attributions for {record['Sequence_Name']}")
             plt.tight_layout()
-            save_or_show_plot(f"DeepLiftShap_{record['Sequence_Name']}.png", self.config.output_dir)
+            save_or_show_plot(f"DeepLiftShap_{record['Sequence_Name']}.png", self.config.output_dir, subfolder="deeplift")
 
     def run_tad_scan_analysis(self):
         """Scans the TAD region with a moving window and writes predictions + summary heatmap."""
@@ -805,8 +807,7 @@ class GenomicInterpreter:
             print("Skipping TAD scan because --output-dir was not provided. This analysis writes a summary figure.")
             return
 
-        images_dir = os.path.join(self.config.output_dir, "images")
-        os.makedirs(images_dir, exist_ok=True)
+        tad_dir = self.config.output_dir
 
         chrom, region_start, region_end, region_name = self.data_prep.get_tad_region()
         region_sequence = self.data_prep.fetch_genomic_region_sequence(
@@ -869,7 +870,7 @@ class GenomicInterpreter:
         print(f"TAD predictions saved to: {prediction_path}")
 
         attribution_matrix = np.vstack(attribution_rows)
-        heatmap_path = os.path.join(images_dir, "tad_summary_heatmap.png")
+        heatmap_path = os.path.join(tad_dir, "tad_summary_heatmap.png")
 
         prediction_matrix = np.asarray(prediction_values, dtype=float)[np.newaxis, :]
 
@@ -1197,7 +1198,7 @@ class GenomicInterpreter:
         plt.figure(figsize=(12, 3))
         plot_logo(X_dl_attr[0].detach().cpu().numpy().astype(float), ax=plt.subplot(111))
         plt.title("DeepLiftShap Attribution on Consensus Sequence")
-        save_or_show_plot("DeepLiftShap_Consensus.png", self.config.output_dir)
+        save_or_show_plot("DeepLiftShap_Consensus.png", self.config.output_dir, subfolder="deeplift")
 
     def run_rc_comparison(self):
         """Compares forward and reverse complement predictions."""
