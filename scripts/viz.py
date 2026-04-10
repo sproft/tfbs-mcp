@@ -794,13 +794,16 @@ class GenomicInterpreter:
             save_or_show_plot(f"DeepLiftShap_{record['Sequence_Name']}.png", self.config.output_dir)
 
     def run_tad_scan_analysis(self):
-        """Scans the built-in TAD region with overlapping 24-mers and writes a summary heatmap."""
+        """Scans the TAD region with a moving window and writes predictions + summary heatmap."""
         print("\n" + "="*50)
-        print("--- 3. TAD 24-mer Scan (Prediction + DeepLiftShap Summary) ---")
+        print("--- TAD Region Scan (Moving Window Prediction + DeepLiftShap) ---")
 
         if not self.config.output_dir:
             print("Skipping TAD scan because --output-dir was not provided. This analysis writes a summary figure.")
             return
+
+        tad_dir = os.path.join(self.config.output_dir, "tad_scan")
+        os.makedirs(tad_dir, exist_ok=True)
 
         chrom, region_start, region_end, region_name = self.data_prep.get_tad_region()
         region_sequence = self.data_prep.fetch_genomic_region_sequence(
@@ -810,16 +813,17 @@ class GenomicInterpreter:
             region_end,
         )
 
-        window_size = self.config.input_length
-        chunks = self.data_prep.split_sequence_into_chunks(region_sequence, window_size, step_size=1)
+        window_size = 50
+        step_size = 25
+        chunks = self.data_prep.split_sequence_into_chunks(region_sequence, window_size, step_size=step_size)
 
         print(
             f"Loaded {region_name}: {chrom}:{region_start}-{region_end} ({len(region_sequence)} bp). "
-            f"Generated {len(chunks)} overlapping {window_size}-mers with step 1."
+            f"Generated {len(chunks)} windows ({window_size} bp, step {step_size})."
         )
 
         if not chunks:
-            print("No full 24-mer windows could be generated from the TAD region.")
+            print(f"No full {window_size}-mer windows could be generated from the TAD region.")
             return
 
         batch_size = 256
@@ -857,12 +861,12 @@ class GenomicInterpreter:
             print(f"Processed {min(batch_start + batch_size, len(chunks))}/{len(chunks)} TAD windows.")
 
         prediction_df = pd.DataFrame(prediction_records)
-        prediction_path = os.path.join(self.config.output_dir, "tad_24mer_predictions.csv")
+        prediction_path = os.path.join(tad_dir, "tad_predictions.csv")
         prediction_df.to_csv(prediction_path, index=False)
-        print(f"TAD 24-mer predictions saved to: {prediction_path}")
+        print(f"TAD predictions saved to: {prediction_path}")
 
         attribution_matrix = np.vstack(attribution_rows)
-        heatmap_path = os.path.join(self.config.output_dir, "tad_24mer_summary_heatmap.png")
+        heatmap_path = os.path.join(tad_dir, "tad_summary_heatmap.png")
 
         prediction_matrix = np.asarray(prediction_values, dtype=float)[np.newaxis, :]
 
@@ -884,7 +888,7 @@ class GenomicInterpreter:
             norm=pred_norm,
             interpolation="nearest",
         )
-        ax_pred.set_title(f"{region_name} prediction intensity across overlapping {window_size}-mers")
+        ax_pred.set_title(f"{region_name} prediction intensity ({window_size} bp windows, step {step_size})")
         ax_pred.set_ylabel("Prediction")
         ax_pred.set_yticks([])
 
@@ -902,10 +906,10 @@ class GenomicInterpreter:
             interpolation="nearest",
         )
         ax_heat.set_title(f"{region_name} signed DeepLiftShap summary heatmap")
-        ax_heat.set_xlabel("Position within 24-mer")
+        ax_heat.set_xlabel(f"Position within {window_size}-mer")
         ax_heat.set_ylabel("Window start position")
 
-        x_tick_positions = np.arange(0, window_size, 4)
+        x_tick_positions = np.arange(0, window_size, 5)
         ax_heat.set_xticks(x_tick_positions)
         ax_heat.set_xticklabels([str(pos + 1) for pos in x_tick_positions])
 
