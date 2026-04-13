@@ -1967,12 +1967,25 @@ async def tfbs_extract_loci(
         peaks_df, genome, in_window=in_window, verbose=False,
     ).float()  # type: ignore[union-attr]
 
+    # extract_loci may silently drop peaks — realign scores.
+    # If counts don't match, truncate scores to tensor length (extract_loci
+    # processes peaks in order, so the first N scores correspond).
+    n_extracted = seqs_tensor.shape[0]
+    if scores_raw is not None and len(scores_raw) != n_extracted:
+        scores_raw = scores_raw[:n_extracted]
+
     # Filter N-containing sequences
     n_mask = seqs_tensor.sum(dim=(1, 2)) == seqs_tensor.shape[-1]
     num_filtered_n = int((~n_mask).sum())
     seqs_tensor = seqs_tensor[n_mask]
     if scores_raw is not None:
         scores_raw = scores_raw[n_mask.numpy()]
+        # Drop any remaining NaN scores
+        nan_mask = _np.isnan(scores_raw)
+        if nan_mask.any():
+            valid = ~nan_mask
+            seqs_tensor = seqs_tensor[_torch.from_numpy(valid)]
+            scores_raw = scores_raw[valid]
 
     # Save
     out = Path(output_dir)
