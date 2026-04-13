@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import itertools
 from matplotlib.colors import TwoSlopeNorm
+from matplotlib.patches import Circle, Rectangle
 import argparse 
 import warnings
 from typing import Optional, List, Dict, Tuple, Any
@@ -46,6 +47,8 @@ except ImportError as e:
 
 class AnalysisConfig:
     """Handles command-line argument parsing and configuration storage."""
+    _report_collector: Optional["ReportCollector"] = None
+
     def __init__(self):
         self.parser = self._setup_parser()
         self.args = self.parser.parse_args()
@@ -87,7 +90,7 @@ class AnalysisConfig:
                             help="If set, uses Tangermeme's DeepLiftShap implementation instead of Captum's.")
         # New CLI arg to pick analyses
         parser.add_argument('--analyses', type=str, default='all',
-                    help="Comma-separated list of analyses to run. Options: sequence,marginalization,seqlet,mutagenesis,rc,epistasis,epistasis_3d,comparison,conv_filters,ambiguous_sequence,tad_scan. Default: all")
+                    help="Comma-separated list of analyses to run. Options: sequence,ambiguous_sequence,tad_scan,experimental_sequences,marginalization,seqlet,mutagenesis,rc,epistasis,epistasis_3d,comparison,conv_filters. Default: all")
         parser.add_argument('--max-seqs', type=int, default=100,
                             help="Maximum number of sequences to process for genome-wide analyses (default: 100).")
         parser.add_argument('--html-report', action='store_true',
@@ -120,13 +123,18 @@ class AnalysisConfig:
         """Allows config.attr access instead of config.args.attr."""
         return getattr(self.args, name)
 
-def save_or_show_plot(filename: str, output_dir: Optional[str]):
+def save_or_show_plot(filename: str, output_dir: Optional[str], subfolder: Optional[str] = None):
     """Saves the current Matplotlib plot or displays it interactively.
        Also records saved images for the HTML report if enabled.
+
+       Args:
+           subfolder: Optional subfolder within output_dir (e.g. "deeplift").
     """
     if output_dir and filename:
+        target_dir = os.path.join(output_dir, subfolder) if subfolder else output_dir
+        os.makedirs(target_dir, exist_ok=True)
         safe_filename = filename.replace(' ', '_').replace('/', '_').replace(':', '')
-        full_path = os.path.join(output_dir, safe_filename)
+        full_path = os.path.join(target_dir, safe_filename)
 
         plt.savefig(full_path, bbox_inches='tight')
         print(f"Plot saved to: {full_path}")
@@ -135,8 +143,8 @@ def save_or_show_plot(filename: str, output_dir: Optional[str]):
             AnalysisConfig._report_collector.record(full_path)
     else:
         plt.show()
-    
-    plt.close() 
+
+    plt.close()
 
 # --- New: simple HTML report collector ---
 class ReportCollector:
@@ -224,11 +232,11 @@ class AttributionCore:
         """
         # If the user did not request the tangermeme backend keep the captum function
         if self.tangermeme:
-            return tangermeme_deep_lift_shap(
+            return tangermeme_deep_lift_shap(  # type: ignore[return-value]
                 self.model, X_input, args=None, target=0, batch_size=128,
                 n_shuffles=n_shuffles, return_references=False,
                 hypothetical=hypothetical, warning_threshold=1000, raw_outputs=raw_outputs,
-                device=self.device, random_state=random_state, verbose=verbose
+                device=str(self.device), random_state=random_state, verbose=verbose
             )
 
         if verbose:
@@ -247,10 +255,8 @@ class AttributionCore:
         max_pairs = 256
 
         # result containers on CPU to reduce GPU pressure
-        if raw_outputs:
-            result_raw = torch.zeros((N, n_shuffles, C, L), dtype=X_input.dtype, device='cpu')
-        else:
-            result_sum = torch.zeros((N, C, L), dtype=X_input.dtype, device='cpu')
+        result_raw = torch.zeros((N, n_shuffles, C, L), dtype=X_input.dtype, device='cpu')
+        result_sum = torch.zeros((N, C, L), dtype=X_input.dtype, device='cpu')
 
         i = 0
         while i < N:
@@ -337,7 +343,7 @@ class AttributionCore:
             return result_raw
         else:
             # 1. Average the summed attributions.
-            avg_attributions = (result_sum / float(n_shuffles))
+            avg_attributions = result_sum / n_shuffles
 
             # 2. Apply final input multiplication if not hypothetical, and move to device.
             if not hypothetical:
@@ -652,7 +658,7 @@ class GenomicInterpreter:
             seq_name = names[i]
             plt.title(f"{prefix} Attributions for {seq_name}")
             plt.tight_layout()
-            save_or_show_plot(f"{prefix}_{seq_name}.png", self.config.output_dir) 
+            save_or_show_plot(f"{prefix}_{seq_name}.png", self.config.output_dir, subfolder="deeplift")
 
     def run_all_analysis(self):
         """Runs the pipeline depending on requested analyses."""
@@ -662,6 +668,7 @@ class GenomicInterpreter:
                 ('sequence', self.run_sequence_analysis),
                 ('ambiguous_sequence', self.run_ambiguous_sequence_analysis),
                 ('tad_scan', self.run_tad_scan_analysis),
+                ('experimental_sequences', self.run_experimental_sequences_analysis),
                 ('marginalization', self.run_marginalization_analysis),
                 ('seqlet', self.run_seqlet_analysis),
                 ('mutagenesis', self.run_mutagenesis_analysis),
@@ -676,6 +683,7 @@ class GenomicInterpreter:
                 'sequence': self.run_sequence_analysis,
                 'ambiguous_sequence': self.run_ambiguous_sequence_analysis,
                 'tad_scan': self.run_tad_scan_analysis,
+                'experimental_sequences': self.run_experimental_sequences_analysis,
                 'marginalization': self.run_marginalization_analysis,
                 'seqlet': self.run_seqlet_analysis,
                 'mutagenesis': self.run_mutagenesis_analysis,
@@ -706,17 +714,17 @@ class GenomicInterpreter:
         print("--- 1. Promoter Sequence Analysis (DeepLiftShap) ---")
         
         X_promotor, names = self.data_prep.load_promotor_sequences()
-        predictions = tpred(self.model, X_promotor, device=self.device)
+        predictions = tpred(self.model, X_promotor, device=str(self.device))  # type: ignore[arg-type]
         # Save predictions to file if output_dir is specified
         if self.config.output_dir:
             pred_df = pd.DataFrame({
             "Sequence_Name": names,
-            "Prediction": predictions.detach().cpu().numpy().flatten()
+            "Prediction": predictions.detach().cpu().numpy().flatten()  # type: ignore[union-attr]
             })
             pred_path = os.path.join(self.config.output_dir, "promoter_predictions.csv")
             pred_df.to_csv(pred_path, index=False)
             print(f"Promoter predictions saved to: {pred_path}")
-        for i in range(predictions.shape[0]):
+        for i in range(predictions.shape[0]):  # type: ignore[union-attr]
             print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
 
         X_attr = self.attr_core.run_deep_lift_shap(X_promotor, self.config.n_shuffles, verbose=True)
@@ -764,7 +772,7 @@ class GenomicInterpreter:
             X_sequence = one_hot_encode(sequence).unsqueeze(0).float().to(self.device)
             expanded_tensors.append(X_sequence)
 
-            prediction = tpred(self.model, X_sequence, device=self.device).detach().cpu().numpy().item()
+            prediction = tpred(self.model, X_sequence, device=str(self.device)).detach().cpu().numpy().item()  # type: ignore[union-attr]
             sequence_records.append({
                 "Sequence_Name": sequence_name,
                 "Sequence": sequence,
@@ -789,16 +797,92 @@ class GenomicInterpreter:
             plt.ylabel("Attribution")
             plt.title(f"DeepLiftShap Attributions for {record['Sequence_Name']}")
             plt.tight_layout()
-            save_or_show_plot(f"DeepLiftShap_{record['Sequence_Name']}.png", self.config.output_dir)
+            save_or_show_plot(f"DeepLiftShap_{record['Sequence_Name']}.png", self.config.output_dir, subfolder="deeplift")
+
+        # --- PWM comparison: top vs bottom 10% of predicted sequences ---
+        self._run_ambiguous_pwm_comparison(sequence_records, ambiguous_sequence)
+
+    def _run_ambiguous_pwm_comparison(self, sequence_records: List[dict], ambiguous_sequence: str):
+        """Build PWMs from the top and bottom 10% of ambiguous sequence predictions and compare."""
+        from logomaker import Logo, transform_matrix
+
+        print("\n--- Ambiguous Sequence PWM Comparison (Top vs Bottom 10%) ---")
+
+        df = pd.DataFrame(sequence_records)
+        n_total = len(df)
+        n_percentile = max(1, n_total // 10)
+
+        df_sorted = df.sort_values("Prediction", ascending=False)
+        top_seqs = df_sorted.head(n_percentile)["Sequence"].tolist()
+        bottom_seqs = df_sorted.tail(n_percentile)["Sequence"].tolist()
+
+        print(f"Total sequences: {n_total}, Top 10%: {len(top_seqs)} (score >= {df_sorted.iloc[n_percentile-1]['Prediction']:.4f}), "
+              f"Bottom 10%: {len(bottom_seqs)} (score <= {df_sorted.iloc[-n_percentile]['Prediction']:.4f})")
+
+        def seqs_to_pwm(sequences: List[str]) -> pd.DataFrame:
+            """Convert a list of equal-length DNA sequences to a PWM (probability matrix)."""
+            seq_len = len(sequences[0])
+            counts = {base: [0] * seq_len for base in "ACGT"}
+            for seq in sequences:
+                for pos, base in enumerate(seq):
+                    counts[base][pos] += 1
+            pwm = pd.DataFrame(counts)
+            pwm = pwm.div(pwm.sum(axis=1), axis=0)
+            return pwm
+
+        pwm_top = seqs_to_pwm(top_seqs)
+        pwm_bottom = seqs_to_pwm(bottom_seqs)
+        pwm_diff = pwm_top - pwm_bottom
+
+        # Identify ambiguous (N) positions
+        n_positions = [i for i, base in enumerate(ambiguous_sequence) if base == 'N']
+
+        # Save PWMs to CSV
+        if self.config.output_dir:
+            pwm_top.to_csv(os.path.join(self.config.output_dir, "ambiguous_pwm_top10.csv"), index_label="Position")
+            pwm_bottom.to_csv(os.path.join(self.config.output_dir, "ambiguous_pwm_bottom10.csv"), index_label="Position")
+            pwm_diff.to_csv(os.path.join(self.config.output_dir, "ambiguous_pwm_diff.csv"), index_label="Position")
+
+        # --- Plot: Top vs Bottom PWMs side by side ---
+        fig, axes = plt.subplots(3, 1, figsize=(12, 8), constrained_layout=True)
+
+        # Information content logos (bits) for top and bottom
+        info_top = transform_matrix(pwm_top, from_type="probability", to_type="information")
+        info_bottom = transform_matrix(pwm_bottom, from_type="probability", to_type="information")
+
+        Logo(info_top, ax=axes[0], color_scheme="classic")
+        axes[0].set_title(f"Top 10% sequences (n={len(top_seqs)}, mean score={top_seqs and df_sorted.head(n_percentile)['Prediction'].mean():.4f})")
+        axes[0].set_ylabel("Bits")
+        for pos in n_positions:
+            axes[0].axvspan(pos - 0.5, pos + 0.5, alpha=0.1, color="grey")
+
+        Logo(info_bottom, ax=axes[1], color_scheme="classic")
+        axes[1].set_title(f"Bottom 10% sequences (n={len(bottom_seqs)}, mean score={bottom_seqs and df_sorted.tail(n_percentile)['Prediction'].mean():.4f})")
+        axes[1].set_ylabel("Bits")
+        for pos in n_positions:
+            axes[1].axvspan(pos - 0.5, pos + 0.5, alpha=0.1, color="grey")
+
+        # Differential logo (top - bottom)
+        Logo(pwm_diff, ax=axes[2], color_scheme="classic")
+        axes[2].set_title("Differential PWM (Top 10% − Bottom 10%)")
+        axes[2].set_ylabel("Δ Frequency")
+        axes[2].set_xlabel("Position")
+        axes[2].axhline(y=0, color='black', linewidth=0.5, linestyle='-')
+        for pos in n_positions:
+            axes[2].axvspan(pos - 0.5, pos + 0.5, alpha=0.1, color="grey")
+
+        save_or_show_plot("Ambiguous_PWM_Comparison.png", self.config.output_dir)
 
     def run_tad_scan_analysis(self):
-        """Scans the built-in TAD region with overlapping 24-mers and writes a summary heatmap."""
+        """Scans the TAD region with a moving window and writes predictions + summary heatmap."""
         print("\n" + "="*50)
-        print("--- 3. TAD 24-mer Scan (Prediction + DeepLiftShap Summary) ---")
+        print("--- TAD Region Scan (Moving Window Prediction + DeepLiftShap) ---")
 
         if not self.config.output_dir:
             print("Skipping TAD scan because --output-dir was not provided. This analysis writes a summary figure.")
             return
+
+        tad_dir = self.config.output_dir
 
         chrom, region_start, region_end, region_name = self.data_prep.get_tad_region()
         region_sequence = self.data_prep.fetch_genomic_region_sequence(
@@ -808,16 +892,17 @@ class GenomicInterpreter:
             region_end,
         )
 
-        window_size = self.config.input_length
-        chunks = self.data_prep.split_sequence_into_chunks(region_sequence, window_size, step_size=1)
+        window_size = 50
+        step_size = 25
+        chunks = self.data_prep.split_sequence_into_chunks(region_sequence, window_size, step_size=step_size)
 
         print(
             f"Loaded {region_name}: {chrom}:{region_start}-{region_end} ({len(region_sequence)} bp). "
-            f"Generated {len(chunks)} overlapping {window_size}-mers with step 1."
+            f"Generated {len(chunks)} windows ({window_size} bp, step {step_size})."
         )
 
         if not chunks:
-            print("No full 24-mer windows could be generated from the TAD region.")
+            print(f"No full {window_size}-mer windows could be generated from the TAD region.")
             return
 
         batch_size = 256
@@ -831,7 +916,7 @@ class GenomicInterpreter:
             batch_sequences = [sequence for _, sequence in batch_chunks]
 
             X_batch = torch.stack([one_hot_encode(sequence) for sequence in batch_sequences]).float().to(self.device)
-            batch_predictions = tpred(self.model, X_batch, device=self.device).detach().cpu().view(-1).numpy()
+            batch_predictions = tpred(self.model, X_batch, device=str(self.device)).detach().cpu().view(-1).numpy()  # type: ignore[union-attr]
 
             batch_attributions = self.attr_core.run_deep_lift_shap(X_batch, self.config.n_shuffles, verbose=False)
 
@@ -855,12 +940,12 @@ class GenomicInterpreter:
             print(f"Processed {min(batch_start + batch_size, len(chunks))}/{len(chunks)} TAD windows.")
 
         prediction_df = pd.DataFrame(prediction_records)
-        prediction_path = os.path.join(self.config.output_dir, "tad_24mer_predictions.csv")
+        prediction_path = os.path.join(self.config.output_dir, "tad_predictions.csv")
         prediction_df.to_csv(prediction_path, index=False)
-        print(f"TAD 24-mer predictions saved to: {prediction_path}")
+        print(f"TAD predictions saved to: {prediction_path}")
 
         attribution_matrix = np.vstack(attribution_rows)
-        heatmap_path = os.path.join(self.config.output_dir, "tad_24mer_summary_heatmap.png")
+        heatmap_path = os.path.join(tad_dir, "tad_summary_heatmap.png")
 
         prediction_matrix = np.asarray(prediction_values, dtype=float)[np.newaxis, :]
 
@@ -882,7 +967,7 @@ class GenomicInterpreter:
             norm=pred_norm,
             interpolation="nearest",
         )
-        ax_pred.set_title(f"{region_name} prediction intensity across overlapping {window_size}-mers")
+        ax_pred.set_title(f"{region_name} prediction intensity ({window_size} bp windows, step {step_size})")
         ax_pred.set_ylabel("Prediction")
         ax_pred.set_yticks([])
 
@@ -900,10 +985,10 @@ class GenomicInterpreter:
             interpolation="nearest",
         )
         ax_heat.set_title(f"{region_name} signed DeepLiftShap summary heatmap")
-        ax_heat.set_xlabel("Position within 24-mer")
+        ax_heat.set_xlabel(f"Position within {window_size}-mer")
         ax_heat.set_ylabel("Window start position")
 
-        x_tick_positions = np.arange(0, window_size, 4)
+        x_tick_positions = np.arange(0, window_size, 5)
         ax_heat.set_xticks(x_tick_positions)
         ax_heat.set_xticklabels([str(pos + 1) for pos in x_tick_positions])
 
@@ -924,15 +1009,9 @@ class GenomicInterpreter:
         print(f"TAD summary heatmap saved to: {heatmap_path}")
         plt.close(fig)
 
-        # Medium Maria sequences
-        print("\n" + "="*50)
-        print("--- 2a. Medium Maria Sequences Analysis (DeepLiftShap) ---")
-        X_medium_maria = self.data_prep.load_medium_maria_sequences()
-
-        # --- Calculate Minimum Length (Receptive Field) ---
-        target_len = 0
+    def _calculate_receptive_field(self, cap_to_input_length: bool = True) -> int:
+        """Calculate the model's receptive field from its conv layers."""
         model_obj = self.model.module if hasattr(self.model, "module") else self.model
-
         if hasattr(model_obj, 'conv_layers'):
             rf = 1
             for layer in model_obj.conv_layers:
@@ -940,135 +1019,70 @@ class GenomicInterpreter:
                     k = layer.kernel_size[0] if isinstance(layer.kernel_size, tuple) else layer.kernel_size
                     d = layer.dilation[0] if isinstance(layer.dilation, tuple) else layer.dilation
                     rf += (k - 1) * d
-            # Cap the target length to the configured input length to avoid
-            # excessive padding and extremely long plot x-axes
-            target_len = min(rf, self.config.input_length)
-            print(f"Calculated Model Receptive Field: {rf} bp (capped to {target_len} for plotting)")
-        else:
-            target_len = min(1000, self.config.input_length) # Fallback (capped)
-            print(f"Warning: Could not determine RF from model layers. Using fallback capped to {target_len}bp.")
+            target = min(rf, self.config.input_length) if cap_to_input_length else rf
+            print(f"Calculated Model Receptive Field: {rf} bp" + (f" (capped to {target} for plotting)" if cap_to_input_length else ""))
+            return target
+        print(f"Warning: Could not determine RF from model layers. Using fallback {self.config.input_length}bp.")
+        return self.config.input_length
 
-        # --- PADDING LOGIC (Handles both Tensor and NumPy) ---
-        current_len = X_medium_maria.shape[-1]
-        
-        if X_medium_maria.shape[0] > 0 and current_len < target_len:
+    def _pad_sequences(self, X: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Pad one-hot encoded sequences to target_len with zeros (N bases)."""
+        current_len = X.shape[-1]
+        if X.shape[0] > 0 and current_len < target_len:
             pad_amount = target_len - current_len
             print(f"Padding sequences with {pad_amount} 'N' bases (Current: {current_len}, Target: {target_len})...")
-            
-            # CHECK: Is it a PyTorch Tensor?
-            if isinstance(X_medium_maria, torch.Tensor):
-                padding = torch.full((X_medium_maria.shape[0], 4, pad_amount), 0, dtype=X_medium_maria.dtype, device=X_medium_maria.device)
-                X_medium_maria = torch.cat([X_medium_maria, padding], dim=2)
+            if isinstance(X, torch.Tensor):
+                padding = torch.full((X.shape[0], 4, pad_amount), 0, dtype=X.dtype, device=X.device)
+                X = torch.cat([X, padding], dim=2)
             else:
-                padding = np.full((X_medium_maria.shape[0], 4, pad_amount), 0, dtype=X_medium_maria.dtype)
-                X_medium_maria = np.concatenate([X_medium_maria, padding], axis=2)
-        # -----------------------------------------------------------
+                padding = np.full((X.shape[0], 4, pad_amount), 0, dtype=X.dtype)
+                X = np.concatenate([X, padding], axis=2)
+        return X
 
-
-        print(f"Loaded {X_medium_maria.shape[0]} medium Maria sequences for analysis.")
-        names = [f"Medium_Maria_Seq_{i+1}" for i in range(X_medium_maria.shape[0])]
-        if X_medium_maria.shape[0] > 0:
-            predictions = tpred(self.model, X_medium_maria, device=self.device)
-            if self.config.output_dir:
-                pred_df = pd.DataFrame({
+    def _run_sequence_set(self, X: torch.Tensor, label: str, prefix: str, csv_name: str):
+        """Run prediction + DeepLiftShap attribution on a set of sequences."""
+        print(f"Loaded {X.shape[0]} {label} sequences for analysis.")
+        names = [f"{prefix}_{i+1}" for i in range(X.shape[0])]
+        if X.shape[0] == 0:
+            print(f"Skipping {label} analysis (no sequences loaded).")
+            return
+        predictions = tpred(self.model, X, device=str(self.device))  # type: ignore[arg-type]
+        if self.config.output_dir:
+            pred_df = pd.DataFrame({
                 "Sequence_Name": names,
-                "Prediction": predictions.detach().cpu().numpy().flatten()
-                })
-                pred_path = os.path.join(self.config.output_dir, "medium_maria_predictions.csv")
-                pred_df.to_csv(pred_path, index=False)
-                print(f"Medium Maria predictions saved to: {pred_path}")
-            for i in range(predictions.shape[0]):
-                print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
-            X_attr_medium_maria = self.attr_core.run_deep_lift_shap(X_medium_maria, self.config.n_shuffles, verbose=True)
-            self._plot_attributions(X_attr_medium_maria, names, "DeepLiftShap")
-        else:
-            print("Skipping medium Maria sequence analysis (no sequences loaded).")
+                "Prediction": predictions.detach().cpu().numpy().flatten()  # type: ignore[union-attr]
+            })
+            pred_path = os.path.join(self.config.output_dir, csv_name)
+            pred_df.to_csv(pred_path, index=False)
+            print(f"{label} predictions saved to: {pred_path}")
+        for i in range(predictions.shape[0]):  # type: ignore[union-attr]
+            print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
+        X_attr = self.attr_core.run_deep_lift_shap(X, self.config.n_shuffles, verbose=True)
+        self._plot_attributions(X_attr, names, "DeepLiftShap")
+
+    def run_experimental_sequences_analysis(self):
+        """Runs prediction and attribution on medium/short Maria and Fabbro sequences."""
+        print("\n" + "="*50)
+        print("--- Experimental Sequences Analysis (DeepLiftShap) ---")
+
+        target_len = self._calculate_receptive_field(cap_to_input_length=True)
+
+        # Medium Maria sequences
+        print("\n--- Medium Maria Sequences ---")
+        X_medium_maria = self.data_prep.load_medium_maria_sequences()
+        X_medium_maria = self._pad_sequences(X_medium_maria, target_len)
+        self._run_sequence_set(X_medium_maria, "medium Maria", "Medium_Maria_Seq", "medium_maria_predictions.csv")
 
         # Fabbro sequences
-        print("\n" + "="*50)
-        print("--- 2b. Fabbro Sequences Analysis (DeepLiftShap) ---")
+        print("\n--- Fabbro Sequences ---")
         X_fabbro = self.data_prep.load_fabbro_sequences()
-        print(f"Loaded {X_fabbro.shape[0]} Fabbro sequences for analysis.")
-        names = [f"Fabbro_Seq_{i+1}" for i in range(X_fabbro.shape[0])]
-        if X_fabbro.shape[0] > 0:
-            predictions = tpred(self.model, X_fabbro, device=self.device)
-            if self.config.output_dir:
-                pred_df = pd.DataFrame({
-                "Sequence_Name": names,
-                "Prediction": predictions.detach().cpu().numpy().flatten()
-                })
-                pred_path = os.path.join(self.config.output_dir, "fabbro_predictions.csv")
-                pred_df.to_csv(pred_path, index=False)
-                print(f"Fabbro predictions saved to: {pred_path}")
-            for i in range(predictions.shape[0]):
-                print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
-            X_attr_fabbro = self.attr_core.run_deep_lift_shap(X_fabbro, self.config.n_shuffles, verbose=True)
-            self._plot_attributions(X_attr_fabbro, names, "DeepLiftShap")
-        else:
-            print("Skipping Fabbro sequence analysis (no sequences loaded).")
+        self._run_sequence_set(X_fabbro, "Fabbro", "Fabbro_Seq", "fabbro_predictions.csv")
 
         # Short Maria sequences
-        print("\n" + "="*50)
-        print("--- 2c. Short Maria Sequences Analysis (DeepLiftShap) ---")
+        print("\n--- Short Maria Sequences ---")
         X_short_maria = self.data_prep.load_short_maria_sequences()
-
-        # --- NEW BLOCK: Calculate Minimum Length (Receptive Field) ---
-        target_len = 0
-        model_obj = self.model.module if hasattr(self.model, "module") else self.model
-
-        if hasattr(model_obj, 'conv_layers'):
-            rf = 1
-            for layer in model_obj.conv_layers:
-                if isinstance(layer, torch.nn.Conv1d):
-                    k = layer.kernel_size[0] if isinstance(layer.kernel_size, tuple) else layer.kernel_size
-                    d = layer.dilation[0] if isinstance(layer.dilation, tuple) else layer.dilation
-                    rf += (k - 1) * d
-            target_len = rf
-            print(f"Calculated Model Receptive Field: {target_len} bp")
-        else:
-            target_len = 1000 # Fallback
-            print("Warning: Could not determine RF from model layers. Using fallback 1000bp.")
-
-        # --- PADDING LOGIC (Handles both Tensor and NumPy) ---
-        current_len = X_short_maria.shape[-1]
-        
-        if X_short_maria.shape[0] > 0 and current_len < target_len:
-            pad_amount = target_len - current_len
-            print(f"Padding sequences with {pad_amount} 'N' bases (Current: {current_len}, Target: {target_len})...")
-            
-            # CHECK: Is it a PyTorch Tensor?
-            if isinstance(X_short_maria, torch.Tensor):
-                # Use TORCH functions
-                # Create padding on the same device as input data
-                padding = torch.full((X_short_maria.shape[0], 4, pad_amount), 0, dtype=X_short_maria.dtype, device=X_short_maria.device)
-                X_short_maria = torch.cat([X_short_maria, padding], dim=2)
-            
-            # CHECK: Is it a NumPy Array?
-            else:
-                # Use NUMPY functions
-                padding = np.full((X_short_maria.shape[0], 4, pad_amount), 0, dtype=X_short_maria.dtype)
-                X_short_maria = np.concatenate([X_short_maria, padding], axis=2)
-        # -----------------------------------------------------------
-
-
-        print(f"Loaded {X_short_maria.shape[0]} short Maria sequences for analysis.")
-        names = [f"Short_Maria_Seq_{i+1}" for i in range(X_short_maria.shape[0])]
-        if X_short_maria.shape[0] > 0:
-            predictions = tpred(self.model, X_short_maria, device=self.device)
-            if self.config.output_dir:
-                pred_df = pd.DataFrame({
-                "Sequence_Name": names,
-                "Prediction": predictions.detach().cpu().numpy().flatten()
-                })
-                pred_path = os.path.join(self.config.output_dir, "short_maria_predictions.csv")
-                pred_df.to_csv(pred_path, index=False)
-                print(f"Short Maria predictions saved to: {pred_path}")
-            for i in range(predictions.shape[0]):
-                print(f"{names[i]}: Prediction = {predictions[i].item():.4f}")
-            X_attr_short_maria = self.attr_core.run_deep_lift_shap(X_short_maria, self.config.n_shuffles, verbose=True)
-            self._plot_attributions(X_attr_short_maria, names, "DeepLiftShap")
-        else:
-            print("Skipping short Maria sequence analysis (no sequences loaded).")
+        X_short_maria = self._pad_sequences(X_short_maria, self._calculate_receptive_field(cap_to_input_length=False))
+        self._run_sequence_set(X_short_maria, "short Maria", "Short_Maria_Seq", "short_maria_predictions.csv")
 
     def run_marginalization_analysis(self):
         """Performs motif marginalization for prediction and attribution."""
@@ -1090,8 +1104,8 @@ class GenomicInterpreter:
         print("\nPrediction Marginalization (Delta Prediction):")
         for name, pwm in motifs.items():
             consensus = pwm_consensus(pwm).unsqueeze(0).to(self.device)
-            y_before, y_after = marginalize(self.model, X_marginal_test, consensus, device=self.device)
-            delta = (y_after - y_before).mean().item()
+            y_before, y_after = marginalize(self.model, X_marginal_test, consensus, device=str(self.device))
+            delta = (y_after - y_before).mean().item()  # type: ignore[operator]
             print(f"{name}: {delta:.4f}")
 
         print("\nAttribution Marginalization (Delta Attribution * Input):")
@@ -1141,7 +1155,7 @@ class GenomicInterpreter:
         
         # Load sequences from peaks file if paths are valid
         peaks = pd.read_csv(self.config.peaks_file, sep="\t", usecols=(0, 1, 2), names=['chrom', 'start', 'end'])
-        X_peaks = extract_loci(peaks, self.config.genome_fasta, in_window=self.config.peak_length).float()
+        X_peaks = extract_loci(peaks, self.config.genome_fasta, in_window=self.config.peak_length).float()  # type: ignore[union-attr]
         X_peaks = X_peaks[X_peaks.sum(dim=(1, 2)) == self.config.peak_length].to(self.device) 
         X_analysis = X_peaks[:min(10 if self.config.test else self.config.max_seqs, X_peaks.shape[0])]
         print(f"Using {X_analysis.shape[0]} sequences extracted from peaks.")
@@ -1238,8 +1252,8 @@ class GenomicInterpreter:
             pos_indices = torch.arange(L).repeat_interleave(C)
             X_ism[torch.arange(C * L), :, pos_indices] = 0.0
             X_ism[torch.arange(C * L), base_indices, pos_indices] = 1.0
-            y_mut = tpred(model, X_ism, device=device)
-            diff_attr = y_mut.detach().cpu().numpy().squeeze() - y_orig
+            y_mut = tpred(model, X_ism, device=str(device))
+            diff_attr = y_mut.detach().cpu().numpy().squeeze() - y_orig  # type: ignore[union-attr]
             diff_attr = diff_attr.reshape(L, C).T
             return torch.tensor(diff_attr, dtype=torch.float32).unsqueeze(0)
     
@@ -1248,9 +1262,9 @@ class GenomicInterpreter:
         X_mut_test = one_hot_encode(consensus_seq).unsqueeze(0).float().to(self.device)
 
         # 5a. ISM Plot
-        X_ism_attr = saturation_mutagenesis(self.model, X_mut_test.cpu(), batch_size=128, device=self.device)
+        X_ism_attr = saturation_mutagenesis(self.model, X_mut_test.cpu(), batch_size=128, device=str(self.device))
         plt.figure(figsize=(12, 3))
-        plot_logo(X_ism_attr[0].detach().cpu().numpy().astype(float), ax=plt.subplot(111))
+        plot_logo(X_ism_attr[0].detach().cpu().numpy().astype(float), ax=plt.subplot(111))  # type: ignore[union-attr]
         plt.title("ISM (Prediction Difference)")
         save_or_show_plot("ISM_Attribution.png", self.config.output_dir)
 
@@ -1259,7 +1273,7 @@ class GenomicInterpreter:
         plt.figure(figsize=(12, 3))
         plot_logo(X_dl_attr[0].detach().cpu().numpy().astype(float), ax=plt.subplot(111))
         plt.title("DeepLiftShap Attribution on Consensus Sequence")
-        save_or_show_plot("DeepLiftShap_Consensus.png", self.config.output_dir)
+        save_or_show_plot("DeepLiftShap_Consensus.png", self.config.output_dir, subfolder="deeplift")
 
     def run_rc_comparison(self):
         """Compares forward and reverse complement predictions."""
@@ -1277,11 +1291,11 @@ class GenomicInterpreter:
         # Complement A->T, C->G, G->C, T->A (Index: 0->3, 1->2, 2->1, 3->0)
         X_rc = torch.index_select(X_rc, 1, torch.tensor([3, 2, 1, 0], dtype=torch.long, device=self.device))
 
-        y = tpred(self.model, X_orig, device=self.device)
-        y_rc = tpred(self.model, X_rc, device=self.device)
+        y = tpred(self.model, X_orig, device=str(self.device))
+        y_rc = tpred(self.model, X_rc, device=str(self.device))
 
         plt.figure(figsize=(12, 3))
-        plt.scatter(y.detach().cpu().numpy(), y_rc.detach().cpu().numpy(), alpha=0.5)
+        plt.scatter(y.detach().cpu().numpy(), y_rc.detach().cpu().numpy(), alpha=0.5)  # type: ignore[union-attr]
         plt.xlabel("Forward Prediction")
         plt.ylabel("Reverse Complement Prediction")
         plt.title("Forward vs Reverse Complement Prediction")
@@ -1433,7 +1447,7 @@ class GenomicInterpreter:
                 x = legend_x0 + i * cell_size
                 y = legend_y0 - j * cell_size
                 # Draw a circle instead of a rectangle
-                circ = plt.Circle((x + cell_size / 2, y - cell_size / 2), cell_size / 2.2, fill=False, edgecolor='k', linewidth=0.7)
+                circ = Circle((x + cell_size / 2, y - cell_size / 2), cell_size / 2.2, fill=False, edgecolor='k', linewidth=0.7)
                 plt.gca().add_patch(circ)
                 plt.text(x + cell_size / 2, y - cell_size / 2, f"{base_y}/{base_x}", 
                         ha='center', va='center', fontsize=8)
@@ -1451,7 +1465,7 @@ class GenomicInterpreter:
         # add red box around the middle four bases at the diagonal
         # the rectangle should be centered around the middle of the zoomed region and also diagonal
         middle = (zoom_start + zoom_end) // 2 - 1
-        rect = plt.Rectangle((middle, middle-0.5), 5, 0.8, linewidth=2, edgecolor='red', facecolor='none', linestyle='--', alpha=0.5)
+        rect = Rectangle((middle, middle-0.5), 5, 0.8, linewidth=2, edgecolor='red', facecolor='none', linestyle='--', alpha=0.5)
         # tilt the rectangle to match the diagonal
         rect.set_angle(45)  # Rotate the rectangle by 45 degrees
         plt.gca().add_patch(rect)
@@ -1595,6 +1609,7 @@ class GenomicInterpreter:
         norm = TwoSlopeNorm(vmin=-max_val, vcenter=0, vmax=max_val)
 
         # For each position in the range, create a slice
+        im = None
         for idx, fixed_k in enumerate(region_range):
             ax = axes[idx]
             
@@ -1649,6 +1664,10 @@ class GenomicInterpreter:
             axes[i].axis('off')
 
         # Global Colorbar
+        if im is None:
+            print("No data to plot for 3rd-order epistasis slices.")
+            plt.close(fig)
+            return
         cbar = fig.colorbar(im, ax=axes.ravel().tolist(), orientation='vertical', fraction=0.02, pad=0.04)
         cbar.set_label('Max 3rd Order Epistasis (ΔΔΔ)', fontsize=12)
 
@@ -1688,7 +1707,7 @@ class GenomicInterpreter:
         plot_logo(ixg_attr_np, ax=ax2)
         ax2.set_title("InputXGradient Attributions")
         plt.suptitle(f"Comparison of Attribution Methods for: {seq_name}", fontsize=14)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
         save_or_show_plot(f"comparison_{seq_name}.png", self.config.output_dir)
 
     def run_conv_filter_visualization(self):
@@ -1704,7 +1723,7 @@ class GenomicInterpreter:
         # --- 1. Load Data ---
         try:
             peaks = pd.read_csv(self.config.peaks_file, sep="\t", usecols=(0, 1, 2), names=['chrom', 'start', 'end'])
-            X_peaks = extract_loci(peaks, self.config.genome_fasta, in_window=self.config.peak_length).float()
+            X_peaks = extract_loci(peaks, self.config.genome_fasta, in_window=self.config.peak_length).float()  # type: ignore[union-attr]
             X_peaks = X_peaks[X_peaks.sum(dim=(1, 2)) == self.config.peak_length].to(self.device)
             X_analysis = X_peaks[:min(500 if self.config.test else self.config.max_seqs, X_peaks.shape[0])]
             
