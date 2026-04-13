@@ -1496,6 +1496,121 @@ python scripts/cli/run_sweep.py \\
 
 
 # ---------------------------------------------------------------------------
+# Tool 18: tfbs_validate (model validation on test/val set)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_validate",
+    annotations={
+        "title": "Submit Validation Job",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_validate(
+    checkpoint_path: str,
+    data_path: str,
+    model_name: str = "VCNNBpnet",
+    scaling_method: str = "standardize",
+    output_file: str | None = None,
+    partition: str = "gpu",
+    gpu_type: str | None = None,
+    max_time: str = "02:00:00",
+    job_name: str | None = None,
+) -> str:
+    """Submit a model validation job to SLURM.
+
+    Runs scripts/validate.py which loads a checkpoint, runs
+    trainer.validate() on the validation set, and appends the loss
+    to a CSV results file.
+
+    Args:
+        checkpoint_path: Path to the .ckpt model checkpoint.
+        data_path: Path to the dataset (tensor directory or CSV).
+        model_name: Model class name (e.g. "VCNNBpnet", "RNN").
+        scaling_method: Label scaling ("standardize", "normalize", "none").
+        output_file: CSV file to append results to.  Defaults to
+                     results/validation_results.csv in the project dir.
+        partition: SLURM partition (default "gpu").
+        gpu_type: GPU gres string (e.g. "nvidia_a100_80gb_pcie:1").
+                  If omitted, requests 1 generic GPU.
+        max_time: SLURM wall time (default "02:00:00").
+        job_name: SLURM job name (default "tfbs_validate").
+
+    Returns:
+        JSON with job_id, the generated sbatch script, and the
+        validation command.
+    """
+    project_root = Path(__file__).resolve().parent.parent.parent
+    validate_script = project_root / "scripts" / "validate.py"
+
+    if not validate_script.exists():
+        return json.dumps({"error": f"validate.py not found at {validate_script}"})
+
+    ckpt = Path(checkpoint_path).resolve()
+    if not ckpt.exists():
+        return json.dumps({"error": f"Checkpoint not found: {checkpoint_path}"})
+
+    data = Path(data_path).resolve()
+    if not data.exists():
+        return json.dumps({"error": f"Data path not found: {data_path}"})
+
+    if output_file is None:
+        output_file = str(project_root / "results" / "validation_results.csv")
+
+    gres = f"gpu:{gpu_type}" if gpu_type else "gpu:1"
+    name = job_name or "tfbs_validate"
+
+    validate_cmd = (
+        f"python {validate_script}"
+        f" --checkpoint_path {ckpt}"
+        f" --model_name {model_name}"
+        f" --data_path {data}"
+        f" --scaling_method {scaling_method}"
+        f" --output_file {output_file}"
+    )
+
+    sbatch_script = (
+        f"#!/bin/bash\n"
+        f"#SBATCH --job-name={name}\n"
+        f"#SBATCH --partition={partition}\n"
+        f"#SBATCH --nodes=1\n"
+        f"#SBATCH --cpus-per-task=8\n"
+        f"#SBATCH --mem=64G\n"
+        f"#SBATCH --gres={gres}\n"
+        f"#SBATCH --time={max_time}\n"
+        f"#SBATCH --output=outs/validate.o%j\n"
+        f"#SBATCH --error=outs/validate.e%j\n"
+        f"\ndate\n"
+        f"{validate_cmd}\n"
+        f"date\n"
+    )
+
+    import os as _os
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".sh", delete=False, prefix="tfbs_validate_",
+    )
+    tmp.write(sbatch_script)
+    tmp.close()
+    _os.chmod(tmp.name, 0o755)
+
+    # Ensure outs/ directory exists
+    outs_dir = project_root / "scripts" / "cli" / "outs"
+    outs_dir.mkdir(parents=True, exist_ok=True)
+
+    submit_result = json.loads(await slurm_submit(
+        script_path=tmp.name,
+        working_dir=str(project_root / "scripts" / "cli"),
+    ))
+
+    submit_result["mode"] = "validate"
+    submit_result["validate_command"] = validate_cmd
+    submit_result["sbatch_script"] = sbatch_script
+    return json.dumps(submit_result)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
