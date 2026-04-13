@@ -18,6 +18,7 @@ Key functionalities:
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import List, Tuple
 
@@ -155,9 +156,11 @@ def plot_sequence_logo(sequences: List[str], title: str, save_path: Path) -> Non
 
     plt.figure(figsize=(12, 3))
     logo = Logo(info_df)
-    logo.ax.set_title(title)
-    logo.ax.set_ylabel("bits")
-    logo.ax.set_xlabel("Position")
+    ax = logo.ax
+    assert ax is not None
+    ax.set_title(title)
+    ax.set_ylabel("bits")
+    ax.set_xlabel("Position")
     plt.ylim(0, 1)
     plt.tight_layout()
     os.makedirs(save_path.parent, exist_ok=True)
@@ -348,7 +351,7 @@ def main() -> None:
         genome,  # Pass the loaded pyfaidx.Fasta object directly
         verbose=True,
         in_window=args.peak_window
-    ).float()
+    ).float()  # type: ignore[union-attr]
 
     # We are done with the genome file
     genome.close()
