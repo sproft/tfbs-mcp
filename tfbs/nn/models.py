@@ -29,6 +29,20 @@ class BaseModel(pl.LightningModule):
     It's designed to be flexible for both classification and regression tasks and
     now supports models with single or multiple inputs.
     """
+    # TODO (Option B — post-publication): Store label scaling params directly in the model
+    # checkpoint so they travel with the weights. This requires:
+    #   1. Add label_mean: float | None = None, label_std: float | None = None
+    #      (and label_min/label_max for normalize) to __init__ kwargs
+    #   2. save_hyperparameters() will automatically persist them in the checkpoint
+    #   3. Add a reverse_transform() method on BaseModel that uses these params
+    #   4. Modify TFBSDataModule.setup() to pass the computed scaling params to
+    #      the model: model.label_mean = self.mean, etc. (via a trainer callback
+    #      or by setting them before trainer.fit)
+    #   5. The MCP server can then read scaling params from the loaded model's
+    #      hparams instead of needing a separate scaling_params.json file
+    #   6. Retrain all models so the new hparams are saved in checkpoints
+    # Current approach (Option A): scaling_params.json is saved by TFBSDataModule
+    # and loaded by the MCP server via tfbs_load_model(data_path=...).
     def __init__(
             self,
             input_length: int,
@@ -39,7 +53,7 @@ class BaseModel(pl.LightningModule):
         Args:
             input_length (int): The number of input features or the length of the input sequence.
             learning_rate (float): The learning rate for the optimizer.
-            classify (bool): If True, the model is set up for binary classification. 
+            classify (bool): If True, the model is set up for binary classification.
                              Otherwise, it's set up for regression.
         """
         super().__init__()

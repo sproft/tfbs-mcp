@@ -236,6 +236,7 @@ async def tfbs_load_model(
     checkpoint_path: str,
     model_type: str,
     device: str | None = None,
+    data_path: str | None = None,
 ) -> str:
     """Load a trained TFBS model checkpoint into the server's memory.
 
@@ -249,6 +250,9 @@ async def tfbs_load_model(
                     (e.g. "VCNNBpnet", "RNN").
         device: "cpu" or "cuda".  Auto-detected if omitted (uses GPU when
                 available on SLURM, CPU otherwise).
+        data_path: Optional path to the training data directory.  If
+                   provided, loads scaling_params.json so predictions
+                   can be inverse-transformed to real-world units.
 
     Returns:
         JSON with model_id, model_type, input_length, classify flag, and device.
@@ -285,12 +289,21 @@ async def tfbs_load_model(
     input_length = getattr(model, "input_length", None)
     classify = getattr(model, "classify", False)
 
+    # Load scaling parameters if available
+    scaling_params = None
+    if data_path:
+        sp_path = Path(data_path) / "scaling_params.json"
+        if sp_path.exists():
+            with open(sp_path) as f:
+                scaling_params = json.load(f)
+
     _model_registry[model_id] = {
         "model": model,
         "model_type": model_type,
         "device": device,
         "input_length": input_length,
         "classify": classify,
+        "scaling_params": scaling_params,
     }
 
     return json.dumps({
@@ -299,6 +312,7 @@ async def tfbs_load_model(
         "input_length": input_length,
         "classify": classify,
         "device": device,
+        "scaling_params": scaling_params,
     })
 
 
@@ -321,6 +335,7 @@ async def tfbs_predict(
     window_mode: bool = False,
     window_size: int = 70,
     batch_size: int | None = None,
+    inverse_transform: bool = False,
 ) -> str:
     """Score DNA sequences for transcription-factor binding affinity.
 
@@ -335,10 +350,16 @@ async def tfbs_predict(
         window_size: Window length for sliding-window mode.
         batch_size: Batch size for processing.  Auto-detected if omitted
                     (512 on GPU, 64 on CPU).
+        inverse_transform: If true, reverse any label scaling that was
+                           applied during training (requires scaling_params
+                           to have been loaded via data_path in
+                           tfbs_load_model).  Only affects regression
+                           models.
 
     Returns:
         JSON with "scores" (normal) or "best_scores", "best_sequences",
-        and "mean_scores" (window mode).
+        and "mean_scores" (window mode).  If inverse_transform is true,
+        scores are in the original label space.
     """
     _ensure_imports()
     _validate_dna(sequences)
@@ -352,22 +373,42 @@ async def tfbs_predict(
 
     X = _sequences_to_tensor(sequences).to(device)
 
+    # Helper: apply inverse scaling to numpy scores
+    def _inverse(scores_np):
+        if not inverse_transform:
+            return scores_np
+        sp = entry.get("scaling_params")
+        if sp is None:
+            return scores_np  # no scaling params available
+        if sp.get("scaling_method") == "standardize":
+            return scores_np * sp["std"] + sp["mean"]
+        if sp.get("scaling_method") == "normalize":
+            return scores_np * (sp["max"] - sp["min"]) + sp["min"]
+        return scores_np
+
     if window_mode:
         best_windows, best_scores, _, mean_scores = _find_best_windows_fast(
             X, model, window_size=window_size,
             processing_batch_size=batch_size, device=device,
         )
         best_seqs = _tensor_to_sequences(_torch.from_numpy(best_windows))
-        return json.dumps({
-            "best_scores": best_scores.tolist(),
+        result = {
+            "best_scores": _inverse(best_scores).tolist(),
             "best_sequences": best_seqs,
-            "mean_scores": mean_scores.tolist(),
-        })
+            "mean_scores": _inverse(mean_scores).tolist(),
+        }
+        if inverse_transform and entry.get("scaling_params"):
+            result["inverse_transformed"] = True
+        return json.dumps(result)
 
     with _torch.no_grad():
         scores = model(X).cpu().numpy()
 
-    return json.dumps({"scores": scores.squeeze().tolist()})
+    scores = _inverse(scores)
+    result = {"scores": scores.squeeze().tolist()}
+    if inverse_transform and entry.get("scaling_params"):
+        result["inverse_transformed"] = True
+    return json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
