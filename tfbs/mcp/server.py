@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +173,17 @@ def _validate_dna(sequences: list[str]) -> None:
                 f"Sequence {i} contains invalid characters: {bad}. "
                 "Only A, C, G, T are allowed."
             )
+
+
+def _tail_file(path: str, n: int = 100) -> str:
+    """Read the last *n* lines of a file efficiently."""
+    try:
+        with open(path) as f:
+            return "\n".join(deque(f, maxlen=n))
+    except FileNotFoundError:
+        return f"[File not found: {path}]"
+    except PermissionError:
+        return f"[Permission denied: {path}]"
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +953,546 @@ async def tfbs_server_info() -> str:
     info["loaded_models"] = list(_model_registry.keys())
 
     return json.dumps(info)
+
+
+# ---------------------------------------------------------------------------
+# Tool 11: slurm_submit
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_submit",
+    annotations={
+        "title": "Submit SLURM Job",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def slurm_submit(
+    script_path: str,
+    args: list[str] | None = None,
+    sbatch_flags: list[str] | None = None,
+    working_dir: str | None = None,
+) -> str:
+    """Submit a batch job to the SLURM scheduler via sbatch.
+
+    Builds and executes: ``sbatch [sbatch_flags...] script_path [args...]``
+
+    Args:
+        script_path: Absolute path to the sbatch script to submit.
+        args: Extra arguments appended after the script path.
+        sbatch_flags: Extra flags inserted before the script path
+                      (e.g. ["--partition=gpu", "--gres=gpu:1"]).
+        working_dir: Directory to run sbatch from.  Defaults to the
+                     script's parent directory.
+
+    Returns:
+        JSON with job_id, submit_command, and any stderr from sbatch.
+    """
+    script = Path(script_path).resolve()
+    if not script.is_file():
+        return json.dumps({"error": f"Script not found or not a file: {script_path}"})
+
+    if shutil.which("sbatch") is None:
+        return json.dumps({"error": "sbatch binary not found on PATH"})
+
+    cmd: list[str] = ["sbatch"]
+    if sbatch_flags:
+        cmd.extend(sbatch_flags)
+    cmd.append(str(script))
+    if args:
+        cmd.extend(args)
+
+    cwd = working_dir or str(script.parent)
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
+
+    if result.returncode != 0:
+        return json.dumps({
+            "error": f"sbatch failed (exit {result.returncode})",
+            "stderr": result.stderr.strip(),
+            "submit_command": " ".join(cmd),
+        })
+
+    # Parse job ID from "Submitted batch job 12345"
+    job_id = None
+    for word in result.stdout.strip().split():
+        if word.isdigit():
+            job_id = word
+            break
+
+    return json.dumps({
+        "job_id": job_id,
+        "submit_command": " ".join(cmd),
+        "stderr": result.stderr.strip() if result.stderr.strip() else None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 12: slurm_status
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_status",
+    annotations={
+        "title": "Check SLURM Job Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def slurm_status(
+    job_id: str,
+) -> str:
+    """Check the current state of a SLURM job.
+
+    Tries squeue first (for running/pending jobs), then falls back to
+    sacct (for completed/failed jobs) to retrieve status information.
+
+    Args:
+        job_id: The SLURM job ID to query.
+
+    Returns:
+        JSON with job_id, state, node, elapsed, submit_time, and
+        exit_code (exit_code only available from sacct).
+    """
+    # Try squeue first (running / pending jobs)
+    try:
+        sq = subprocess.run(
+            ["squeue", "-j", job_id, "--noheader", "--format=%i|%T|%N|%M|%V"],
+            capture_output=True, text=True, timeout=30,
+        )
+        line = sq.stdout.strip()
+        if line:
+            parts = line.split("|")
+            return json.dumps({
+                "job_id": parts[0].strip() if len(parts) > 0 else job_id,
+                "state": parts[1].strip() if len(parts) > 1 else "UNKNOWN",
+                "node": parts[2].strip() if len(parts) > 2 else None,
+                "elapsed": parts[3].strip() if len(parts) > 3 else None,
+                "submit_time": parts[4].strip() if len(parts) > 4 else None,
+                "exit_code": None,
+            })
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Fall back to sacct (completed / historical jobs)
+    try:
+        sa = subprocess.run(
+            [
+                "sacct", "-j", job_id, "--noheader", "--parsable2",
+                "--format=JobID,State,NodeList,Elapsed,Submit,ExitCode",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        for raw_line in sa.stdout.strip().splitlines():
+            parts = raw_line.split("|")
+            # Filter to main job line (skip .batch / .extern steps)
+            if parts and parts[0].strip() == job_id:
+                return json.dumps({
+                    "job_id": parts[0].strip(),
+                    "state": parts[1].strip() if len(parts) > 1 else "UNKNOWN",
+                    "node": parts[2].strip() if len(parts) > 2 else None,
+                    "elapsed": parts[3].strip() if len(parts) > 3 else None,
+                    "submit_time": parts[4].strip() if len(parts) > 4 else None,
+                    "exit_code": parts[5].strip() if len(parts) > 5 else None,
+                })
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return json.dumps({"job_id": job_id, "state": "NOT_FOUND", "error": "Job not found in squeue or sacct"})
+
+
+# ---------------------------------------------------------------------------
+# Tool 13: slurm_logs
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_logs",
+    annotations={
+        "title": "Read SLURM Job Logs",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def slurm_logs(
+    job_id: str,
+    log_type: str = "stderr",
+    tail: int = 100,
+) -> str:
+    """Read stdout and/or stderr log files for a SLURM job.
+
+    Uses sacct to locate the log file paths, then reads the last
+    ``tail`` lines from each requested file.
+
+    Args:
+        job_id: The SLURM job ID whose logs to read.
+        log_type: Which log to read: "stdout", "stderr", or "both".
+        tail: Number of lines to read from the end of each log file.
+
+    Returns:
+        JSON with job_id, log_paths dict, and the content of requested
+        log files.  Missing files are reported with an error message.
+    """
+    stdout_path = None
+    stderr_path = None
+
+    try:
+        sa = subprocess.run(
+            [
+                "sacct", "-j", job_id, "--noheader", "--parsable2",
+                "--format=JobID,WorkDir,StdOut,StdErr",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        for raw_line in sa.stdout.strip().splitlines():
+            parts = raw_line.split("|")
+            # Filter to main job line (skip .batch / .extern steps)
+            if parts and parts[0].strip() == job_id:
+                stdout_path = parts[2].strip() if len(parts) > 2 else None
+                stderr_path = parts[3].strip() if len(parts) > 3 else None
+                break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return json.dumps({"error": "sacct not available or timed out"})
+
+    log_paths: dict[str, str | None] = {
+        "stdout": stdout_path,
+        "stderr": stderr_path,
+    }
+    result: dict[str, Any] = {"job_id": job_id, "log_paths": log_paths}
+
+    if log_type in ("stdout", "both") and stdout_path:
+        result["stdout"] = _tail_file(stdout_path, tail)
+    if log_type in ("stderr", "both") and stderr_path:
+        result["stderr"] = _tail_file(stderr_path, tail)
+
+    # Handle case where paths were not found
+    if log_type in ("stdout", "both") and not stdout_path:
+        result["stdout"] = "[stdout path not found in sacct output]"
+    if log_type in ("stderr", "both") and not stderr_path:
+        result["stderr"] = "[stderr path not found in sacct output]"
+
+    return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Tool 14: slurm_cancel
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_cancel",
+    annotations={
+        "title": "Cancel SLURM Job",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def slurm_cancel(
+    job_id: str,
+) -> str:
+    """Cancel a running or pending SLURM job.
+
+    Args:
+        job_id: The SLURM job ID to cancel.
+
+    Returns:
+        JSON with job_id, cancelled (bool), and any stderr from scancel.
+    """
+    try:
+        result = subprocess.run(
+            ["scancel", job_id],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError:
+        return json.dumps({"error": "scancel binary not found on PATH"})
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "scancel timed out"})
+
+    return json.dumps({
+        "job_id": job_id,
+        "cancelled": result.returncode == 0,
+        "stderr": result.stderr.strip() if result.stderr.strip() else None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 15: slurm_watch
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_watch",
+    annotations={
+        "title": "Watch SLURM Job",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def slurm_watch(
+    job_id: str,
+    check_interval: str = "1h",
+    context: str | None = None,
+) -> str:
+    """Request monitoring of a SLURM job.
+
+    This is a placeholder that returns instructions for the LLM client
+    to set up recurring status checks.  The MCP server itself cannot
+    create Claude Code scheduled agents — the LLM acts on the returned
+    instructions to configure monitoring via CronCreate or /schedule.
+
+    Args:
+        job_id: The SLURM job ID to monitor.
+        check_interval: How often to check (e.g. "30m", "1h", "2h").
+        context: Optional description of what the job is doing, to
+                 include in status check messages.
+
+    Returns:
+        JSON with job_id, check_interval, context, and instructions
+        for the LLM to set up scheduled monitoring.
+    """
+    instructions = (
+        f"Set up a recurring check for SLURM job {job_id} every {check_interval}. "
+        "Use CronCreate or /schedule to create a scheduled agent that: "
+        f"1) Calls slurm_status with job_id='{job_id}' to get the current state. "
+        f"2) Calls slurm_logs with job_id='{job_id}' and log_type='stderr' to check for errors. "
+        "3) Reports the status to the user. "
+        "4) If the job has completed (COMPLETED, FAILED, CANCELLED, TIMEOUT), "
+        "report the final status and exit code, then cancel the scheduled check."
+    )
+
+    return json.dumps({
+        "job_id": job_id,
+        "check_interval": check_interval,
+        "context": context,
+        "instructions": instructions,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 16: tfbs_train
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_train",
+    annotations={
+        "title": "Submit Training Job",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_train(
+    script: str | None = None,
+    config_path: str | None = None,
+    partition: str = "gpu",
+    gpu_type: str | None = None,
+    max_time: str = "48:00:00",
+    job_name: str | None = None,
+    extra_args: list[str] | None = None,
+) -> str:
+    """Submit a TFBS model training job to SLURM.
+
+    Two modes of operation:
+
+    **Script mode** — provide ``script`` to submit an existing sbatch
+    script directly.
+
+    **Config mode** — provide ``config_path`` to auto-generate an
+    sbatch script that invokes the Lightning CLI trainer with the
+    given YAML config.
+
+    Args:
+        script: Path to an existing sbatch script (script mode).
+        config_path: Path to a Lightning CLI YAML config (config mode).
+        partition: SLURM partition (default "gpu").
+        gpu_type: GPU type constraint (e.g. "a100", "v100").
+        max_time: Maximum wall-clock time (default "48:00:00").
+        job_name: SLURM job name.  Auto-generated if omitted.
+        extra_args: Additional CLI arguments appended to the training
+                    command (config mode only).
+
+    Returns:
+        JSON with mode, job_id, submit_command, and (for config mode)
+        the generated sbatch script content.
+    """
+    # Validate: exactly one of script or config_path
+    if script and config_path:
+        return json.dumps({"error": "Provide exactly one of 'script' or 'config_path', not both."})
+    if not script and not config_path:
+        return json.dumps({"error": "Provide exactly one of 'script' or 'config_path'."})
+
+    # Script mode
+    if script:
+        script_p = Path(script).resolve()
+        if not script_p.is_file():
+            return json.dumps({"error": f"Script not found: {script}"})
+        result = await slurm_submit(script_path=str(script_p))
+        result_dict = json.loads(result)
+        result_dict["mode"] = "script"
+        return json.dumps(result_dict)
+
+    # Config mode
+    config_p = Path(config_path).resolve()
+    if not config_p.is_file():
+        return json.dumps({"error": f"Config not found: {config_path}"})
+
+    if job_name is None:
+        job_name = f"tfbs_train_{config_p.stem}"
+
+    gres_line = ""
+    if gpu_type:
+        gres_line = f"#SBATCH --gres=gpu:{gpu_type}:1"
+    else:
+        gres_line = "#SBATCH --gres=gpu:1"
+
+    train_cmd = f"python /sc-projects/sc-proj-cc17-P09_TFBS/scripts/cli/train_cli.py fit --config {config_p}"
+    if extra_args:
+        train_cmd += " " + " ".join(extra_args)
+
+    sbatch_content = f"""#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --partition={partition}
+{gres_line}
+#SBATCH --time={max_time}
+#SBATCH --output={job_name}_%j.out
+#SBATCH --error={job_name}_%j.err
+#SBATCH --ntasks=1
+
+{train_cmd}
+"""
+
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False, prefix="tfbs_")
+    tmp.write(sbatch_content)
+    tmp.close()
+    os.chmod(tmp.name, 0o755)
+
+    result = await slurm_submit(script_path=tmp.name, working_dir=str(config_p.parent))
+    result_dict = json.loads(result)
+    result_dict["mode"] = "config"
+    result_dict["generated_script"] = sbatch_content
+    return json.dumps(result_dict)
+
+
+# ---------------------------------------------------------------------------
+# Tool 17: tfbs_sweep
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_sweep",
+    annotations={
+        "title": "Submit WandB Sweep",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_sweep(
+    sweep_config: str,
+    project_name: str,
+    model: str,
+    data_path: str,
+    data_name: str,
+    scaling_method: str = "standardize",
+    n_trials: int = 50,
+    partition: str = "gpu",
+    gpu_type: str | None = None,
+) -> str:
+    """Create a WandB sweep and submit an agent job to SLURM.
+
+    Steps:
+      1. Run ``wandb sweep`` to create the sweep and obtain a sweep ID.
+      2. Generate a temporary sbatch script that launches a sweep agent.
+      3. Submit the agent job via sbatch.
+
+    Args:
+        sweep_config: Path to a WandB sweep YAML config file.
+        project_name: WandB project name for the sweep.
+        model: Model architecture name (e.g. "VCNNBpnet").
+        data_path: Path to the training data directory.
+        data_name: Dataset name (e.g. "all_mean").
+        scaling_method: Label scaling method (default "standardize").
+        n_trials: Number of sweep trials to run (default 50).
+        partition: SLURM partition (default "gpu").
+        gpu_type: GPU type constraint (e.g. "a100").
+
+    Returns:
+        JSON with sweep_id, job_id, and submit_command.
+    """
+    sweep_p = Path(sweep_config).resolve()
+    if not sweep_p.is_file():
+        return json.dumps({"error": f"Sweep config not found: {sweep_config}"})
+
+    if shutil.which("wandb") is None:
+        return json.dumps({"error": "wandb binary not found on PATH"})
+
+    # Step 1: Create the sweep
+    try:
+        sw = subprocess.run(
+            ["wandb", "sweep", str(sweep_p), "--project", project_name],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "wandb sweep creation timed out"})
+
+    if sw.returncode != 0:
+        return json.dumps({
+            "error": f"wandb sweep failed (exit {sw.returncode})",
+            "stderr": sw.stderr.strip(),
+        })
+
+    # Parse sweep ID from output (check both stdout and stderr)
+    sweep_id = None
+    for line in (sw.stdout + "\n" + sw.stderr).splitlines():
+        if "ID:" in line:
+            # Formats: "Creating sweep with ID: xxx" or "wandb: Created sweep with ID: xxx"
+            sweep_id = line.split("ID:")[-1].strip()
+            break
+
+    if not sweep_id:
+        return json.dumps({
+            "error": "Could not parse sweep ID from wandb output",
+            "stdout": sw.stdout.strip(),
+            "stderr": sw.stderr.strip(),
+        })
+
+    # Step 2: Build sbatch script for the sweep agent
+    gres_line = ""
+    if gpu_type:
+        gres_line = f"#SBATCH --gres=gpu:{gpu_type}:1"
+    else:
+        gres_line = "#SBATCH --gres=gpu:1"
+
+    sbatch_content = f"""#!/bin/bash
+#SBATCH --job-name=sweep_{sweep_id}
+#SBATCH --partition={partition}
+{gres_line}
+#SBATCH --time=48:00:00
+#SBATCH --output=sweep_{sweep_id}_%j.out
+#SBATCH --error=sweep_{sweep_id}_%j.err
+#SBATCH --ntasks=1
+
+python scripts/cli/run_sweep.py \\
+    --model {model} \\
+    --data-path {data_path} \\
+    --data-name {data_name} \\
+    --scaling-method {scaling_method} \\
+    --n-trials {n_trials} \\
+    --sweep-id {sweep_id} \\
+    --project-name {project_name}
+"""
+
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False, prefix="tfbs_")
+    tmp.write(sbatch_content)
+    tmp.close()
+    os.chmod(tmp.name, 0o755)
+
+    # Step 3: Submit via sbatch
+    result = await slurm_submit(script_path=tmp.name)
+    result_dict = json.loads(result)
+    result_dict["sweep_id"] = sweep_id
+    return json.dumps(result_dict)
 
 
 # ---------------------------------------------------------------------------
