@@ -1611,6 +1611,206 @@ async def tfbs_validate(
 
 
 # ---------------------------------------------------------------------------
+# Tool 19: tfbs_config (generate LightningCLI YAML config)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_config",
+    annotations={
+        "title": "Generate Training Config",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_config(
+    model_type: str,
+    data_path: str,
+    output_path: str,
+    input_length: int = 24,
+    scaling_method: str = "standardize",
+    batch_size: int = 64,
+    max_epochs: int = 500,
+    patience: int = 5,
+    learning_rate: float = 0.001,
+    classify: bool = False,
+    wandb_project: str | None = None,
+    checkpoint_dir: str | None = None,
+    checkpoint_filename: str | None = None,
+    model_params: dict | None = None,
+) -> str:
+    """Generate a LightningCLI YAML config file for training.
+
+    Creates a complete config with model, data, and trainer sections
+    that can be passed directly to tfbs_train.
+
+    Supported model types: VCNNBpnet, RNN.  Model-specific
+    hyperparameters are passed via model_params dict.
+
+    VCNNBpnet model_params keys:
+      num_channels (int, default 64), kernel_size (int, default 21),
+      dilations (list[int], default [1,1,2,4,8]),
+      pool_output_size (int, default 128),
+      dense_sizes (list[int], default [128,64])
+
+    RNN model_params keys:
+      conv_out_channels (int, default 100), kernel_size (int, default 5),
+      pool_size (int, default 2), dropout_conv (float, default 0.3),
+      gru_hidden_size (int, default 100), gru_num_layers (int, default 1),
+      bidirectional (bool, default true),
+      dense_size (int, default 100), dropout_fc (float, default 0.6)
+
+    Args:
+        model_type: Architecture name ("VCNNBpnet" or "RNN").
+        data_path: Path to dataset (tensor directory or CSV).
+        output_path: Where to write the YAML config file.
+        input_length: Sequence length (default 24).
+        scaling_method: Label scaling ("standardize", "normalize", "none").
+        batch_size: Training batch size (default 64).
+        max_epochs: Maximum training epochs (default 500).
+        patience: Early stopping patience (default 5).
+        learning_rate: Optimizer learning rate (default 0.001).
+        classify: If true, use BCE loss; else MSE (default false).
+        wandb_project: WandB project name for logging.  If omitted,
+                       no WandB logger is configured.
+        checkpoint_dir: Directory to save checkpoints.  Defaults to
+                        saved_models/<data_name>/<scaling_method>.
+        checkpoint_filename: Checkpoint filename (default "best_<model_type>").
+        model_params: Dict of model-specific hyperparameters (see above).
+
+    Returns:
+        JSON with "output_path", "config_preview" (first 40 lines),
+        and "model_type".
+    """
+    import yaml
+
+    valid_models = {"VCNNBpnet", "RNN"}
+    if model_type not in valid_models:
+        return json.dumps({
+            "error": f"Unknown model_type '{model_type}'. Must be one of: {sorted(valid_models)}"
+        })
+
+    data = Path(data_path).resolve()
+    if not data.exists():
+        return json.dumps({"error": f"Data path not found: {data_path}"})
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    params = model_params or {}
+
+    # --- Model section ---
+    base_args = {
+        "input_length": input_length,
+        "learning_rate": learning_rate,
+        "classify": classify,
+        "input_channels": 4,
+    }
+
+    if model_type == "VCNNBpnet":
+        model_args = {
+            "num_channels": params.get("num_channels", 64),
+            "kernel_size": params.get("kernel_size", 21),
+            "dilations": params.get("dilations", [1, 1, 2, 4, 8]),
+            "pool_output_size": params.get("pool_output_size", 128),
+            "dense_sizes": params.get("dense_sizes", [128, 64]),
+        }
+    elif model_type == "RNN":
+        model_args = {
+            "conv_out_channels": params.get("conv_out_channels", 100),
+            "kernel_size": params.get("kernel_size", 5),
+            "pool_size": params.get("pool_size", 2),
+            "dropout_conv": params.get("dropout_conv", 0.3),
+            "gru_hidden_size": params.get("gru_hidden_size", 100),
+            "gru_num_layers": params.get("gru_num_layers", 1),
+            "bidirectional": params.get("bidirectional", True),
+            "dense_size": params.get("dense_size", 100),
+            "dropout_fc": params.get("dropout_fc", 0.6),
+        }
+
+    model_args.update(base_args)
+
+    # --- Trainer section ---
+    data_name = data.name
+    ckpt_dir = checkpoint_dir or str(
+        project_root / "saved_models" / data_name / scaling_method
+    )
+    ckpt_filename = checkpoint_filename or f"best_{model_type}"
+
+    callbacks = [
+        {
+            "class_path": "pytorch_lightning.callbacks.EarlyStopping",
+            "init_args": {
+                "monitor": "val_loss",
+                "patience": patience,
+                "mode": "min",
+            },
+        },
+        {
+            "class_path": "pytorch_lightning.callbacks.ModelCheckpoint",
+            "init_args": {
+                "dirpath": ckpt_dir,
+                "filename": ckpt_filename,
+                "monitor": "val_loss",
+                "mode": "min",
+                "save_top_k": 1,
+            },
+        },
+    ]
+
+    trainer: dict = {
+        "accelerator": "auto",
+        "devices": "auto",
+        "max_epochs": max_epochs,
+        "log_every_n_steps": 10,
+        "callbacks": callbacks,
+    }
+
+    if wandb_project:
+        trainer["logger"] = [
+            {
+                "class_path": "pytorch_lightning.loggers.WandbLogger",
+                "init_args": {
+                    "project": wandb_project,
+                    "log_model": False,
+                },
+            }
+        ]
+
+    # --- Assemble full config ---
+    config = {
+        "seed_everything": 42,
+        "trainer": trainer,
+        "model": {
+            "class_path": f"tfbs.nn.models.{model_type}",
+            "init_args": model_args,
+        },
+        "data": {
+            "data_path": str(data),
+            "batch_size": batch_size,
+            "num_workers": 24,
+            "preprocess": False,
+            "scaling_method": scaling_method,
+        },
+    }
+
+    # --- Write file ---
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    # Read back for preview
+    with open(out) as f:
+        lines = f.readlines()
+    preview = "".join(lines[:40])
+
+    return json.dumps({
+        "output_path": str(out),
+        "model_type": model_type,
+        "config_preview": preview,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
