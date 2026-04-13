@@ -62,6 +62,9 @@ def plot_and_calculate_auc(
         print(f"Warning: FIMO file not found for positive TF '{tf_pos}'. Skipping FIMO curves.")
         pos_fimo = None
 
+    curve_type_str = "PR" if pr else "ROC"
+    score_type_str = "mean" if mean else "max"
+
     for ax, tf_neg in zip(axes, tfs_neg):
         # --- Plot curves for each NN model ---
         for model in models:
@@ -104,6 +107,7 @@ def plot_and_calculate_auc(
                 continue
 
         # --- Plot FIMO curve for comparison ---
+        neg_fimo = None
         if pos_fimo is not None:
             try:
                 fimo_neg_path = os.path.join(base_results_path, "FIMO", "500", tf_neg, "fimo.tsv")
@@ -131,12 +135,10 @@ def plot_and_calculate_auc(
                 print(f"Warning: FIMO file not found for negative TF '{tf_neg}'. Skipping FIMO curve.")
 
         # --- Finalize subplot appearance ---
-        curve_type_str = "PR" if pr else "ROC"
-        score_type_str = "mean" if mean else "max"
         title = f"{curve_type_str}-curve: {tf_pos.replace('-','.')} vs {tf_neg.replace('-','.')}"
 
         if pr:
-            ratio = len(pos_fimo) / (len(pos_fimo) + len(neg_fimo)) if pos_fimo is not None and (len(pos_fimo) + len(neg_fimo)) > 0 else 0
+            ratio = len(pos_fimo) / (len(pos_fimo) + len(neg_fimo)) if pos_fimo is not None and neg_fimo is not None and (len(pos_fimo) + len(neg_fimo)) > 0 else 0
             ax.plot([0, 1], [ratio, ratio], 'k--', linewidth=1.0, label=f'Baseline ({ratio:.2f})')
             ax.set_xlabel("Recall", fontsize=label_fs)
             ax.set_ylabel("Precision", fontsize=label_fs)
