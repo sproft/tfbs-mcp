@@ -152,12 +152,26 @@ def _ensure_genomics_imports():
 
 
 def _get_genome(genome_fasta: str):
-    """Load and cache a pyfaidx.Fasta genome handle."""
+    """Load a pyfaidx.Fasta genome handle, reopening if stale.
+
+    pyfaidx file handles can close between async calls.  We detect
+    this via a probe read and reopen when necessary.
+    """
     _ensure_genomics_imports()
     path = str(Path(genome_fasta).resolve())
-    if path not in _genome_cache:
-        _genome_cache[path] = _pyfaidx.Fasta(path)
-    return _genome_cache[path]
+    genome = _genome_cache.get(path)
+    if genome is not None:
+        try:
+            # Probe: attempt a minimal read to verify handle is alive
+            first_chrom = next(iter(genome.keys()))
+            _ = genome[first_chrom][0:1]
+        except (ValueError, StopIteration):
+            # File handle closed — reopen
+            genome = None
+    if genome is None:
+        genome = _pyfaidx.Fasta(path)
+        _genome_cache[path] = genome
+    return genome
 
 
 # ---------------------------------------------------------------------------
@@ -2104,13 +2118,21 @@ async def tfbs_prepare_dataset(
     if labels.dim() == 1:
         labels = labels.unsqueeze(1)
 
+    n = len(seqs)
+    if n < 3:
+        return json.dumps({
+            "error": f"Need at least 3 sequences for train/val/test split, got {n}."
+        })
+
     # Split: first test, then val from remaining
-    indices = _np.arange(len(seqs))
+    indices = _np.arange(n)
+    n_test = max(1, int(n * test_size))
+    n_val = max(1, int((n - n_test) * val_size))
     train_idx, test_idx = train_test_split(
-        indices, test_size=test_size, shuffle=True, random_state=random_seed,
+        indices, test_size=n_test, shuffle=True, random_state=random_seed,
     )
     train_idx, val_idx = train_test_split(
-        train_idx, test_size=val_size, shuffle=True, random_state=random_seed,
+        train_idx, test_size=n_val, shuffle=True, random_state=random_seed,
     )
 
     def _save_split(split_name, idx):
@@ -2413,12 +2435,15 @@ async def tfbs_seqlets(
     # Sum across channels for seqlet discovery: (N, 4, L) → (N, L)
     attr_sum = attr_np.sum(axis=1)
 
-    # Discover seqlets
-    seqlets = recursive_seqlets(
-        attr_sum,
-        min_seqlet_len=min_seqlet_len,
-        max_seqlet_len=max_seqlet_len,
-    )
+    # Discover seqlets — recursive_seqlets can fail with too few sequences
+    try:
+        seqlets = recursive_seqlets(
+            attr_sum,
+            min_seqlet_len=min_seqlet_len,
+            max_seqlet_len=max_seqlet_len,
+        )
+    except (ZeroDivisionError, ValueError):
+        seqlets = []
 
     seqlet_list = []
     for s in seqlets:
