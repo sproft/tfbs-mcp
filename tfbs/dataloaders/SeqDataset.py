@@ -61,12 +61,12 @@ class TFBSDataModule(LightningDataModule):
         else:
             # This block runs if we load pre-saved tensors from a directory
             data_dir = self.hparams.data_path
-            train_seqs = torch.load(f'{data_dir}/train/seqs.pt')
-            train_labels = torch.load(f'{data_dir}/train/labels.pt')
-            val_seqs = torch.load(f'{data_dir}/val/seqs.pt')
-            val_labels = torch.load(f'{data_dir}/val/labels.pt')
-            test_seqs = torch.load(f'{data_dir}/test/seqs.pt')
-            test_labels = torch.load(f'{data_dir}/test/labels.pt')
+            train_seqs = torch.load(f'{data_dir}/train/seqs.pt', weights_only=True)
+            train_labels = torch.load(f'{data_dir}/train/labels.pt', weights_only=True)
+            val_seqs = torch.load(f'{data_dir}/val/seqs.pt', weights_only=True)
+            val_labels = torch.load(f'{data_dir}/val/labels.pt', weights_only=True)
+            test_seqs = torch.load(f'{data_dir}/test/seqs.pt', weights_only=True)
+            test_labels = torch.load(f'{data_dir}/test/labels.pt', weights_only=True)
 
         # --- SCALING LOGIC ---
         if self.hparams.scaling_method:
