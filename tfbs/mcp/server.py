@@ -129,6 +129,38 @@ def _ensure_imports():
 
 
 # ---------------------------------------------------------------------------
+# Lazy imports — genomics (pyfaidx, tangermeme.io)
+# ---------------------------------------------------------------------------
+_pyfaidx = None
+_extract_loci = None
+_pd = None
+_genome_cache: dict[str, Any] = {}
+
+
+def _ensure_genomics_imports():
+    """Import genomics dependencies on first use."""
+    global _pyfaidx, _extract_loci, _pd
+    if _pyfaidx is not None:
+        return
+    import pyfaidx
+    import pandas as pd
+    from tangermeme.io import extract_loci
+
+    _pyfaidx = pyfaidx
+    _extract_loci = extract_loci
+    _pd = pd
+
+
+def _get_genome(genome_fasta: str):
+    """Load and cache a pyfaidx.Fasta genome handle."""
+    _ensure_genomics_imports()
+    path = str(Path(genome_fasta).resolve())
+    if path not in _genome_cache:
+        _genome_cache[path] = _pyfaidx.Fasta(path)
+    return _genome_cache[path]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 _NUC_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
@@ -1807,6 +1839,795 @@ async def tfbs_config(
         "output_path": str(out),
         "model_type": model_type,
         "config_preview": preview,
+    })
+
+
+# ===========================================================================
+# Pipeline tools (20-23): BED → tensors → train/val/test splits
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Tool 20: tfbs_extract_loci (BED + genome → one-hot tensor)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_extract_loci",
+    annotations={
+        "title": "Extract Loci from BED",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_extract_loci(
+    bed_path: str,
+    output_dir: str,
+    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    in_window: int = 200,
+    max_sequences: int | None = None,
+    score_column: int | None = 4,
+) -> str:
+    """Extract DNA sequences from a reference genome at BED peak positions.
+
+    Reads a BED file, centers a window on each peak midpoint, extracts the
+    DNA sequence from the genome, one-hot encodes it, and filters out
+    sequences containing ambiguous bases (N).  Optionally extracts a
+    continuous score column for regression tasks.
+
+    Supports standard BED (3+ columns) and ChIP-Atlas aggregated BED
+    format (9 columns with MACS2 score in column 5).
+
+    Requires pyfaidx: pip install 'tfbs-nn[genomics]'
+
+    Args:
+        bed_path: Path to a BED file (tab-separated, at least 3 columns).
+        output_dir: Directory to save sequences.pt (and scores.pt if scores
+                    are extracted).
+        genome_fasta: Path to reference genome FASTA file.
+        in_window: Window size in bp centered on peak midpoints (default 200).
+        max_sequences: If set, randomly sample this many peaks before
+                       extraction (useful for large ChIP-Atlas files).
+        score_column: 0-indexed BED column to extract as continuous scores
+                      (default 4 = column 5).  Set to None to skip.
+
+    Returns:
+        JSON with shape, num_peaks_input, num_peaks_extracted,
+        num_filtered_n, output_dir, and has_scores.
+    """
+    _ensure_imports()
+    _ensure_genomics_imports()
+
+    bed = Path(bed_path).resolve()
+    if not bed.exists():
+        return json.dumps({"error": f"BED file not found: {bed_path}"})
+
+    genome_path = Path(genome_fasta).resolve()
+    if not genome_path.exists():
+        return json.dumps({"error": f"Genome FASTA not found: {genome_fasta}"})
+
+    # Read BED file
+    bed_df = _pd.read_csv(bed, sep="\t", header=None, comment="#")
+    num_input = len(bed_df)
+
+    peaks_df = _pd.DataFrame({
+        "chrom": bed_df.iloc[:, 0],
+        "start": bed_df.iloc[:, 1].astype(int),
+        "end": bed_df.iloc[:, 2].astype(int),
+    })
+
+    # Extract scores if requested
+    scores_raw = None
+    if score_column is not None and bed_df.shape[1] > score_column:
+        try:
+            scores_raw = bed_df.iloc[:, score_column].astype(float).values
+        except (ValueError, TypeError):
+            scores_raw = None
+
+    # Optional subsampling for large files
+    if max_sequences and len(peaks_df) > max_sequences:
+        idx = _np.random.RandomState(42).choice(
+            len(peaks_df), size=max_sequences, replace=False,
+        )
+        idx.sort()
+        peaks_df = peaks_df.iloc[idx].reset_index(drop=True)
+        if scores_raw is not None:
+            scores_raw = scores_raw[idx]
+
+    # Load genome
+    genome = _get_genome(str(genome_path))
+    chrom_lengths = {name: len(seq) for name, seq in genome.items()}
+
+    # Pre-filter off-chromosome peaks
+    in_width = in_window // 2
+    valid_mask = []
+    for _, row in peaks_df.iterrows():
+        chrom = row["chrom"]
+        if chrom not in chrom_lengths:
+            valid_mask.append(False)
+            continue
+        mid = row["start"] + (row["end"] - row["start"]) // 2
+        seq_start = mid - in_width
+        seq_end = mid + in_width + (in_window % 2)
+        valid_mask.append(seq_start >= 0 and seq_end < chrom_lengths[chrom])
+
+    valid_mask = _np.array(valid_mask)
+    peaks_df = peaks_df[valid_mask].reset_index(drop=True)
+    if scores_raw is not None:
+        scores_raw = scores_raw[valid_mask]
+
+    if len(peaks_df) == 0:
+        return json.dumps({
+            "error": "No valid peaks remaining after filtering",
+            "num_peaks_input": num_input,
+        })
+
+    # Extract sequences
+    seqs_tensor = _extract_loci(
+        peaks_df, genome, in_window=in_window, verbose=False,
+    ).float()  # type: ignore[union-attr]
+
+    # Filter N-containing sequences
+    n_mask = seqs_tensor.sum(dim=(1, 2)) == seqs_tensor.shape[-1]
+    num_filtered_n = int((~n_mask).sum())
+    seqs_tensor = seqs_tensor[n_mask]
+    if scores_raw is not None:
+        scores_raw = scores_raw[n_mask.numpy()]
+
+    # Save
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    _torch.save(seqs_tensor, out / "sequences.pt")
+
+    has_scores = scores_raw is not None
+    if has_scores:
+        scores_t = _torch.tensor(scores_raw, dtype=_torch.float32).unsqueeze(1)
+        _torch.save(scores_t, out / "scores.pt")
+
+    return json.dumps({
+        "shape": list(seqs_tensor.shape),
+        "num_peaks_input": num_input,
+        "num_peaks_extracted": int(seqs_tensor.shape[0]),
+        "num_filtered_n": num_filtered_n,
+        "output_dir": str(out),
+        "has_scores": has_scores,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 21: tfbs_prepare_dataset (split into train/val/test)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_prepare_dataset",
+    annotations={
+        "title": "Prepare Train/Val/Test Split",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_prepare_dataset(
+    sequences_path: str,
+    labels_path: str,
+    output_dir: str,
+    test_size: float = 0.2,
+    val_size: float = 0.2,
+    add_rc: bool = False,
+    random_seed: int = 42,
+) -> str:
+    """Split sequences and labels into train/val/test directories.
+
+    Creates the directory structure expected by TFBSDataModule:
+    {output_dir}/{train,val,test}/{seqs.pt, labels.pt}
+
+    Args:
+        sequences_path: Path to sequences.pt tensor (N, 4, L).
+        labels_path: Path to labels.pt tensor (N, 1) or (N,).
+        output_dir: Base directory for the split dataset.
+        test_size: Fraction for test set (default 0.2).
+        val_size: Fraction of remaining for validation (default 0.2).
+        add_rc: Add reverse complement augmentation (doubles dataset).
+        random_seed: Random seed for reproducible splits (default 42).
+
+    Returns:
+        JSON with output_dir, train_count, val_count, test_count,
+        and label_stats.
+    """
+    from sklearn.model_selection import train_test_split
+
+    _ensure_imports()
+
+    seqs_p = Path(sequences_path).resolve()
+    labels_p = Path(labels_path).resolve()
+    if not seqs_p.exists():
+        return json.dumps({"error": f"Sequences file not found: {sequences_path}"})
+    if not labels_p.exists():
+        return json.dumps({"error": f"Labels file not found: {labels_path}"})
+
+    seqs = _torch.load(seqs_p, weights_only=True)
+    labels = _torch.load(labels_p, weights_only=True)
+    if labels.dim() == 1:
+        labels = labels.unsqueeze(1)
+
+    # Split: first test, then val from remaining
+    indices = _np.arange(len(seqs))
+    train_idx, test_idx = train_test_split(
+        indices, test_size=test_size, shuffle=True, random_state=random_seed,
+    )
+    train_idx, val_idx = train_test_split(
+        train_idx, test_size=val_size, shuffle=True, random_state=random_seed,
+    )
+
+    def _save_split(split_name, idx):
+        s = seqs[idx]
+        l = labels[idx]
+        if add_rc:
+            rc = _torch.flip(s, [2])
+            rc = _torch.index_select(rc, 1, _torch.tensor([3, 2, 1, 0], dtype=_torch.long))
+            s = _torch.cat([s, rc], dim=0)
+            l = _torch.cat([l, l], dim=0)
+        split_dir = Path(output_dir) / split_name
+        split_dir.mkdir(parents=True, exist_ok=True)
+        _torch.save(s, split_dir / "seqs.pt")
+        _torch.save(l, split_dir / "labels.pt")
+        return len(s)
+
+    train_n = _save_split("train", train_idx)
+    val_n = _save_split("val", val_idx)
+    test_n = _save_split("test", test_idx)
+
+    all_labels = labels.numpy().flatten()
+    return json.dumps({
+        "output_dir": str(Path(output_dir).resolve()),
+        "train_count": train_n,
+        "val_count": val_n,
+        "test_count": test_n,
+        "label_stats": {
+            "min": float(all_labels.min()),
+            "max": float(all_labels.max()),
+            "mean": float(all_labels.mean()),
+            "std": float(all_labels.std()),
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 22: tfbs_prepare_classification (positive + negative → binary)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_prepare_classification",
+    annotations={
+        "title": "Prepare Classification Dataset",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_prepare_classification(
+    positive_path: str,
+    negative_path: str,
+    output_dir: str,
+    balance: bool = True,
+    random_seed: int = 42,
+) -> str:
+    """Combine positive and negative sequence tensors into a binary dataset.
+
+    Loads two sequence tensor files (e.g. from tfbs_extract_loci),
+    assigns labels 1.0 (positive) and 0.0 (negative), optionally
+    balances by subsampling the larger set, shuffles, and saves.
+
+    Output (sequences.pt + labels.pt) feeds into tfbs_prepare_dataset.
+
+    Args:
+        positive_path: Path to positive sequences.pt (N_pos, 4, L).
+        negative_path: Path to negative sequences.pt (N_neg, 4, L).
+        output_dir: Directory to save combined sequences.pt and labels.pt.
+        balance: Subsample larger set to match smaller (default true).
+        random_seed: Random seed (default 42).
+
+    Returns:
+        JSON with output_dir, num_positive, num_negative, total.
+    """
+    _ensure_imports()
+
+    pos_p = Path(positive_path).resolve()
+    neg_p = Path(negative_path).resolve()
+    if not pos_p.exists():
+        return json.dumps({"error": f"Positive file not found: {positive_path}"})
+    if not neg_p.exists():
+        return json.dumps({"error": f"Negative file not found: {negative_path}"})
+
+    pos = _torch.load(pos_p, weights_only=True)
+    neg = _torch.load(neg_p, weights_only=True)
+
+    rng = _np.random.RandomState(random_seed)
+
+    if balance:
+        n = min(len(pos), len(neg))
+        if len(pos) > n:
+            idx = rng.choice(len(pos), size=n, replace=False)
+            pos = pos[idx]
+        if len(neg) > n:
+            idx = rng.choice(len(neg), size=n, replace=False)
+            neg = neg[idx]
+
+    n_pos, n_neg = len(pos), len(neg)
+    seqs = _torch.cat([pos, neg], dim=0)
+    labels = _torch.cat([
+        _torch.ones(n_pos, 1),
+        _torch.zeros(n_neg, 1),
+    ], dim=0)
+
+    # Shuffle
+    perm = _torch.tensor(rng.permutation(len(seqs)))
+    seqs = seqs[perm]
+    labels = labels[perm]
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    _torch.save(seqs, out / "sequences.pt")
+    _torch.save(labels, out / "labels.pt")
+
+    return json.dumps({
+        "output_dir": str(out.resolve()),
+        "num_positive": n_pos,
+        "num_negative": n_neg,
+        "total": n_pos + n_neg,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 23: tfbs_prepare_regression (sequences + scores → transformed)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_prepare_regression",
+    annotations={
+        "title": "Prepare Regression Dataset",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_prepare_regression(
+    sequences_path: str,
+    scores_path: str,
+    output_dir: str,
+    score_transform: str = "log2",
+    min_score: float | None = None,
+    random_seed: int = 42,
+) -> str:
+    """Prepare a regression dataset from sequences and continuous scores.
+
+    Loads sequences and their associated scores (e.g. ChIP-seq signal
+    values from BED column 5), optionally filters by minimum score,
+    applies a transformation, and saves.
+
+    Output (sequences.pt + labels.pt) feeds into tfbs_prepare_dataset.
+
+    Args:
+        sequences_path: Path to sequences.pt (N, 4, L).
+        scores_path: Path to scores.pt (N, 1) from tfbs_extract_loci.
+        output_dir: Directory to save sequences.pt and labels.pt.
+        score_transform: Transform to apply: "log2" (log2(x+1)),
+                         "log10" (log10(x+1)), "zscore", or "none".
+        min_score: If set, filter out sequences with score below this.
+        random_seed: Random seed (default 42).
+
+    Returns:
+        JSON with output_dir, num_sequences, score_stats_before,
+        score_stats_after.
+    """
+    _ensure_imports()
+
+    seqs_p = Path(sequences_path).resolve()
+    scores_p = Path(scores_path).resolve()
+    if not seqs_p.exists():
+        return json.dumps({"error": f"Sequences file not found: {sequences_path}"})
+    if not scores_p.exists():
+        return json.dumps({"error": f"Scores file not found: {scores_path}"})
+
+    seqs = _torch.load(seqs_p, weights_only=True)
+    scores = _torch.load(scores_p, weights_only=True).float()
+    if scores.dim() == 1:
+        scores = scores.unsqueeze(1)
+
+    def _stats(t):
+        v = t.numpy().flatten()
+        return {"min": float(v.min()), "max": float(v.max()),
+                "mean": float(v.mean()), "std": float(v.std())}
+
+    stats_before = _stats(scores)
+
+    # Filter by minimum score
+    if min_score is not None:
+        mask = scores.squeeze() >= min_score
+        seqs = seqs[mask]
+        scores = scores[mask]
+
+    # Apply transform
+    valid_transforms = {"log2", "log10", "zscore", "none"}
+    if score_transform not in valid_transforms:
+        return json.dumps({
+            "error": f"Unknown score_transform '{score_transform}'. "
+                     f"Must be one of: {sorted(valid_transforms)}"
+        })
+
+    if score_transform == "log2":
+        scores = _torch.log2(scores + 1)
+    elif score_transform == "log10":
+        scores = _torch.log10(scores + 1)
+    elif score_transform == "zscore":
+        mean = scores.mean()
+        std = scores.std()
+        scores = (scores - mean) / (std + 1e-8)
+
+    stats_after = _stats(scores)
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    _torch.save(seqs, out / "sequences.pt")
+    _torch.save(scores, out / "labels.pt")
+
+    return json.dumps({
+        "output_dir": str(out.resolve()),
+        "num_sequences": int(seqs.shape[0]),
+        "score_stats_before": stats_before,
+        "score_stats_after": stats_after,
+    })
+
+
+# ===========================================================================
+# Visualization tools (24-26): seqlets, epistasis, conv filters
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Tool 24: tfbs_seqlets (motif seqlet discovery from attributions)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_seqlets",
+    annotations={
+        "title": "Discover Motif Seqlets",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_seqlets(
+    model_id: str,
+    sequences: list[str],
+    n_shuffles: int = 20,
+    min_seqlet_len: int = 5,
+    max_seqlet_len: int = 15,
+    motif_file: str | None = None,
+) -> str:
+    """Discover recurring motif patterns from attribution scores.
+
+    Computes DeepLiftShap attributions, then finds seqlets (short
+    subsequences with consistently high attribution) using tangermeme's
+    recursive seqlet discovery.  Optionally annotates seqlets against
+    a JASPAR/MEME motif database.
+
+    Requires captum and tangermeme: pip install 'tfbs-nn[viz]'
+
+    Args:
+        model_id: Identifier of a loaded model.
+        sequences: DNA sequences to analyze.
+        n_shuffles: Number of shuffled baselines for DeepLiftShap.
+        min_seqlet_len: Minimum seqlet length (default 5).
+        max_seqlet_len: Maximum seqlet length (default 15).
+        motif_file: Optional path to a MEME-format motif file for
+                    annotation (e.g. JASPAR database).
+
+    Returns:
+        JSON with num_seqlets, seqlets list (example_idx, start, end,
+        mean_attribution), and optionally top_motifs.
+    """
+    try:
+        from tangermeme.seqlet import recursive_seqlets
+        from tangermeme.deep_lift_shap import deep_lift_shap as tangermeme_dls
+    except ImportError:
+        return json.dumps({
+            "error": "tangermeme required. Install with: pip install 'tfbs-nn[viz]'"
+        })
+
+    _ensure_imports()
+    _validate_dna(sequences)
+
+    entry = _get_model(model_id)
+    model = entry["model"]
+    device = entry["device"]
+
+    X = _sequences_to_tensor(sequences).to(device)
+
+    # Compute attributions
+    model.train()
+    try:
+        attr = tangermeme_dls(model, X, n_shuffles=n_shuffles, device=str(device))
+    finally:
+        model.eval()
+
+    if isinstance(attr, _torch.Tensor):
+        attr_np = attr.detach().cpu().numpy()
+    else:
+        attr_np = _np.asarray(attr)
+
+    # Sum across channels for seqlet discovery: (N, 4, L) → (N, L)
+    attr_sum = attr_np.sum(axis=1)
+
+    # Discover seqlets
+    seqlets = recursive_seqlets(
+        attr_sum,
+        min_seqlet_len=min_seqlet_len,
+        max_seqlet_len=max_seqlet_len,
+    )
+
+    seqlet_list = []
+    for s in seqlets:
+        seqlet_list.append({
+            "example_idx": int(s[0]) if hasattr(s, '__getitem__') else 0,
+            "start": int(s.start) if hasattr(s, 'start') else int(s[1]),
+            "end": int(s.end) if hasattr(s, 'end') else int(s[2]),
+        })
+
+    result: dict[str, Any] = {
+        "num_seqlets": len(seqlet_list),
+        "seqlets": seqlet_list[:200],  # cap output
+    }
+
+    # Optional motif annotation
+    if motif_file and Path(motif_file).exists():
+        try:
+            from tangermeme.io import read_meme
+            from tangermeme.annotate import annotate_seqlets, count_annotations
+            motifs = read_meme(motif_file)
+            X_cpu = X.cpu()
+            annotations, _ = annotate_seqlets(X_cpu, seqlets, motifs)
+            counts = count_annotations(annotations)
+            top_motifs = []
+            if hasattr(counts, 'items'):
+                for name, count in sorted(counts.items(), key=lambda x: -x[1])[:20]:
+                    top_motifs.append({"name": str(name), "count": int(count)})
+            result["top_motifs"] = top_motifs
+        except Exception as e:
+            result["annotation_error"] = str(e)
+
+    return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Tool 25: tfbs_epistasis (pairwise / 3D mutation interactions)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_epistasis",
+    annotations={
+        "title": "Epistasis Analysis",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_epistasis(
+    model_id: str,
+    sequence: str,
+    positions: list[int] | None = None,
+    output_dir: str | None = None,
+) -> str:
+    """Compute pairwise epistasis scores for a DNA sequence.
+
+    For each pair of positions, computes all single and double mutant
+    predictions, then calculates the epistasis score:
+    delta_delta = y_ij - y_i - y_j + y_orig
+
+    Non-zero epistasis indicates the two positions interact (their
+    effects are non-additive).
+
+    Args:
+        model_id: Identifier of a loaded model.
+        sequence: Single DNA sequence to analyze.
+        positions: Restrict analysis to these 0-indexed positions.
+                   Default: all positions (warning: L^2 predictions).
+        output_dir: If set, save CSVs (single_mutations.csv,
+                    epistasis_matrix.csv) here.
+
+    Returns:
+        JSON with original_prediction, num_pairs_analyzed,
+        top_interactions (sorted by |delta_delta|, capped at 500).
+    """
+    _ensure_imports()
+    _validate_dna([sequence])
+
+    entry = _get_model(model_id)
+    model = entry["model"]
+    device = entry["device"]
+
+    X = _sequences_to_tensor([sequence]).to(device)
+    L = X.shape[2]
+
+    with _torch.no_grad():
+        y_orig = model(X).cpu().item()
+
+    pos = positions if positions is not None else list(range(L))
+
+    # Single mutants
+    single_deltas = {}
+    for p in pos:
+        for b in range(4):
+            X_mut = X.clone()
+            X_mut[0, :, p] = 0.0
+            X_mut[0, b, p] = 1.0
+            with _torch.no_grad():
+                y_mut = model(X_mut).cpu().item()
+            single_deltas[(p, b)] = y_mut - y_orig
+
+    # Pairwise epistasis
+    interactions = []
+    for i_idx, pi in enumerate(pos):
+        for pj in pos[i_idx + 1:]:
+            for bi in range(4):
+                for bj in range(4):
+                    X_double = X.clone()
+                    X_double[0, :, pi] = 0.0
+                    X_double[0, bi, pi] = 1.0
+                    X_double[0, :, pj] = 0.0
+                    X_double[0, bj, pj] = 1.0
+                    with _torch.no_grad():
+                        y_double = model(X_double).cpu().item()
+                    dd = y_double - single_deltas[(pi, bi)] - single_deltas[(pj, bj)]
+                    if abs(dd) > 1e-6:
+                        interactions.append({
+                            "pos_i": pi, "base_i": _IDX_TO_NUC[bi],
+                            "pos_j": pj, "base_j": _IDX_TO_NUC[bj],
+                            "delta_delta": round(dd, 6),
+                        })
+
+    interactions.sort(key=lambda x: -abs(x["delta_delta"]))
+
+    if output_dir:
+        import csv as _csv
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        with open(out / "epistasis_top.csv", "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=["pos_i", "base_i", "pos_j", "base_j", "delta_delta"])
+            w.writeheader()
+            w.writerows(interactions[:500])
+
+    return json.dumps({
+        "original_prediction": round(y_orig, 6),
+        "num_pairs_analyzed": len(pos) * (len(pos) - 1) // 2 * 16,
+        "top_interactions": interactions[:500],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 26: tfbs_conv_filters (conv filter visualization + HTML report)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_conv_filters",
+    annotations={
+        "title": "Visualize Conv Filters",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_conv_filters(
+    model_id: str,
+    sequences: list[str],
+    output_dir: str,
+    top_n_filters: int = 50,
+) -> str:
+    """Visualize what convolutional filters learned.
+
+    Runs input sequences through the model, captures activations at
+    each Conv1d layer, identifies maximally-activating subsequences
+    per filter, builds position frequency matrices (PFMs), and
+    generates a summary.
+
+    Args:
+        model_id: Identifier of a loaded model.
+        sequences: DNA sequences to use for activation analysis.
+        output_dir: Directory to save filter PFMs and summary.
+        top_n_filters: Max filters to analyze per layer (default 50).
+
+    Returns:
+        JSON with num_layers, num_filters_analyzed, and per-filter
+        summary (layer, filter_id, max_activation, num_activating).
+    """
+    _ensure_imports()
+    _validate_dna(sequences)
+
+    entry = _get_model(model_id)
+    model = entry["model"]
+    device = entry["device"]
+
+    X = _sequences_to_tensor(sequences).to(device)
+
+    # Find Conv1d layers
+    conv_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, _torch.nn.Conv1d):
+            conv_layers.append((name, module))
+
+    if not conv_layers:
+        return json.dumps({
+            "error": "No Conv1d layers found in model",
+            "model_type": entry["model_type"],
+        })
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Capture activations via hooks
+    activations: dict[str, Any] = {}
+    hooks = []
+    for layer_name, module in conv_layers:
+        def _hook(mod, inp, output, name=layer_name):
+            activations[name] = output.detach().cpu()
+        hooks.append(module.register_forward_hook(_hook))
+
+    with _torch.no_grad():
+        model(X)
+
+    for h in hooks:
+        h.remove()
+
+    # Analyze filters
+    filter_summary = []
+    for layer_name, module in conv_layers:
+        if layer_name not in activations:
+            continue
+        act = activations[layer_name]  # (N, C_out, L_out)
+        n_filters = min(act.shape[1], top_n_filters)
+        kernel_size = module.kernel_size[0]
+
+        for f_idx in range(n_filters):
+            f_act = act[:, f_idx, :]  # (N, L_out)
+            max_act = float(f_act.max())
+
+            # Find top activating positions
+            threshold = max_act * 0.8
+            high_mask = f_act >= threshold
+            n_activating = int(high_mask.sum())
+
+            # Extract PFM from top-activating windows
+            pfm = _np.zeros((4, kernel_size))
+            count = 0
+            for seq_idx in range(f_act.shape[0]):
+                positions = _torch.where(high_mask[seq_idx])[0]
+                for pos in positions[:10]:  # cap per sequence
+                    p = int(pos)
+                    if p + kernel_size <= X.shape[2]:
+                        window = X[seq_idx, :, p:p + kernel_size].cpu().numpy()
+                        pfm += window
+                        count += 1
+
+            if count > 0:
+                pfm /= count
+
+            filter_summary.append({
+                "layer": layer_name,
+                "filter_id": f_idx,
+                "max_activation": round(max_act, 4),
+                "num_activating": n_activating,
+                "kernel_size": kernel_size,
+            })
+
+    # Save summary
+    with open(out / "filter_summary.json", "w") as f:
+        json.dump(filter_summary, f, indent=2)
+
+    return json.dumps({
+        "output_dir": str(out.resolve()),
+        "num_layers": len(conv_layers),
+        "num_filters_analyzed": len(filter_summary),
+        "filter_summary": filter_summary[:100],  # cap response
     })
 
 
