@@ -103,11 +103,14 @@ def _run_foldx_energy(
     if mutation_string:
         mut_file = wd / "individual_list.txt"
         mut_file.write_text(mutation_string + "\n")
-        r = subprocess.run(
-            [foldx_bin, "--command=BuildModel",
-             f"--pdb={pdb_name}", f"--mutant-file={mut_file.name}"],
-            capture_output=True, text=True, timeout=600, cwd=str(wd),
-        )
+        try:
+            r = subprocess.run(
+                [foldx_bin, "--command=BuildModel",
+                 f"--pdb={pdb_name}", f"--mutant-file={mut_file.name}"],
+                capture_output=True, text=True, timeout=1200, cwd=str(wd),
+            )
+        except subprocess.TimeoutExpired:
+            return None
         mutated = wd / f"{Path(pdb_name).stem}_1.pdb"
         if mutated.exists():
             analyse_target = mutated.name
@@ -564,13 +567,19 @@ async def tfbs_binding_scan(
                         mut_parts.append(mut_rev.rstrip(";"))
                 mutation_str = ",".join(mut_parts) + ";" if mut_parts else None
 
-                with tempfile.TemporaryDirectory(prefix="fxw_") as wdir:
-                    energy = _run_foldx_energy(foldx_bin, structure, wdir, mutation_str)
+                try:
+                    with tempfile.TemporaryDirectory(prefix="fxw_") as wdir:
+                        energy = _run_foldx_energy(foldx_bin, structure, wdir, mutation_str)
+                        positions.append(w_start)
+                        energies.append(energy if energy is not None else float("nan"))
+                except Exception as exc:
                     positions.append(w_start)
-                    energies.append(energy if energy is not None else float("nan"))
+                    energies.append(float("nan"))
+                    print(f"  Window {{i}}: error - {{exc}}")
 
                 if (i + 1) % 100 == 0:
-                    print(f"  {{i+1}}/{{num_windows}} windows done")
+                    n_valid = sum(1 for e in energies if not math.isnan(e))
+                    print(f"  {{i+1}}/{{num_windows}} windows done ({{n_valid}} valid)")
 
             genome.close()
 
@@ -667,9 +676,12 @@ async def tfbs_binding_scan(
         mutation_string = ",".join(mut_parts) + ";" if mut_parts else None
 
         # Run FoldX in a fresh temp dir per window to avoid file collisions
-        with tempfile.TemporaryDirectory(prefix="fxw_") as wdir:
-            energy = _run_foldx_energy(foldx, str(pdb), wdir, mutation_string)
-            scores.append((w_start, w_end, energy if energy is not None else float("nan")))
+        try:
+            with tempfile.TemporaryDirectory(prefix="fxw_") as wdir:
+                energy = _run_foldx_energy(foldx, str(pdb), wdir, mutation_string)
+                scores.append((w_start, w_end, energy if energy is not None else float("nan")))
+        except Exception:
+            scores.append((w_start, w_end, float("nan")))
 
         if (i + 1) % 100 == 0:
             print(f"  FoldX scan: {i + 1}/{num_windows} windows processed")
