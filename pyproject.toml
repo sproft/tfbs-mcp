@@ -37,11 +37,14 @@ tracking = [
 mcp = [
     "mcp>=1.0",
 ]
+foldx = [
+    "pyBigWig>=0.3",
+]
 dev = [
     "pytest>=7.0",
 ]
 all = [
-    "tfbs-nn[viz,genomics,tracking,mcp,dev]",
+    "tfbs-nn[viz,genomics,tracking,mcp,dev,foldx]",
 ]
 
 [project.scripts]

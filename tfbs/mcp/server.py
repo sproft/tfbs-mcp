@@ -2714,6 +2714,18 @@ async def tfbs_conv_filters(
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
+    # Ensure this module is reachable as 'tfbs.mcp.server' even when
+    # executed via ``python -m tfbs.mcp.server`` (which sets __name__ to
+    # '__main__').  Without this, sub-module imports like foldx_tools would
+    # create a *second* copy of the module and register tools on a
+    # different ``mcp`` instance.
+    import sys
+    if __name__ == "__main__" and "tfbs.mcp.server" not in sys.modules:
+        sys.modules["tfbs.mcp.server"] = sys.modules[__name__]
+
+    # Register FoldX tools on the shared mcp instance
+    import tfbs.mcp.foldx_tools  # noqa: F401
+
     mcp.run()
 
 
