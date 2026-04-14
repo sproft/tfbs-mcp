@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 from pytorch_lightning import LightningDataModule
@@ -60,12 +61,12 @@ class TFBSDataModule(LightningDataModule):
         else:
             # This block runs if we load pre-saved tensors from a directory
             data_dir = self.hparams.data_path
-            train_seqs = torch.load(f'{data_dir}/train/seqs.pt')
-            train_labels = torch.load(f'{data_dir}/train/labels.pt')
-            val_seqs = torch.load(f'{data_dir}/val/seqs.pt')
-            val_labels = torch.load(f'{data_dir}/val/labels.pt')
-            test_seqs = torch.load(f'{data_dir}/test/seqs.pt')
-            test_labels = torch.load(f'{data_dir}/test/labels.pt')
+            train_seqs = torch.load(f'{data_dir}/train/seqs.pt', weights_only=True)
+            train_labels = torch.load(f'{data_dir}/train/labels.pt', weights_only=True)
+            val_seqs = torch.load(f'{data_dir}/val/seqs.pt', weights_only=True)
+            val_labels = torch.load(f'{data_dir}/val/labels.pt', weights_only=True)
+            test_seqs = torch.load(f'{data_dir}/test/seqs.pt', weights_only=True)
+            test_labels = torch.load(f'{data_dir}/test/labels.pt', weights_only=True)
 
         # --- SCALING LOGIC ---
         if self.hparams.scaling_method:
@@ -96,6 +97,10 @@ class TFBSDataModule(LightningDataModule):
             else:
                 raise ValueError(f"Unknown scaling_method: '{self.hparams.scaling_method}'. "
                                  f"Choose from 'standardize', 'normalize', or None.")
+
+            # Persist scaling parameters so they can be used at inference time
+            # without re-loading the training data (e.g. by the MCP server).
+            self._save_scaling_params()
 
         # Create TensorDatasets for the dataloaders
         self.train_dataset = TensorDataset(train_seqs, train_labels)
@@ -132,6 +137,34 @@ class TFBSDataModule(LightningDataModule):
         else:
             # If no scaling was applied, return the original tensor
             return scaled_tensor
+
+    def _save_scaling_params(self):
+        """Save scaling parameters to a JSON file next to the training data.
+
+        This allows the MCP server (and other inference code) to reverse
+        the label transform without re-loading the training set.
+        """
+        import json as _json
+
+        data_dir = self.hparams.data_path
+        if data_dir is None:
+            return
+
+        params: dict = {"scaling_method": self.hparams.scaling_method}
+        if self.hparams.scaling_method == "standardize" and self.mean is not None:
+            params["mean"] = float(self.mean)
+            params["std"] = float(self.std)
+        elif self.hparams.scaling_method == "normalize" and self.min is not None:
+            params["min"] = float(self.min)
+            params["max"] = float(self.max)
+
+        path = os.path.join(str(data_dir), "scaling_params.json")
+        try:
+            with open(path, "w") as f:
+                _json.dump(params, f, indent=2)
+            print(f"Scaling parameters saved to {path}")
+        except OSError as e:
+            print(f"Warning: could not save scaling params: {e}")
 
     def _one_hot_encode(self, df, seq_col, target_col):
         """Helper function to one-hot encode sequences from a dataframe."""

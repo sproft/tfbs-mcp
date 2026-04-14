@@ -28,13 +28,11 @@ def save_results(args, loss_value):
     result_data = {
         'modeltype': args.model_name,
         'scaling_method': args.scaling_method,
-        # Using the data_path as the dataset identifier
-        'dataset_path': os.path.basename(args.data_path), # only write the data name, not full path
-        'loss': loss_value
+        'dataset_path': os.path.basename(args.data_path),
+        'test_loss': loss_value
     }
-    
-    # Define the column names (header)
-    fieldnames = ['modeltype', 'scaling_method', 'dataset_path', 'loss']
+
+    fieldnames = ['modeltype', 'scaling_method', 'dataset_path', 'test_loss']
     
     # Check if the file exists to determine if we need to write the header
     file_exists = os.path.exists(args.output_file)
@@ -113,24 +111,24 @@ def main(args):
         logger=False
     )
 
-    # 4. Run Validation
-    # trainer.validate() computes metrics (like loss, accuracy, AUROC) 
-    # using the logic in the model's validation_step.
-    print("\nRunning validation on the validation set...")
-    results = trainer.validate(model, datamodule=dm, verbose=True)
+    # 4. Run Test (on the held-out test set, NOT the validation set)
+    # trainer.test() uses test_step which evaluates on data never seen
+    # during training or early stopping / checkpoint selection.
+    print("\nRunning evaluation on the held-out test set...")
+    results = trainer.test(model, datamodule=dm, verbose=True)
 
-    print("\n--- Validation Results ---")
+    print("\n--- Test Results ---")
     print(results)
-    print("--------------------------")
-    
-    # 5. Extract and Save Results
-    validation_loss_key = 'val_loss'
-    val_loss = results[0].get(validation_loss_key)
+    print("--------------------")
 
-    if val_loss is not None:
-        save_results(args, val_loss)
+    # 5. Extract and Save Results
+    test_loss_key = 'test_loss'
+    test_loss = results[0].get(test_loss_key)
+
+    if test_loss is not None:
+        save_results(args, test_loss)
     else:
-        print(f"Warning: Could not find '{validation_loss_key}' in validation results to save.")
+        print(f"Warning: Could not find '{test_loss_key}' in test results to save.")
 
 
 if __name__ == '__main__':
