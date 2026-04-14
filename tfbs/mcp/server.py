@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +173,17 @@ def _validate_dna(sequences: list[str]) -> None:
                 f"Sequence {i} contains invalid characters: {bad}. "
                 "Only A, C, G, T are allowed."
             )
+
+
+def _tail_file(path: str, n: int = 100) -> str:
+    """Read the last *n* lines of a file efficiently."""
+    try:
+        with open(path) as f:
+            return "\n".join(deque(f, maxlen=n))
+    except FileNotFoundError:
+        return f"[File not found: {path}]"
+    except PermissionError:
+        return f"[Permission denied: {path}]"
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +953,861 @@ async def tfbs_server_info() -> str:
     info["loaded_models"] = list(_model_registry.keys())
 
     return json.dumps(info)
+
+
+# ---------------------------------------------------------------------------
+# Tool 11: slurm_submit
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_submit",
+    annotations={
+        "title": "Submit SLURM Job",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def slurm_submit(
+    script_path: str,
+    args: list[str] | None = None,
+    sbatch_flags: list[str] | None = None,
+    working_dir: str | None = None,
+) -> str:
+    """Submit a batch job to the SLURM scheduler via sbatch.
+
+    Builds and executes: ``sbatch [sbatch_flags...] script_path [args...]``
+
+    Args:
+        script_path: Absolute path to the sbatch script to submit.
+        args: Extra arguments appended after the script path.
+        sbatch_flags: Extra flags inserted before the script path
+                      (e.g. ["--partition=gpu", "--gres=gpu:1"]).
+        working_dir: Directory to run sbatch from.  Defaults to the
+                     script's parent directory.
+
+    Returns:
+        JSON with job_id, submit_command, and any stderr from sbatch.
+    """
+    script = Path(script_path).resolve()
+    if not script.is_file():
+        return json.dumps({"error": f"Script not found or not a file: {script_path}"})
+
+    if shutil.which("sbatch") is None:
+        return json.dumps({"error": "sbatch binary not found on PATH"})
+
+    cmd: list[str] = ["sbatch"]
+    if sbatch_flags:
+        cmd.extend(sbatch_flags)
+    cmd.append(str(script))
+    if args:
+        cmd.extend(args)
+
+    cwd = working_dir or str(script.parent)
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
+
+    if result.returncode != 0:
+        return json.dumps({
+            "error": f"sbatch failed (exit {result.returncode})",
+            "stderr": result.stderr.strip(),
+            "submit_command": " ".join(cmd),
+        })
+
+    # Parse job ID from "Submitted batch job 12345"
+    job_id = None
+    for word in result.stdout.strip().split():
+        if word.isdigit():
+            job_id = word
+            break
+
+    return json.dumps({
+        "job_id": job_id,
+        "submit_command": " ".join(cmd),
+        "stderr": result.stderr.strip() if result.stderr.strip() else None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 12: slurm_status
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_status",
+    annotations={
+        "title": "Check SLURM Job Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def slurm_status(
+    job_id: str,
+) -> str:
+    """Check the current state of a SLURM job.
+
+    Tries squeue first (for running/pending jobs), then falls back to
+    sacct (for completed/failed jobs) to retrieve status information.
+
+    Args:
+        job_id: The SLURM job ID to query.
+
+    Returns:
+        JSON with job_id, state, node, elapsed, submit_time, and
+        exit_code (exit_code only available from sacct).
+    """
+    # Try squeue first (running / pending jobs)
+    try:
+        sq = subprocess.run(
+            ["squeue", "-j", job_id, "--noheader", "--format=%i|%T|%N|%M|%V"],
+            capture_output=True, text=True, timeout=30,
+        )
+        line = sq.stdout.strip()
+        if line:
+            parts = line.split("|")
+            return json.dumps({
+                "job_id": parts[0].strip() if len(parts) > 0 else job_id,
+                "state": parts[1].strip() if len(parts) > 1 else "UNKNOWN",
+                "node": parts[2].strip() if len(parts) > 2 else None,
+                "elapsed": parts[3].strip() if len(parts) > 3 else None,
+                "submit_time": parts[4].strip() if len(parts) > 4 else None,
+                "exit_code": None,
+            })
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Fall back to sacct (completed / historical jobs)
+    try:
+        sa = subprocess.run(
+            [
+                "sacct", "-j", job_id, "--noheader", "--parsable2",
+                "--format=JobID,State,NodeList,Elapsed,Submit,ExitCode",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        for raw_line in sa.stdout.strip().splitlines():
+            parts = raw_line.split("|")
+            # Filter to main job line (skip .batch / .extern steps)
+            if parts and parts[0].strip() == job_id:
+                return json.dumps({
+                    "job_id": parts[0].strip(),
+                    "state": parts[1].strip() if len(parts) > 1 else "UNKNOWN",
+                    "node": parts[2].strip() if len(parts) > 2 else None,
+                    "elapsed": parts[3].strip() if len(parts) > 3 else None,
+                    "submit_time": parts[4].strip() if len(parts) > 4 else None,
+                    "exit_code": parts[5].strip() if len(parts) > 5 else None,
+                })
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return json.dumps({"job_id": job_id, "state": "NOT_FOUND", "error": "Job not found in squeue or sacct"})
+
+
+# ---------------------------------------------------------------------------
+# Tool 13: slurm_logs
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_logs",
+    annotations={
+        "title": "Read SLURM Job Logs",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def slurm_logs(
+    job_id: str,
+    log_type: str = "stderr",
+    tail: int = 100,
+) -> str:
+    """Read stdout and/or stderr log files for a SLURM job.
+
+    Uses sacct to locate the log file paths, then reads the last
+    ``tail`` lines from each requested file.
+
+    Args:
+        job_id: The SLURM job ID whose logs to read.
+        log_type: Which log to read: "stdout", "stderr", or "both".
+        tail: Number of lines to read from the end of each log file.
+
+    Returns:
+        JSON with job_id, log_paths dict, and the content of requested
+        log files.  Missing files are reported with an error message.
+    """
+    stdout_path = None
+    stderr_path = None
+
+    try:
+        sa = subprocess.run(
+            [
+                "sacct", "-j", job_id, "--noheader", "--parsable2",
+                "--format=JobID,WorkDir,StdOut,StdErr",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        for raw_line in sa.stdout.strip().splitlines():
+            parts = raw_line.split("|")
+            # Filter to main job line (skip .batch / .extern steps)
+            if parts and parts[0].strip() == job_id:
+                stdout_path = parts[2].strip() if len(parts) > 2 else None
+                stderr_path = parts[3].strip() if len(parts) > 3 else None
+                break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return json.dumps({"error": "sacct not available or timed out"})
+
+    log_paths: dict[str, str | None] = {
+        "stdout": stdout_path,
+        "stderr": stderr_path,
+    }
+    result: dict[str, Any] = {"job_id": job_id, "log_paths": log_paths}
+
+    if log_type in ("stdout", "both") and stdout_path:
+        result["stdout"] = _tail_file(stdout_path, tail)
+    if log_type in ("stderr", "both") and stderr_path:
+        result["stderr"] = _tail_file(stderr_path, tail)
+
+    # Handle case where paths were not found
+    if log_type in ("stdout", "both") and not stdout_path:
+        result["stdout"] = "[stdout path not found in sacct output]"
+    if log_type in ("stderr", "both") and not stderr_path:
+        result["stderr"] = "[stderr path not found in sacct output]"
+
+    return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Tool 14: slurm_cancel
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_cancel",
+    annotations={
+        "title": "Cancel SLURM Job",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def slurm_cancel(
+    job_id: str,
+) -> str:
+    """Cancel a running or pending SLURM job.
+
+    Args:
+        job_id: The SLURM job ID to cancel.
+
+    Returns:
+        JSON with job_id, cancelled (bool), and any stderr from scancel.
+    """
+    try:
+        result = subprocess.run(
+            ["scancel", job_id],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError:
+        return json.dumps({"error": "scancel binary not found on PATH"})
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "scancel timed out"})
+
+    return json.dumps({
+        "job_id": job_id,
+        "cancelled": result.returncode == 0,
+        "stderr": result.stderr.strip() if result.stderr.strip() else None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 15: slurm_watch
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="slurm_watch",
+    annotations={
+        "title": "Watch SLURM Job",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def slurm_watch(
+    job_id: str,
+    check_interval: str = "1h",
+    context: str | None = None,
+) -> str:
+    """Request monitoring of a SLURM job.
+
+    This is a placeholder that returns instructions for the LLM client
+    to set up recurring status checks.  The MCP server itself cannot
+    create Claude Code scheduled agents — the LLM acts on the returned
+    instructions to configure monitoring via CronCreate or /schedule.
+
+    Args:
+        job_id: The SLURM job ID to monitor.
+        check_interval: How often to check (e.g. "30m", "1h", "2h").
+        context: Optional description of what the job is doing, to
+                 include in status check messages.
+
+    Returns:
+        JSON with job_id, check_interval, context, and instructions
+        for the LLM to set up scheduled monitoring.
+    """
+    instructions = (
+        f"Set up a recurring check for SLURM job {job_id} every {check_interval}. "
+        "Use CronCreate or /schedule to create a scheduled agent that: "
+        f"1) Calls slurm_status with job_id='{job_id}' to get the current state. "
+        f"2) Calls slurm_logs with job_id='{job_id}' and log_type='stderr' to check for errors. "
+        "3) Reports the status to the user. "
+        "4) If the job has completed (COMPLETED, FAILED, CANCELLED, TIMEOUT), "
+        "report the final status and exit code, then cancel the scheduled check."
+    )
+
+    return json.dumps({
+        "job_id": job_id,
+        "check_interval": check_interval,
+        "context": context,
+        "instructions": instructions,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 16: tfbs_train
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_train",
+    annotations={
+        "title": "Submit Training Job",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_train(
+    script: str | None = None,
+    config_path: str | None = None,
+    partition: str = "gpu",
+    gpu_type: str | None = None,
+    max_time: str = "48:00:00",
+    job_name: str | None = None,
+    extra_args: list[str] | None = None,
+) -> str:
+    """Submit a TFBS model training job to SLURM.
+
+    Two modes of operation:
+
+    **Script mode** — provide ``script`` to submit an existing sbatch
+    script directly.
+
+    **Config mode** — provide ``config_path`` to auto-generate an
+    sbatch script that invokes the Lightning CLI trainer with the
+    given YAML config.
+
+    Args:
+        script: Path to an existing sbatch script (script mode).
+        config_path: Path to a Lightning CLI YAML config (config mode).
+        partition: SLURM partition (default "gpu").
+        gpu_type: GPU type constraint (e.g. "a100", "v100").
+        max_time: Maximum wall-clock time (default "48:00:00").
+        job_name: SLURM job name.  Auto-generated if omitted.
+        extra_args: Additional CLI arguments appended to the training
+                    command (config mode only).
+
+    Returns:
+        JSON with mode, job_id, submit_command, and (for config mode)
+        the generated sbatch script content.
+    """
+    # Validate: exactly one of script or config_path
+    if script and config_path:
+        return json.dumps({"error": "Provide exactly one of 'script' or 'config_path', not both."})
+    if not script and not config_path:
+        return json.dumps({"error": "Provide exactly one of 'script' or 'config_path'."})
+
+    # Script mode
+    if script:
+        script_p = Path(script).resolve()
+        if not script_p.is_file():
+            return json.dumps({"error": f"Script not found: {script}"})
+        result = await slurm_submit(script_path=str(script_p))
+        result_dict = json.loads(result)
+        result_dict["mode"] = "script"
+        return json.dumps(result_dict)
+
+    # Config mode
+    config_p = Path(config_path).resolve()
+    if not config_p.is_file():
+        return json.dumps({"error": f"Config not found: {config_path}"})
+
+    if job_name is None:
+        job_name = f"tfbs_train_{config_p.stem}"
+
+    gres_line = ""
+    if gpu_type:
+        gres_line = f"#SBATCH --gres=gpu:{gpu_type}:1"
+    else:
+        gres_line = "#SBATCH --gres=gpu:1"
+
+    train_cmd = f"python /sc-projects/sc-proj-cc17-P09_TFBS/scripts/cli/train_cli.py fit --config {config_p}"
+    if extra_args:
+        train_cmd += " " + " ".join(extra_args)
+
+    sbatch_content = f"""#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --partition={partition}
+{gres_line}
+#SBATCH --time={max_time}
+#SBATCH --output={job_name}_%j.out
+#SBATCH --error={job_name}_%j.err
+#SBATCH --ntasks=1
+
+{train_cmd}
+"""
+
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False, prefix="tfbs_")
+    tmp.write(sbatch_content)
+    tmp.close()
+    os.chmod(tmp.name, 0o755)
+
+    result = await slurm_submit(script_path=tmp.name, working_dir=str(config_p.parent))
+    result_dict = json.loads(result)
+    result_dict["mode"] = "config"
+    result_dict["generated_script"] = sbatch_content
+    return json.dumps(result_dict)
+
+
+# ---------------------------------------------------------------------------
+# Tool 17: tfbs_sweep
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_sweep",
+    annotations={
+        "title": "Submit WandB Sweep",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_sweep(
+    sweep_config: str,
+    project_name: str,
+    model: str,
+    data_path: str,
+    data_name: str,
+    scaling_method: str = "standardize",
+    n_trials: int = 50,
+    partition: str = "gpu",
+    gpu_type: str | None = None,
+) -> str:
+    """Create a WandB sweep and submit an agent job to SLURM.
+
+    Steps:
+      1. Run ``wandb sweep`` to create the sweep and obtain a sweep ID.
+      2. Generate a temporary sbatch script that launches a sweep agent.
+      3. Submit the agent job via sbatch.
+
+    Args:
+        sweep_config: Path to a WandB sweep YAML config file.
+        project_name: WandB project name for the sweep.
+        model: Model architecture name (e.g. "VCNNBpnet").
+        data_path: Path to the training data directory.
+        data_name: Dataset name (e.g. "all_mean").
+        scaling_method: Label scaling method (default "standardize").
+        n_trials: Number of sweep trials to run (default 50).
+        partition: SLURM partition (default "gpu").
+        gpu_type: GPU type constraint (e.g. "a100").
+
+    Returns:
+        JSON with sweep_id, job_id, and submit_command.
+    """
+    sweep_p = Path(sweep_config).resolve()
+    if not sweep_p.is_file():
+        return json.dumps({"error": f"Sweep config not found: {sweep_config}"})
+
+    if shutil.which("wandb") is None:
+        return json.dumps({"error": "wandb binary not found on PATH"})
+
+    # Step 1: Create the sweep
+    try:
+        sw = subprocess.run(
+            ["wandb", "sweep", str(sweep_p), "--project", project_name],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "wandb sweep creation timed out"})
+
+    if sw.returncode != 0:
+        return json.dumps({
+            "error": f"wandb sweep failed (exit {sw.returncode})",
+            "stderr": sw.stderr.strip(),
+        })
+
+    # Parse sweep ID from output (check both stdout and stderr)
+    sweep_id = None
+    for line in (sw.stdout + "\n" + sw.stderr).splitlines():
+        if "ID:" in line:
+            # Formats: "Creating sweep with ID: xxx" or "wandb: Created sweep with ID: xxx"
+            sweep_id = line.split("ID:")[-1].strip()
+            break
+
+    if not sweep_id:
+        return json.dumps({
+            "error": "Could not parse sweep ID from wandb output",
+            "stdout": sw.stdout.strip(),
+            "stderr": sw.stderr.strip(),
+        })
+
+    # Step 2: Build sbatch script for the sweep agent
+    gres_line = ""
+    if gpu_type:
+        gres_line = f"#SBATCH --gres=gpu:{gpu_type}:1"
+    else:
+        gres_line = "#SBATCH --gres=gpu:1"
+
+    sbatch_content = f"""#!/bin/bash
+#SBATCH --job-name=sweep_{sweep_id}
+#SBATCH --partition={partition}
+{gres_line}
+#SBATCH --time=48:00:00
+#SBATCH --output=sweep_{sweep_id}_%j.out
+#SBATCH --error=sweep_{sweep_id}_%j.err
+#SBATCH --ntasks=1
+
+python scripts/cli/run_sweep.py \\
+    --model {model} \\
+    --data-path {data_path} \\
+    --data-name {data_name} \\
+    --scaling-method {scaling_method} \\
+    --n-trials {n_trials} \\
+    --sweep-id {sweep_id} \\
+    --project-name {project_name}
+"""
+
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False, prefix="tfbs_")
+    tmp.write(sbatch_content)
+    tmp.close()
+    os.chmod(tmp.name, 0o755)
+
+    # Step 3: Submit via sbatch
+    result = await slurm_submit(script_path=tmp.name)
+    result_dict = json.loads(result)
+    result_dict["sweep_id"] = sweep_id
+    return json.dumps(result_dict)
+
+
+# ---------------------------------------------------------------------------
+# Tool 18: tfbs_validate (model validation on test/val set)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_validate",
+    annotations={
+        "title": "Submit Validation Job",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_validate(
+    checkpoint_path: str,
+    data_path: str,
+    model_name: str = "VCNNBpnet",
+    scaling_method: str = "standardize",
+    output_file: str | None = None,
+    partition: str = "gpu",
+    gpu_type: str | None = None,
+    max_time: str = "02:00:00",
+    job_name: str | None = None,
+) -> str:
+    """Submit a model validation job to SLURM.
+
+    Runs scripts/validate.py which loads a checkpoint, runs
+    trainer.validate() on the validation set, and appends the loss
+    to a CSV results file.
+
+    Args:
+        checkpoint_path: Path to the .ckpt model checkpoint.
+        data_path: Path to the dataset (tensor directory or CSV).
+        model_name: Model class name (e.g. "VCNNBpnet", "RNN").
+        scaling_method: Label scaling ("standardize", "normalize", "none").
+        output_file: CSV file to append results to.  Defaults to
+                     results/validation_results.csv in the project dir.
+        partition: SLURM partition (default "gpu").
+        gpu_type: GPU gres string (e.g. "nvidia_a100_80gb_pcie:1").
+                  If omitted, requests 1 generic GPU.
+        max_time: SLURM wall time (default "02:00:00").
+        job_name: SLURM job name (default "tfbs_validate").
+
+    Returns:
+        JSON with job_id, the generated sbatch script, and the
+        validation command.
+    """
+    project_root = Path(__file__).resolve().parent.parent.parent
+    validate_script = project_root / "scripts" / "validate.py"
+
+    if not validate_script.exists():
+        return json.dumps({"error": f"validate.py not found at {validate_script}"})
+
+    ckpt = Path(checkpoint_path).resolve()
+    if not ckpt.exists():
+        return json.dumps({"error": f"Checkpoint not found: {checkpoint_path}"})
+
+    data = Path(data_path).resolve()
+    if not data.exists():
+        return json.dumps({"error": f"Data path not found: {data_path}"})
+
+    if output_file is None:
+        output_file = str(project_root / "results" / "validation_results.csv")
+
+    gres = f"gpu:{gpu_type}" if gpu_type else "gpu:1"
+    name = job_name or "tfbs_validate"
+
+    validate_cmd = (
+        f"python {validate_script}"
+        f" --checkpoint_path {ckpt}"
+        f" --model_name {model_name}"
+        f" --data_path {data}"
+        f" --scaling_method {scaling_method}"
+        f" --output_file {output_file}"
+    )
+
+    sbatch_script = (
+        f"#!/bin/bash\n"
+        f"#SBATCH --job-name={name}\n"
+        f"#SBATCH --partition={partition}\n"
+        f"#SBATCH --nodes=1\n"
+        f"#SBATCH --cpus-per-task=8\n"
+        f"#SBATCH --mem=64G\n"
+        f"#SBATCH --gres={gres}\n"
+        f"#SBATCH --time={max_time}\n"
+        f"#SBATCH --output=outs/validate.o%j\n"
+        f"#SBATCH --error=outs/validate.e%j\n"
+        f"\ndate\n"
+        f"{validate_cmd}\n"
+        f"date\n"
+    )
+
+    import os as _os
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".sh", delete=False, prefix="tfbs_validate_",
+    )
+    tmp.write(sbatch_script)
+    tmp.close()
+    _os.chmod(tmp.name, 0o755)
+
+    # Ensure outs/ directory exists
+    outs_dir = project_root / "scripts" / "cli" / "outs"
+    outs_dir.mkdir(parents=True, exist_ok=True)
+
+    submit_result = json.loads(await slurm_submit(
+        script_path=tmp.name,
+        working_dir=str(project_root / "scripts" / "cli"),
+    ))
+
+    submit_result["mode"] = "validate"
+    submit_result["validate_command"] = validate_cmd
+    submit_result["sbatch_script"] = sbatch_script
+    return json.dumps(submit_result)
+
+
+# ---------------------------------------------------------------------------
+# Tool 19: tfbs_config (generate LightningCLI YAML config)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_config",
+    annotations={
+        "title": "Generate Training Config",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_config(
+    model_type: str,
+    data_path: str,
+    output_path: str,
+    input_length: int = 24,
+    scaling_method: str = "standardize",
+    batch_size: int = 64,
+    max_epochs: int = 500,
+    patience: int = 5,
+    learning_rate: float = 0.001,
+    classify: bool = False,
+    wandb_project: str | None = None,
+    checkpoint_dir: str | None = None,
+    checkpoint_filename: str | None = None,
+    model_params: dict | None = None,
+) -> str:
+    """Generate a LightningCLI YAML config file for training.
+
+    Creates a complete config with model, data, and trainer sections
+    that can be passed directly to tfbs_train.
+
+    Supported model types: VCNNBpnet, RNN.  Model-specific
+    hyperparameters are passed via model_params dict.
+
+    VCNNBpnet model_params keys:
+      num_channels (int, default 64), kernel_size (int, default 21),
+      dilations (list[int], default [1,1,2,4,8]),
+      pool_output_size (int, default 128),
+      dense_sizes (list[int], default [128,64])
+
+    RNN model_params keys:
+      conv_out_channels (int, default 100), kernel_size (int, default 5),
+      pool_size (int, default 2), dropout_conv (float, default 0.3),
+      gru_hidden_size (int, default 100), gru_num_layers (int, default 1),
+      bidirectional (bool, default true),
+      dense_size (int, default 100), dropout_fc (float, default 0.6)
+
+    Args:
+        model_type: Architecture name ("VCNNBpnet" or "RNN").
+        data_path: Path to dataset (tensor directory or CSV).
+        output_path: Where to write the YAML config file.
+        input_length: Sequence length (default 24).
+        scaling_method: Label scaling ("standardize", "normalize", "none").
+        batch_size: Training batch size (default 64).
+        max_epochs: Maximum training epochs (default 500).
+        patience: Early stopping patience (default 5).
+        learning_rate: Optimizer learning rate (default 0.001).
+        classify: If true, use BCE loss; else MSE (default false).
+        wandb_project: WandB project name for logging.  If omitted,
+                       no WandB logger is configured.
+        checkpoint_dir: Directory to save checkpoints.  Defaults to
+                        saved_models/<data_name>/<scaling_method>.
+        checkpoint_filename: Checkpoint filename (default "best_<model_type>").
+        model_params: Dict of model-specific hyperparameters (see above).
+
+    Returns:
+        JSON with "output_path", "config_preview" (first 40 lines),
+        and "model_type".
+    """
+    import yaml
+
+    valid_models = {"VCNNBpnet", "RNN"}
+    if model_type not in valid_models:
+        return json.dumps({
+            "error": f"Unknown model_type '{model_type}'. Must be one of: {sorted(valid_models)}"
+        })
+
+    data = Path(data_path).resolve()
+    if not data.exists():
+        return json.dumps({"error": f"Data path not found: {data_path}"})
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    params = model_params or {}
+
+    # --- Model section ---
+    base_args = {
+        "input_length": input_length,
+        "learning_rate": learning_rate,
+        "classify": classify,
+        "input_channels": 4,
+    }
+
+    if model_type == "VCNNBpnet":
+        model_args = {
+            "num_channels": params.get("num_channels", 64),
+            "kernel_size": params.get("kernel_size", 21),
+            "dilations": params.get("dilations", [1, 1, 2, 4, 8]),
+            "pool_output_size": params.get("pool_output_size", 128),
+            "dense_sizes": params.get("dense_sizes", [128, 64]),
+        }
+    elif model_type == "RNN":
+        model_args = {
+            "conv_out_channels": params.get("conv_out_channels", 100),
+            "kernel_size": params.get("kernel_size", 5),
+            "pool_size": params.get("pool_size", 2),
+            "dropout_conv": params.get("dropout_conv", 0.3),
+            "gru_hidden_size": params.get("gru_hidden_size", 100),
+            "gru_num_layers": params.get("gru_num_layers", 1),
+            "bidirectional": params.get("bidirectional", True),
+            "dense_size": params.get("dense_size", 100),
+            "dropout_fc": params.get("dropout_fc", 0.6),
+        }
+
+    model_args.update(base_args)
+
+    # --- Trainer section ---
+    data_name = data.name
+    ckpt_dir = checkpoint_dir or str(
+        project_root / "saved_models" / data_name / scaling_method
+    )
+    ckpt_filename = checkpoint_filename or f"best_{model_type}"
+
+    callbacks = [
+        {
+            "class_path": "pytorch_lightning.callbacks.EarlyStopping",
+            "init_args": {
+                "monitor": "val_loss",
+                "patience": patience,
+                "mode": "min",
+            },
+        },
+        {
+            "class_path": "pytorch_lightning.callbacks.ModelCheckpoint",
+            "init_args": {
+                "dirpath": ckpt_dir,
+                "filename": ckpt_filename,
+                "monitor": "val_loss",
+                "mode": "min",
+                "save_top_k": 1,
+            },
+        },
+    ]
+
+    trainer: dict = {
+        "accelerator": "auto",
+        "devices": "auto",
+        "max_epochs": max_epochs,
+        "log_every_n_steps": 10,
+        "callbacks": callbacks,
+    }
+
+    if wandb_project:
+        trainer["logger"] = [
+            {
+                "class_path": "pytorch_lightning.loggers.WandbLogger",
+                "init_args": {
+                    "project": wandb_project,
+                    "log_model": False,
+                },
+            }
+        ]
+
+    # --- Assemble full config ---
+    config = {
+        "seed_everything": 42,
+        "trainer": trainer,
+        "model": {
+            "class_path": f"tfbs.nn.models.{model_type}",
+            "init_args": model_args,
+        },
+        "data": {
+            "data_path": str(data),
+            "batch_size": batch_size,
+            "num_workers": 24,
+            "preprocess": False,
+            "scaling_method": scaling_method,
+        },
+    }
+
+    # --- Write file ---
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    # Read back for preview
+    with open(out) as f:
+        lines = f.readlines()
+    preview = "".join(lines[:40])
+
+    return json.dumps({
+        "output_path": str(out),
+        "model_type": model_type,
+        "config_preview": preview,
+    })
 
 
 # ---------------------------------------------------------------------------
