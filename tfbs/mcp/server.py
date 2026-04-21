@@ -2711,6 +2711,143 @@ async def tfbs_conv_filters(
 
 
 # ---------------------------------------------------------------------------
+# Tool 30: tfbs_chipseq_benchmark (ChIP-Atlas benchmark analysis)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_chipseq_benchmark",
+    annotations={
+        "title": "ChIP-seq Benchmark Analysis",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_chipseq_benchmark(
+    intersect_dir: str,
+    output_dir: str,
+    pos_tf: str = "NKX2-1",
+    neg_tfs: list[str] | None = None,
+    datasets: list[str] | None = None,
+    cutoffs: list[int] | None = None,
+    model_type: str = "VCNNBpnet",
+    models_dir: str = "saved_models_final",
+    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    max_sequences: int = 15000,
+    slurm: bool = False,
+    partition: str = "gpu",
+    max_time: str = "04:00:00",
+) -> str:
+    """Run ChIP-seq benchmark analysis comparing NN models against ChIP-Atlas data.
+
+    Evaluates models in two ways:
+    1. Classification: distinguish pos TF binding from neg TFs (ROC curves)
+    2. Regression: correlate NN score with experiment overlap count
+
+    Input: ChIP-Atlas intersection BED files (*.allintersect.bed).
+
+    Args:
+        intersect_dir: Directory with *.allintersect.bed files.
+        output_dir: Where to save plots and CSV results.
+        pos_tf: Positive transcription factor name (default NKX2-1).
+        neg_tfs: Negative TF names (default GATA1, MYOD1, NKX2-5, RXRA).
+        datasets: Model dataset names (default all_mean, core_mean, flank_mean).
+        cutoffs: Experiment-count cutoffs for classification (default 1,3,5,8).
+        model_type: Architecture class name (default VCNNBpnet).
+        models_dir: Base checkpoint directory.
+        genome_fasta: Reference genome FASTA path.
+        max_sequences: Max sequences per TF for speed.
+        slurm: Submit as SLURM job instead of running directly.
+        partition: SLURM partition.
+        max_time: SLURM wall time.
+
+    Returns:
+        JSON with output_dir and list of generated files, or job_id if SLURM.
+    """
+    if neg_tfs is None:
+        neg_tfs = ["GATA1", "MYOD1", "NKX2-5", "RXRA"]
+    if datasets is None:
+        datasets = ["all_mean", "core_mean", "flank_mean"]
+    if cutoffs is None:
+        cutoffs = [1, 3, 5, 8]
+
+    intersect_path = Path(intersect_dir).resolve()
+    if not intersect_path.is_dir():
+        return json.dumps({"error": f"Intersect directory not found: {intersect_dir}"})
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    script = project_root / "scripts" / "chipseq_benchmark.py"
+    if not script.exists():
+        return json.dumps({"error": f"Benchmark script not found: {script}"})
+
+    out = Path(output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    cmd = (
+        f"python {script}"
+        f" --intersect-dir {intersect_path}"
+        f" --output-dir {out}"
+        f" --pos-tf {pos_tf}"
+        f" --neg-tfs {' '.join(neg_tfs)}"
+        f" --datasets {' '.join(datasets)}"
+        f" --cutoffs {' '.join(str(c) for c in cutoffs)}"
+        f" --model-type {model_type}"
+        f" --models-dir {models_dir}"
+        f" --genome {genome_fasta}"
+        f" --max-sequences {max_sequences}"
+    )
+
+    if slurm:
+        import os as _os
+        sbatch_content = (
+            f"#!/bin/bash\n"
+            f"#SBATCH --job-name=chipseq_bench\n"
+            f"#SBATCH --partition={partition}\n"
+            f"#SBATCH --nodes=1\n"
+            f"#SBATCH --cpus-per-task=8\n"
+            f"#SBATCH --mem=64G\n"
+            f"#SBATCH --gres=gpu:1\n"
+            f"#SBATCH --time={max_time}\n"
+            f"#SBATCH --output={out}/bench.o%j\n"
+            f"#SBATCH --error={out}/bench.e%j\n"
+            f"\ndate\n{cmd}\ndate\n"
+        )
+        sbatch_path = out / "chipseq_benchmark.sh"
+        sbatch_path.write_text(sbatch_content)
+        _os.chmod(str(sbatch_path), 0o755)
+
+        submit_result = json.loads(await slurm_submit(
+            script_path=str(sbatch_path),
+            working_dir=str(project_root),
+        ))
+        submit_result["mode"] = "slurm"
+        submit_result["command"] = cmd
+        return json.dumps(submit_result)
+
+    # Direct mode — run the script as subprocess
+    result = subprocess.run(
+        cmd.split(), capture_output=True, text=True,
+        timeout=3600, cwd=str(project_root),
+    )
+
+    if result.returncode != 0:
+        return json.dumps({
+            "error": f"Benchmark failed (exit {result.returncode})",
+            "stderr": result.stderr[-1000:],
+        })
+
+    # List output files
+    files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
+
+    return json.dumps({
+        "mode": "direct",
+        "output_dir": str(out),
+        "files": files,
+        "stdout": result.stdout[-500:],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
