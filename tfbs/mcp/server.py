@@ -2848,6 +2848,145 @@ async def tfbs_chipseq_benchmark(
 
 
 # ---------------------------------------------------------------------------
+# Tool 31: tfbs_chipseq_method_comparison (NN + FIMO + FoldX, head-to-head)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_chipseq_method_comparison",
+    annotations={
+        "title": "ChIP-seq Method Comparison (NN + FIMO + FoldX)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_chipseq_method_comparison(
+    intersect_dir: str,
+    output_dir: str,
+    motif_file: str,
+    foldx_pdb: str,
+    pos_tf: str = "NKX2-1",
+    neg_tfs: list[str] | None = None,
+    datasets: list[str] | None = None,
+    model_type: str = "VCNNBpnet",
+    models_dir: str = "saved_models_final",
+    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    n_per_tf: int = 500,
+    foldx_workers: int = 32,
+    slurm: bool = True,
+    partition: str = "gpu",
+    max_time: str = "12:00:00",
+) -> str:
+    """Compare NN, FIMO (JASPAR PWM), and FoldX (TF-DNA crystal) for
+    distinguishing positive TF peaks from negative TF peaks.
+
+    This is the same ChIP-Atlas TF-vs-TF classification task as
+    tfbs_chipseq_benchmark, but adds head-to-head ROC-AUC comparison
+    against the JASPAR motif (FIMO) and structure-based binding energy
+    (FoldX) on the same balanced subsample of sequences.
+
+    Recommended for SLURM (FoldX is ~3 min per sequence; default 500
+    sequences per TF takes ~4 hours on 32 cores).
+
+    Args:
+        intersect_dir: Directory with *.allintersect.bed files.
+        output_dir: Where to save plots, raw scores, and AUC tables.
+        motif_file: JASPAR/MEME motif file for FIMO (e.g. MA1994.1.meme
+            for NKX2-1).
+        foldx_pdb: Repaired TF-DNA complex PDB. The DNA length in the
+            PDB defines the FoldX scoring window (must be <= the
+            sequence window, typically 11 bp for NKX2-1).
+        pos_tf: Positive transcription factor name.
+        neg_tfs: Negative TF names.
+        datasets: NN dataset names (subdirectories of models_dir).
+        model_type: Model architecture class name.
+        models_dir: Base checkpoint directory.
+        genome_fasta: Reference genome FASTA.
+        n_per_tf: Sequences sampled per TF (FoldX bottleneck).
+        foldx_workers: Parallel CPU workers for FoldX.
+        slurm: Submit as SLURM job (recommended).
+        partition: SLURM partition.
+        max_time: SLURM wall time.
+
+    Returns:
+        JSON with output_dir, file list, and (if slurm) job_id.
+    """
+    if neg_tfs is None:
+        neg_tfs = ["GATA1", "MYOD1", "NKX2-5", "RXRA"]
+    if datasets is None:
+        datasets = ["all_mean", "core_mean", "flank_mean"]
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    script = project_root / "scripts" / "chipseq_benchmark_with_foldx.py"
+    if not script.exists():
+        return json.dumps({"error": f"Script not found: {script}"})
+
+    out = Path(output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    cmd_parts = [
+        "/home/profts/.conda/envs/mamba/envs/sams/bin/python",
+        str(script),
+        "--intersect-dir", str(Path(intersect_dir).resolve()),
+        "--output-dir", str(out),
+        "--genome", str(Path(genome_fasta).resolve()),
+        "--motif-file", str(Path(motif_file).resolve()),
+        "--foldx-pdb", str(Path(foldx_pdb).resolve()),
+        "--pos-tf", pos_tf,
+        "--neg-tfs", *neg_tfs,
+        "--datasets", *datasets,
+        "--models-dir", models_dir,
+        "--model-type", model_type,
+        "--n-per-tf", str(n_per_tf),
+        "--foldx-workers", str(foldx_workers),
+    ]
+    cmd = " ".join(cmd_parts)
+
+    if slurm:
+        import os as _os
+        sbatch_content = (
+            f"#!/bin/bash\n"
+            f"#SBATCH --job-name=cs_method_cmp\n"
+            f"#SBATCH --partition={partition}\n"
+            f"#SBATCH --nodes=1\n"
+            f"#SBATCH --cpus-per-task={max(foldx_workers, 8)}\n"
+            f"#SBATCH --mem=64G\n"
+            f"#SBATCH --gres=gpu:1\n"
+            f"#SBATCH --time={max_time}\n"
+            f"#SBATCH --output={out}/method_cmp.o%j\n"
+            f"#SBATCH --error={out}/method_cmp.e%j\n"
+            f"\ndate\n{cmd}\ndate\n"
+        )
+        sbatch_path = out / "method_comparison.sh"
+        sbatch_path.write_text(sbatch_content)
+        _os.chmod(str(sbatch_path), 0o755)
+
+        submit_result = json.loads(await slurm_submit(
+            script_path=str(sbatch_path),
+            working_dir=str(project_root),
+        ))
+        submit_result["mode"] = "slurm"
+        submit_result["command"] = cmd
+        submit_result["output_dir"] = str(out)
+        return json.dumps(submit_result)
+
+    result = subprocess.run(
+        cmd_parts, capture_output=True, text=True,
+        timeout=43200, cwd=str(project_root),
+    )
+    if result.returncode != 0:
+        return json.dumps({
+            "error": f"Method comparison failed (exit {result.returncode})",
+            "stderr": result.stderr[-1500:],
+        })
+    files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
+    return json.dumps({
+        "mode": "direct", "output_dir": str(out),
+        "files": files, "stdout": result.stdout[-1000:],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
