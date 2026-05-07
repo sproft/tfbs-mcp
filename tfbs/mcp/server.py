@@ -2711,9 +2711,443 @@ async def tfbs_conv_filters(
 
 
 # ---------------------------------------------------------------------------
+# Tool 30: tfbs_chipseq_benchmark (ChIP-Atlas benchmark analysis)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_chipseq_benchmark",
+    annotations={
+        "title": "ChIP-seq Benchmark Analysis",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def tfbs_chipseq_benchmark(
+    intersect_dir: str,
+    output_dir: str,
+    pos_tf: str = "NKX2-1",
+    neg_tfs: list[str] | None = None,
+    datasets: list[str] | None = None,
+    cutoffs: list[int] | None = None,
+    model_type: str = "VCNNBpnet",
+    models_dir: str = "saved_models_final",
+    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    max_sequences: int = 15000,
+    slurm: bool = False,
+    partition: str = "gpu",
+    max_time: str = "04:00:00",
+) -> str:
+    """Run ChIP-seq benchmark analysis comparing NN models against ChIP-Atlas data.
+
+    Evaluates models in two ways:
+    1. Classification: distinguish pos TF binding from neg TFs (ROC curves)
+    2. Regression: correlate NN score with experiment overlap count
+
+    Input: ChIP-Atlas intersection BED files (*.allintersect.bed).
+
+    Args:
+        intersect_dir: Directory with *.allintersect.bed files.
+        output_dir: Where to save plots and CSV results.
+        pos_tf: Positive transcription factor name (default NKX2-1).
+        neg_tfs: Negative TF names (default GATA1, MYOD1, NKX2-5, RXRA).
+        datasets: Model dataset names (default all_mean, core_mean, flank_mean).
+        cutoffs: Experiment-count cutoffs for classification (default 1,3,5,8).
+        model_type: Architecture class name (default VCNNBpnet).
+        models_dir: Base checkpoint directory.
+        genome_fasta: Reference genome FASTA path.
+        max_sequences: Max sequences per TF for speed.
+        slurm: Submit as SLURM job instead of running directly.
+        partition: SLURM partition.
+        max_time: SLURM wall time.
+
+    Returns:
+        JSON with output_dir and list of generated files, or job_id if SLURM.
+    """
+    if neg_tfs is None:
+        neg_tfs = ["GATA1", "MYOD1", "NKX2-5", "RXRA"]
+    if datasets is None:
+        datasets = ["all_mean", "core_mean", "flank_mean"]
+    if cutoffs is None:
+        cutoffs = [1, 3, 5, 8]
+
+    intersect_path = Path(intersect_dir).resolve()
+    if not intersect_path.is_dir():
+        return json.dumps({"error": f"Intersect directory not found: {intersect_dir}"})
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    script = project_root / "scripts" / "chipseq_benchmark.py"
+    if not script.exists():
+        return json.dumps({"error": f"Benchmark script not found: {script}"})
+
+    out = Path(output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    cmd = (
+        f"python {script}"
+        f" --intersect-dir {intersect_path}"
+        f" --output-dir {out}"
+        f" --pos-tf {pos_tf}"
+        f" --neg-tfs {' '.join(neg_tfs)}"
+        f" --datasets {' '.join(datasets)}"
+        f" --cutoffs {' '.join(str(c) for c in cutoffs)}"
+        f" --model-type {model_type}"
+        f" --models-dir {models_dir}"
+        f" --genome {genome_fasta}"
+        f" --max-sequences {max_sequences}"
+    )
+
+    if slurm:
+        import os as _os
+        sbatch_content = (
+            f"#!/bin/bash\n"
+            f"#SBATCH --job-name=chipseq_bench\n"
+            f"#SBATCH --partition={partition}\n"
+            f"#SBATCH --nodes=1\n"
+            f"#SBATCH --cpus-per-task=8\n"
+            f"#SBATCH --mem=64G\n"
+            f"#SBATCH --gres=gpu:1\n"
+            f"#SBATCH --time={max_time}\n"
+            f"#SBATCH --output={out}/bench.o%j\n"
+            f"#SBATCH --error={out}/bench.e%j\n"
+            f"\ndate\n{cmd}\ndate\n"
+        )
+        sbatch_path = out / "chipseq_benchmark.sh"
+        sbatch_path.write_text(sbatch_content)
+        _os.chmod(str(sbatch_path), 0o755)
+
+        submit_result = json.loads(await slurm_submit(
+            script_path=str(sbatch_path),
+            working_dir=str(project_root),
+        ))
+        submit_result["mode"] = "slurm"
+        submit_result["command"] = cmd
+        return json.dumps(submit_result)
+
+    # Direct mode — run the script as subprocess
+    result = subprocess.run(
+        cmd.split(), capture_output=True, text=True,
+        timeout=3600, cwd=str(project_root),
+    )
+
+    if result.returncode != 0:
+        return json.dumps({
+            "error": f"Benchmark failed (exit {result.returncode})",
+            "stderr": result.stderr[-1000:],
+        })
+
+    # List output files
+    files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
+
+    return json.dumps({
+        "mode": "direct",
+        "output_dir": str(out),
+        "files": files,
+        "stdout": result.stdout[-500:],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 31: tfbs_chipseq_method_comparison (NN + FIMO + FoldX, head-to-head)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_chipseq_method_comparison",
+    annotations={
+        "title": "ChIP-seq Method Comparison (NN + FIMO + FoldX)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_chipseq_method_comparison(
+    intersect_dir: str,
+    output_dir: str,
+    motif_file: str,
+    foldx_pdb: str,
+    pos_tf: str = "NKX2-1",
+    neg_tfs: list[str] | None = None,
+    datasets: list[str] | None = None,
+    model_type: str = "VCNNBpnet",
+    models_dir: str = "saved_models_final",
+    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    n_per_tf: int = 500,
+    foldx_workers: int = 32,
+    slurm: bool = True,
+    partition: str = "gpu",
+    max_time: str = "12:00:00",
+) -> str:
+    """Compare NN, FIMO (JASPAR PWM), and FoldX (TF-DNA crystal) for
+    distinguishing positive TF peaks from negative TF peaks.
+
+    This is the same ChIP-Atlas TF-vs-TF classification task as
+    tfbs_chipseq_benchmark, but adds head-to-head ROC-AUC comparison
+    against the JASPAR motif (FIMO) and structure-based binding energy
+    (FoldX) on the same balanced subsample of sequences.
+
+    Recommended for SLURM (FoldX is ~3 min per sequence; default 500
+    sequences per TF takes ~4 hours on 32 cores).
+
+    Args:
+        intersect_dir: Directory with *.allintersect.bed files.
+        output_dir: Where to save plots, raw scores, and AUC tables.
+        motif_file: JASPAR/MEME motif file for FIMO (e.g. MA1994.1.meme
+            for NKX2-1).
+        foldx_pdb: Repaired TF-DNA complex PDB. The DNA length in the
+            PDB defines the FoldX scoring window (must be <= the
+            sequence window, typically 11 bp for NKX2-1).
+        pos_tf: Positive transcription factor name.
+        neg_tfs: Negative TF names.
+        datasets: NN dataset names (subdirectories of models_dir).
+        model_type: Model architecture class name.
+        models_dir: Base checkpoint directory.
+        genome_fasta: Reference genome FASTA.
+        n_per_tf: Sequences sampled per TF (FoldX bottleneck).
+        foldx_workers: Parallel CPU workers for FoldX.
+        slurm: Submit as SLURM job (recommended).
+        partition: SLURM partition.
+        max_time: SLURM wall time.
+
+    Returns:
+        JSON with output_dir, file list, and (if slurm) job_id.
+    """
+    if neg_tfs is None:
+        neg_tfs = ["GATA1", "MYOD1", "NKX2-5", "RXRA"]
+    if datasets is None:
+        datasets = ["all_mean", "core_mean", "flank_mean"]
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    script = project_root / "scripts" / "chipseq_benchmark_with_foldx.py"
+    if not script.exists():
+        return json.dumps({"error": f"Script not found: {script}"})
+
+    out = Path(output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    cmd_parts = [
+        "/home/profts/.conda/envs/mamba/envs/sams/bin/python",
+        str(script),
+        "--intersect-dir", str(Path(intersect_dir).resolve()),
+        "--output-dir", str(out),
+        "--genome", str(Path(genome_fasta).resolve()),
+        "--motif-file", str(Path(motif_file).resolve()),
+        "--foldx-pdb", str(Path(foldx_pdb).resolve()),
+        "--pos-tf", pos_tf,
+        "--neg-tfs", *neg_tfs,
+        "--datasets", *datasets,
+        "--models-dir", models_dir,
+        "--model-type", model_type,
+        "--n-per-tf", str(n_per_tf),
+        "--foldx-workers", str(foldx_workers),
+    ]
+    cmd = " ".join(cmd_parts)
+
+    if slurm:
+        import os as _os
+        sbatch_content = (
+            f"#!/bin/bash\n"
+            f"#SBATCH --job-name=cs_method_cmp\n"
+            f"#SBATCH --partition={partition}\n"
+            f"#SBATCH --nodes=1\n"
+            f"#SBATCH --cpus-per-task={max(foldx_workers, 8)}\n"
+            f"#SBATCH --mem=64G\n"
+            f"#SBATCH --gres=gpu:1\n"
+            f"#SBATCH --time={max_time}\n"
+            f"#SBATCH --output={out}/method_cmp.o%j\n"
+            f"#SBATCH --error={out}/method_cmp.e%j\n"
+            f"\ndate\n{cmd}\ndate\n"
+        )
+        sbatch_path = out / "method_comparison.sh"
+        sbatch_path.write_text(sbatch_content)
+        _os.chmod(str(sbatch_path), 0o755)
+
+        submit_result = json.loads(await slurm_submit(
+            script_path=str(sbatch_path),
+            working_dir=str(project_root),
+        ))
+        submit_result["mode"] = "slurm"
+        submit_result["command"] = cmd
+        submit_result["output_dir"] = str(out)
+        return json.dumps(submit_result)
+
+    result = subprocess.run(
+        cmd_parts, capture_output=True, text=True,
+        timeout=43200, cwd=str(project_root),
+    )
+    if result.returncode != 0:
+        return json.dumps({
+            "error": f"Method comparison failed (exit {result.returncode})",
+            "stderr": result.stderr[-1500:],
+        })
+    files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
+    return json.dumps({
+        "mode": "direct", "output_dir": str(out),
+        "files": files, "stdout": result.stdout[-1000:],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 32: tfbs_disease_variant_validation
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_disease_variant_validation",
+    annotations={
+        "title": "Disease-Variant Validation",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_disease_variant_validation(
+    peaks_bed: str,
+    output_dir: str,
+    clinvar_vcf: str = "/sc-projects/sc-proj-cc17-P09_TFBS/data/clinvar/clinvar.vcf.gz",
+    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    peak_confidence: int = 1,
+    nn_models: dict | None = None,
+    motif_file: str | None = None,
+    foldx_pdb: str | None = None,
+    nn_window: int = 24,
+    foldx_workers: int = 16,
+    device: str = "cuda",
+    slurm: bool = False,
+    partition: str = "compute",
+    max_time: str = "06:00:00",
+) -> str:
+    """Validate TF-binding models against ClinVar disease variants.
+
+    Pipeline (works for any transcription factor):
+    1. Merge a BED of TF binding peaks (optional confidence filter).
+    2. Pull non-coding pathogenic and benign SNVs from ClinVar that
+       overlap those peaks.
+    3. Score reference and alternative alleles per variant with one or
+       more NN models, with FIMO against a JASPAR PWM, and optionally
+       with FoldX on a TF-DNA crystal structure.
+    4. Test whether |delta-delta| discriminates pathogenic from benign
+       variants (ROC-AUC, Mann-Whitney U).
+
+    Args:
+        peaks_bed: Path to a BED file of TF binding peaks. Accepts the
+            ChIP-Atlas allintersect format (4th column = experiment
+            overlap count) or any BED with 3+ columns.
+        output_dir: Directory to write results, plots, and summary CSV.
+        clinvar_vcf: Indexed ClinVar VCF (.vcf.gz with .tbi).
+        genome_fasta: Reference genome FASTA file.
+        peak_confidence: Minimum value of the BED 4th column to keep
+            (e.g. ChIP-Atlas overlap >= 3). Default 1.
+        nn_models: Dict mapping model name to checkpoint path, e.g.
+            {"flank_mean": "/path/to/best_VCNNBpnet.ckpt"}.
+        motif_file: JASPAR / MEME motif file for FIMO scoring.
+        foldx_pdb: Repaired TF-DNA complex PDB for FoldX scoring.
+            FoldX is computationally expensive; consider slurm=true.
+        nn_window: Window size around the variant for NN scoring
+            (default 24, matches model input).
+        foldx_workers: Parallel CPU workers for FoldX.
+        device: "cuda" or "cpu" for NN inference.
+        slurm: Submit as a SLURM job rather than running directly.
+            Strongly recommended when FoldX is enabled.
+        partition: SLURM partition.
+        max_time: SLURM wall time (max 48:00:00).
+
+    Returns:
+        JSON with output_dir, file list, and (if slurm=true) job_id.
+    """
+    project_root = Path(__file__).resolve().parent.parent.parent
+    script = project_root / "scripts" / "disease_variant_validation.py"
+    if not script.exists():
+        return json.dumps({"error": f"Script not found: {script}"})
+
+    out = Path(output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    cmd_parts = [
+        "/home/profts/.conda/envs/mamba/envs/sams/bin/python",
+        str(script),
+        "--peaks-bed", str(Path(peaks_bed).resolve()),
+        "--clinvar-vcf", str(Path(clinvar_vcf).resolve()),
+        "--genome", str(Path(genome_fasta).resolve()),
+        "--output-dir", str(out),
+        "--peak-confidence", str(peak_confidence),
+        "--nn-window", str(nn_window),
+        "--foldx-workers", str(foldx_workers),
+        "--device", device,
+    ]
+    if nn_models:
+        model_args = [f"{name}={ckpt}" for name, ckpt in nn_models.items()]
+        cmd_parts.append("--models")
+        cmd_parts.extend(model_args)
+    if motif_file:
+        cmd_parts.extend(["--motif-file", str(Path(motif_file).resolve())])
+    if foldx_pdb:
+        cmd_parts.extend(["--foldx-pdb", str(Path(foldx_pdb).resolve())])
+
+    cmd = " ".join(cmd_parts)
+
+    if slurm:
+        import os as _os
+        sbatch_content = (
+            f"#!/bin/bash\n"
+            f"#SBATCH --job-name=disease_validation\n"
+            f"#SBATCH --partition={partition}\n"
+            f"#SBATCH --nodes=1\n"
+            f"#SBATCH --cpus-per-task={max(foldx_workers, 8)}\n"
+            f"#SBATCH --mem=64G\n"
+            f"#SBATCH --time={max_time}\n"
+            f"#SBATCH --output={out}/disease_validation.o%j\n"
+            f"#SBATCH --error={out}/disease_validation.e%j\n"
+            f"\ndate\n{cmd}\ndate\n"
+        )
+        sbatch_path = out / "disease_validation.sh"
+        sbatch_path.write_text(sbatch_content)
+        _os.chmod(str(sbatch_path), 0o755)
+
+        submit_result = json.loads(await slurm_submit(
+            script_path=str(sbatch_path),
+            working_dir=str(project_root),
+        ))
+        submit_result["mode"] = "slurm"
+        submit_result["command"] = cmd
+        submit_result["output_dir"] = str(out)
+        return json.dumps(submit_result)
+
+    result = subprocess.run(
+        cmd_parts, capture_output=True, text=True,
+        timeout=14400, cwd=str(project_root),
+    )
+
+    if result.returncode != 0:
+        return json.dumps({
+            "error": f"Disease validation failed (exit {result.returncode})",
+            "stderr": result.stderr[-1500:],
+            "stdout": result.stdout[-500:],
+        })
+
+    files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
+    return json.dumps({
+        "mode": "direct",
+        "output_dir": str(out),
+        "files": files,
+        "stdout": result.stdout[-1000:],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
+    # Ensure this module is reachable as 'tfbs.mcp.server' even when
+    # executed via ``python -m tfbs.mcp.server`` (which sets __name__ to
+    # '__main__').  Without this, sub-module imports like foldx_tools would
+    # create a *second* copy of the module and register tools on a
+    # different ``mcp`` instance.
+    import sys
+    if __name__ == "__main__" and "tfbs.mcp.server" not in sys.modules:
+        sys.modules["tfbs.mcp.server"] = sys.modules[__name__]
+
+    # Register FoldX tools on the shared mcp instance
+    import tfbs.mcp.foldx_tools  # noqa: F401
+
     mcp.run()
 
 
