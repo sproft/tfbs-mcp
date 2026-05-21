@@ -2987,7 +2987,197 @@ async def tfbs_chipseq_method_comparison(
 
 
 # ---------------------------------------------------------------------------
-# Tool 32: tfbs_disease_variant_validation
+# Tool 32: tfbs_remap_validation (ReMap external validation, NN+FIMO+FoldX)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="tfbs_remap_validation",
+    annotations={
+        "title": "ReMap External Validation (NN + FIMO + FoldX)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def tfbs_remap_validation(
+    remap_bed: str,
+    output_dir: str,
+    motif_file: str = "/sc-projects/sc-proj-cc17-P09_TFBS/data/JASPAR/MA1994.1.meme",
+    foldx_pdb: str = "/sc-projects/sc-proj-cc17-P09_TFBS/data/structures/repaired/NKX2-1_complex_CAB_Repair.pdb",
+    score_min: int = 4,
+    max_positives: int = 500,
+    negative_mode: str = "shuffle",
+    datasets: list[str] | None = None,
+    model_type: str = "VCNNBpnet",
+    models_dir: str = "saved_models_final",
+    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    foldx_workers: int = 32,
+    foldx_window: int = 11,
+    nn_window: int = 24,
+    max_region_len: int = 500,
+    skip_foldx: bool = False,
+    device: str = "cuda",
+    seed: int = 42,
+    slurm: bool = True,
+    partition: str = "gpu",
+    max_time: str = "12:00:00",
+) -> str:
+    """External validation of a TFBS model against a ReMap peak set.
+
+    Positives are ReMap peaks at experiment-count >= score_min (column 5
+    of the ReMap BED). Negatives are either dinucleotide-shuffled
+    positives (cleanest motif-disrupting control) or length+GC matched
+    random genomic regions that do not overlap any ReMap peak +/- 1 kb.
+    All three method families are scored on the same regions: the NN
+    takes the max over nn_window-bp tiles, FIMO scans the full region
+    with the supplied JASPAR motif, and FoldX scores the foldx_window-bp
+    centre of the region against the supplied TF-DNA crystal.
+
+    This is a complement to tfbs_chipseq_method_comparison, which runs
+    positive-TF-peaks vs negative-TF-peaks classification. ReMap
+    validation uses shuffle or matched-genomic negatives instead, which
+    is the cleanest external test of whether the model has learned the
+    motif rather than the cell-type background.
+
+    Args:
+        remap_bed: ReMap 2022 non-redundant BED for the target TF.
+            Column 5 must encode the experiment count.
+        output_dir: Where the script writes summary.csv, the two scores
+            CSVs, and roc_all_methods.png.
+        motif_file: JASPAR / MEME motif file for FIMO.
+        foldx_pdb: Repaired TF-DNA complex PDB for FoldX scoring.
+        score_min: Minimum experiment count in the ReMap BED.
+        max_positives: Subsample the high-confidence set to this many
+            peaks (FoldX is the bottleneck; default 500).
+        negative_mode: "shuffle" for dinucleotide-shuffled positives or
+            "genomic" for length+GC matched random regions.
+        datasets: NN dataset names (subdirectories of models_dir).
+        model_type: Model architecture class name.
+        models_dir: Base checkpoint directory.
+        genome_fasta: Reference genome FASTA.
+        foldx_workers: Parallel CPU workers for FoldX.
+        foldx_window: DNA window for FoldX (must match the PDB).
+        nn_window: Tile size for the NN score.
+        max_region_len: Cap on the per-peak region length for tiling.
+        skip_foldx: Skip the FoldX leg (useful for quick NN+FIMO runs).
+        device: "cuda" or "cpu" for NN inference.
+        seed: Random seed for negative sampling and shuffle.
+        slurm: Submit as a SLURM job (recommended when FoldX is on).
+        partition: SLURM partition.
+        max_time: SLURM wall time.
+
+    Returns:
+        JSON with output_dir, file list, and either job_id (slurm=true)
+        or the parsed AUC summary (slurm=false, summary.csv read back
+        as a list of {method, auc, n_pos, n_neg} entries).
+    """
+    if datasets is None:
+        datasets = ["all_mean", "core_mean", "flank_mean"]
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    script = project_root / "scripts" / "remap_validation.py"
+    if not script.exists():
+        return json.dumps({"error": f"Script not found: {script}"})
+
+    out = Path(output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    cmd_parts = [
+        "/home/profts/.conda/envs/mamba/envs/sams/bin/python",
+        str(script),
+        "--remap-bed", str(Path(remap_bed).resolve()),
+        "--output-dir", str(out),
+        "--genome", str(Path(genome_fasta).resolve()),
+        "--motif-file", str(Path(motif_file).resolve()),
+        "--foldx-pdb", str(Path(foldx_pdb).resolve()),
+        "--score-min", str(score_min),
+        "--max-positives", str(max_positives),
+        "--negative-mode", negative_mode,
+        "--datasets", *datasets,
+        "--models-dir", models_dir,
+        "--model-type", model_type,
+        "--device", device,
+        "--seed", str(seed),
+        "--foldx-workers", str(foldx_workers),
+        "--foldx-window", str(foldx_window),
+        "--nn-window", str(nn_window),
+        "--max-region-len", str(max_region_len),
+    ]
+    if skip_foldx:
+        cmd_parts.append("--skip-foldx")
+    cmd = " ".join(cmd_parts)
+
+    if slurm:
+        import os as _os
+        sbatch_content = (
+            f"#!/bin/bash\n"
+            f"#SBATCH --job-name=remap_validation\n"
+            f"#SBATCH --partition={partition}\n"
+            f"#SBATCH --nodes=1\n"
+            f"#SBATCH --cpus-per-task={max(foldx_workers, 8)}\n"
+            f"#SBATCH --mem=64G\n"
+            f"#SBATCH --gres=gpu:1\n"
+            f"#SBATCH --time={max_time}\n"
+            f"#SBATCH --output={out}/remap_validation.o%j\n"
+            f"#SBATCH --error={out}/remap_validation.e%j\n"
+            f"\ndate\n{cmd}\ndate\n"
+        )
+        sbatch_path = out / "remap_validation.sh"
+        sbatch_path.write_text(sbatch_content)
+        _os.chmod(str(sbatch_path), 0o755)
+
+        submit_result = json.loads(await slurm_submit(
+            script_path=str(sbatch_path),
+            working_dir=str(project_root),
+        ))
+        submit_result["mode"] = "slurm"
+        submit_result["command"] = cmd
+        submit_result["output_dir"] = str(out)
+        submit_result["expected_summary"] = str(out / "summary.csv")
+        return json.dumps(submit_result)
+
+    result = subprocess.run(
+        cmd_parts, capture_output=True, text=True,
+        timeout=43200, cwd=str(project_root),
+    )
+    if result.returncode != 0:
+        return json.dumps({
+            "error": f"ReMap validation failed (exit {result.returncode})",
+            "stderr": result.stderr[-1500:],
+        })
+
+    # Parse summary.csv if the script produced it, so direct-mode callers
+    # see the AUCs in the JSON without a follow-up file read.
+    summary = None
+    summary_csv = out / "summary.csv"
+    if summary_csv.exists():
+        try:
+            import csv
+            with open(summary_csv) as f:
+                summary = [
+                    {
+                        "method": row["method"],
+                        "auc": float(row["auc"]),
+                        "n_pos": int(row["n_pos"]),
+                        "n_neg": int(row["n_neg"]),
+                    }
+                    for row in csv.DictReader(f)
+                ]
+        except Exception as exc:
+            summary = {"parse_error": str(exc)}
+
+    files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
+    return json.dumps({
+        "mode": "direct",
+        "output_dir": str(out),
+        "files": files,
+        "summary": summary,
+        "stdout": result.stdout[-1000:],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 33: tfbs_disease_variant_validation
 # ---------------------------------------------------------------------------
 @mcp.tool(
     name="tfbs_disease_variant_validation",
