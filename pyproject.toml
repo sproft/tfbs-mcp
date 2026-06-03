@@ -3,11 +3,14 @@ requires = ["setuptools>=64", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tfbs-nn"
+name = "tfbs-mcp"
 version = "0.1.0"
-description = "Neural network models for transcription factor binding site prediction"
+description = "Python library and Model Context Protocol server for transcription factor binding site analysis"
 readme = "README.md"
 license = {text = "MIT"}
+authors = [
+    {name = "Sebastian Proft", email = "sebastian.proft@bih-charite.de"},
+]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
@@ -44,7 +47,7 @@ dev = [
     "pytest>=7.0",
 ]
 all = [
-    "tfbs-nn[viz,genomics,tracking,mcp,dev,foldx]",
+    "tfbs-mcp[viz,genomics,tracking,mcp,dev,foldx]",
 ]
 
 [project.scripts]
@@ -52,8 +55,13 @@ tfbs-train = "scripts.cli.train_cli:cli_main"
 tfbs-predict = "tfbs.predict:main"
 tfbs-mcp = "tfbs.mcp.server:main"
 
+[project.urls]
+Homepage = "https://github.com/sproft/tfbs-mcp"
+Repository = "https://github.com/sproft/tfbs-mcp"
+Issues = "https://github.com/sproft/tfbs-mcp/issues"
+
 [tool.setuptools.packages.find]
-include = ["tfbs*", "classes*"]
+include = ["tfbs*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
