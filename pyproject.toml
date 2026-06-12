@@ -21,6 +21,9 @@ dependencies = [
     "scikit-learn>=1.3",
     "pyyaml>=6.0",
     "matplotlib>=3.7",
+    # Required by the LightningCLI that backs the tfbs-train console script;
+    # base pytorch-lightning does not pull it in.
+    "jsonargparse[signatures]>=4.27.7",
 ]
 
 [project.optional-dependencies]
@@ -51,7 +54,7 @@ all = [
 ]
 
 [project.scripts]
-tfbs-train = "scripts.cli.train_cli:cli_main"
+tfbs-train = "tfbs.cli.train_cli:cli_main"
 tfbs-predict = "tfbs.predict:main"
 tfbs-mcp = "tfbs.mcp.server:main"
 

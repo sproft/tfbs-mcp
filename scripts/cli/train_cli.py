@@ -1,15 +1,14 @@
-from pytorch_lightning.cli import LightningCLI
-import torch
+"""Backwards-compatible shim.
 
-torch.set_float32_matmul_precision('high')
+The training CLI moved into the installed package at ``tfbs.cli.train_cli`` so the
+``tfbs-train`` console script resolves from a pip-installed wheel (the repo-local
+``scripts`` directory is not packaged). This re-export keeps ``scripts.cli.train_cli``
+working for repo-local Weights & Biases sweeps that still reference it.
+"""
+from tfbs.cli.train_cli import cli_main
 
-from tfbs.nn.models import BaseModel
-from tfbs.dataloaders.SeqDataset import TFBSDataModule
+__all__ = ["cli_main"]
 
-def cli_main():
-    cli = LightningCLI(BaseModel, TFBSDataModule, seed_everything_default=42, subclass_mode_model=True, save_config_kwargs={"overwrite": True})
-    # note: don't call fit!!
 
 if __name__ == "__main__":
     cli_main()
-    # note: it is good practice to implement the CLI in a function and call it in the main if block
