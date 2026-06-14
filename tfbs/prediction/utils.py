@@ -33,12 +33,17 @@ def load_model(model_info: ModelInfo, models_module: Any) -> Module:
     model_path = model_info['path']
     model_type = model_info['type']
 
-    if model_type == "SimpleCNN":
-        model = models_module.SimpleCNN.load_from_checkpoint(model_path)
-    elif model_type == "EquiNet":
-        model = models_module.EquiNet.load_from_checkpoint(model_path)
-    else:
-        raise ValueError(f"Unknown model type '{model_type}' in config.")
+    # Every model in tfbs.nn.models subclasses BaseModel and calls
+    # save_hyperparameters(), so load_from_checkpoint reconstructs any of them
+    # from the checkpoint's stored hyperparameters. Look the class up by name
+    # instead of hardcoding the supported types.
+    model_cls = getattr(models_module, model_type, None)
+    if model_cls is None:
+        available = [n for n in dir(models_module) if n[:1].isupper()]
+        raise ValueError(
+            f"Unknown model type '{model_type}' in config. Available: {available}"
+        )
+    model = model_cls.load_from_checkpoint(model_path)
 
     model.eval()
     model.freeze()
