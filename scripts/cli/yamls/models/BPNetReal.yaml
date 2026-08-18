@@ -1,0 +1,16 @@
+# Example model config for BPNetReal.
+# Reference BPNet implementation.
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/BPNetReal.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/BPNetReal.yaml
+#
+# Values are the class defaults - tune them for your data.
+class_path: tfbs.nn.models.BPNetReal
+init_args:
+  input_length: 24
+  n_filters: 64
+  n_layers: 8
+  n_control_tracks: 0
+  count_output_bias: true

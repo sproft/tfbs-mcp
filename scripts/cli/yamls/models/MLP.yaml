@@ -1,0 +1,15 @@
+# Example model config for MLP.
+# Fully connected baseline on the flattened one-hot input.
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/MLP.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/MLP.yaml
+#
+# Values are the class defaults - tune them for your data.
+class_path: tfbs.nn.models.MLP
+init_args:
+  input_length: 24
+  input_channels: 4
+  hidden_dims: [8, 8]
+  output_dim: 1

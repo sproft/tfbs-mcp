@@ -1,0 +1,18 @@
+# Example model config for VCNNBpnet.
+# Dilated CNN with a dense head - primary architecture for short windows.
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/VCNNBpnet.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/VCNNBpnet.yaml
+#
+# Values are the tuned settings from do_train_final.sh (all_mean, 24 bp).
+class_path: tfbs.nn.models.VCNNBpnet
+init_args:
+  input_length: 24
+  input_channels: 4
+  num_channels: 82
+  kernel_size: 42
+  dilations: [1, 1, 2, 4, 8]
+  pool_output_size: 167
+  dense_sizes: [128, 64]

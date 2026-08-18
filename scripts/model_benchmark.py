@@ -1,9 +1,16 @@
 import os
 import itertools
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc, precision_recall_curve
+
+def _default_results_path() -> Path:
+    """Results root: $TFBS_PROJECT_ROOT/results, else <repo>/results."""
+    root = os.environ.get("TFBS_PROJECT_ROOT") or Path(__file__).resolve().parent.parent
+    return Path(root) / "results"
+
 
 def plot_and_calculate_auc(
     tf_pos,
@@ -13,7 +20,7 @@ def plot_and_calculate_auc(
     mean=False,
     norm="none",
     model_type="SimpleCNN",
-    base_results_path="/sc-projects/sc-proj-cc17-P09_TFBS/results",
+    base_results_path="",
     kmers_len=24,
 ):
     """
@@ -28,12 +35,15 @@ def plot_and_calculate_auc(
         norm (str): The type of normalization used, e.g., 'normalize', 'standardize'.
         model_type (str): The type of neural network model, e.g., 'SimpleCNN'.
         base_results_path (str): The base directory for results and predictions.
+            Empty resolves to $TFBS_PROJECT_ROOT/results (or <repo>/results).
         kmers_len (int): The length of k-mers used in the model.
 
     Returns:
         list: A list of dictionaries, where each dictionary contains the AUC
               and the parameters used for a single model against a negative TF.
     """
+    base_results_path = base_results_path or str(_default_results_path())
+
     run_results = []
     n = len(tfs_neg)
 
@@ -166,7 +176,7 @@ def plot_and_calculate_auc(
 
 if __name__ == "__main__":
     # --- Configuration ---
-    BASE_RESULTS_PATH = "/sc-projects/sc-proj-cc17-P09_TFBS/results"
+    BASE_RESULTS_PATH = str(_default_results_path())
     TF_POS = "NKX2-1"
     TFS_NEG = ["GATA1", "MYOD1", "NKX2-5", "RXRA"]
 

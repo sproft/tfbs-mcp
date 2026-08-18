@@ -58,7 +58,7 @@ trainer:
       log_rank_zero_only: false
   - class_path: pytorch_lightning.callbacks.ModelCheckpoint
     init_args:
-      dirpath: /sc-projects/sc-proj-cc17-P09_TFBS/saved_models_tuned/combined_mean/standardize
+      dirpath: /path/to/tfbs-project/saved_models_tuned/combined_mean/standardize
       filename: best_RNN
       monitor: val_loss
       verbose: false
@@ -105,7 +105,7 @@ trainer:
   reload_dataloaders_every_n_epochs: 0
   default_root_dir: null
 data:
-  data_path: /sc-projects/sc-proj-cc17-P09_TFBS/data/tensors/combined_mean
+  data_path: /path/to/tfbs-project/data/tensors/combined_mean
   batch_size: 64
   num_workers: 24
   preprocess: false

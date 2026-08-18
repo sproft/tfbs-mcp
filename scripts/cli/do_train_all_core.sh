@@ -10,6 +10,26 @@
 #SBATCH --error=outs/train_core.e%j     # File name for standard error output
 #SBATCH --array=0-9
 
+# Data, checkpoints and results live under $TFBS_PROJECT_ROOT. Default to the
+# repo root (two levels up from this script) so a fresh clone runs unedited.
+# Data, checkpoints and results live under $TFBS_PROJECT_ROOT.  Derive it if
+# unset: the script's own location works for a direct run, but under sbatch
+# Slurm executes a COPY in its spool dir, so fall back to the submit directory.
+# Each candidate must actually look like the repo, otherwise we would silently
+# train against a wrong (but existing) path such as /var/spool.
+if [ -z "${TFBS_PROJECT_ROOT}" ]; then
+  for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"                "$(cd "${SLURM_SUBMIT_DIR:-$PWD}/../.." 2>/dev/null && pwd)"                "${SLURM_SUBMIT_DIR:-$PWD}"; do
+    if [ -n "${_cand}" ] && [ -d "${_cand}/tfbs" ] && [ -d "${_cand}/scripts" ]; then
+      TFBS_PROJECT_ROOT="${_cand}"
+      break
+    fi
+  done
+fi
+if [ -z "${TFBS_PROJECT_ROOT}" ]; then
+  echo "ERROR: could not locate the tfbs-mcp checkout. Set TFBS_PROJECT_ROOT." >&2
+  exit 1
+fi
+
 models=(SimpleCNN MLP BPNet my_cnn RNN EquiNet VCNN VCNNBpnet CNN BPNetReal)
 model=${models[$SLURM_ARRAY_TASK_ID]}
 
@@ -23,12 +43,12 @@ do
     python train_cli.py fit \
     --model $model \
     --model.input_length 24 \
-    --data.data_path /sc-projects/sc-proj-cc17-P09_TFBS/data/tensors/${data} \
+    --data.data_path ${TFBS_PROJECT_ROOT}/data/tensors/${data} \
     --data.batch_size 64 \
     --data.scaling_method ${norm} \
     --trainer yamls/trainers/default.yaml \
     --trainer.logger.init_args.project P09_${data}_${norm} \
-    --trainer.callbacks.init_args.dirpath /sc-projects/sc-proj-cc17-P09_TFBS/saved_models/${data}/${norm} \
+    --trainer.callbacks.init_args.dirpath ${TFBS_PROJECT_ROOT}/saved_models/${data}/${norm} \
     --trainer.callbacks.init_args.filename best_${model}
   done
 done

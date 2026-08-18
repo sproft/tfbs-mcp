@@ -76,13 +76,13 @@ class AnalysisConfig:
         parser.add_argument('--n-shuffles', type=int, default=20, 
                             help="Number of random shuffles for DeepLiftShap baselines (default: 20).")
         parser.add_argument('--peaks-file', type=str, 
-                            default="/sc-projects/sc-proj-cc17-P09_TFBS/data/chipSeq/High_Quality/Oth.ALL.50.NKX2-1.AllCell.bed", 
+                            default=os.environ.get("TFBS_PEAKS_BED", ""), 
                             help="Path to the ChIP-Seq peaks BED file for sequence extraction.")
         parser.add_argument('--jaspar-motif-file', type=str, 
-                            default="/sc-projects/sc-proj-cc17-P09_TFBS/data/JASPAR/JASPAR2024_CORE_non-redundant_pfms_meme_with_NKX2.1.txt", 
+                            default=os.environ.get("TFBS_MOTIF_FILE", ""), 
                             help="Path to the JASPAR core motifs MEME file.")
         parser.add_argument('--genome-fasta', type=str, 
-                            default="/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa", 
+                            default=os.environ.get("TFBS_GENOME_FASTA", ""), 
                             help="Path to the reference genome FASTA file.")
         parser.add_argument('--test', action='store_true', 
                             help="If set, runs a quick test with fewer sequences for faster execution.")
@@ -98,18 +98,30 @@ class AnalysisConfig:
         return parser
 
     def _validate_paths(self):
-        """Checks for hardcoded paths and warns the user."""
-        hardcoded_paths = [
-            '--peaks-file', '--jaspar-motif-file', 
-            '--genome-fasta'
-        ]
-        
-        for arg_name in hardcoded_paths:
-            arg_val = getattr(self.args, arg_name.lstrip('--').replace('-', '_'))
-            if arg_val.startswith('/sc-projects/'):
+        """Warns about data paths that are unset or point somewhere unusable."""
+        data_paths = {
+            '--peaks-file': 'TFBS_PEAKS_BED',
+            '--jaspar-motif-file': 'TFBS_MOTIF_FILE',
+            '--genome-fasta': 'TFBS_GENOME_FASTA',
+        }
+
+        for arg_name, env_var in data_paths.items():
+            arg_val = getattr(self.args, arg_name.lstrip('--').replace('-', '_')) or ''
+            if not arg_val:
                 warnings.warn(
-                    f"The path for {arg_name} is hardcoded to a cluster environment: {arg_val}. "
-                    "Please verify this path is correct for your local setup.",
+                    f"No path given for {arg_name}. Pass it explicitly or set "
+                    f"the {env_var} environment variable.",
+                    UserWarning
+                )
+            elif arg_val.startswith('/sc-projects/'):
+                warnings.warn(
+                    f"The path for {arg_name} points at an HPC cluster share: {arg_val}. "
+                    "Verify it is correct for your setup.",
+                    UserWarning
+                )
+            elif not os.path.exists(arg_val):
+                warnings.warn(
+                    f"The path for {arg_name} does not exist: {arg_val}",
                     UserWarning
                 )
         

@@ -19,7 +19,7 @@ Usage example:
     python scripts/disease_variant_validation.py \\
         --peaks-bed data/chipSeq/Markus/INTERSECTIONS/NKX2-1.allintersect.bed \\
         --clinvar-vcf data/clinvar/clinvar.vcf.gz \\
-        --genome /sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa \\
+        --genome /path/to/hg38.fa \\
         --output-dir results/disease_validation \\
         --models all_mean=saved_models_final/all_mean/standardize/best_VCNNBpnet.ckpt \\
                  flank_mean=saved_models_final/flank_mean/standardize/best_VCNNBpnet.ckpt \\
@@ -305,7 +305,6 @@ def score_with_fimo(df: pd.DataFrame, genome, motif_file: str, window_factor: in
 
 def score_with_foldx(df: pd.DataFrame, genome, foldx_pdb: str, n_workers: int = 16) -> pd.DataFrame:
     """Add FoldX ΔΔG column. Uses the DNA length encoded in the PDB."""
-    sys.path.insert(0, "/sc-projects/sc-proj-cc17-P09_TFBS")
     from tfbs.mcp.foldx_tools import (
         _parse_dna_from_pdb, _build_foldx_mutation_string,
         _run_foldx_energy,

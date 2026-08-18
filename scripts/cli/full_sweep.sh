@@ -10,6 +10,26 @@
 #SBATCH --error=outs/sweep.e%j      # File name for standard error output
 #SBATCH --array=0-8
 
+# Data, checkpoints and results live under $TFBS_PROJECT_ROOT. Default to the
+# repo root (two levels up from this script) so a fresh clone runs unedited.
+# Data, checkpoints and results live under $TFBS_PROJECT_ROOT.  Derive it if
+# unset: the script's own location works for a direct run, but under sbatch
+# Slurm executes a COPY in its spool dir, so fall back to the submit directory.
+# Each candidate must actually look like the repo, otherwise we would silently
+# train against a wrong (but existing) path such as /var/spool.
+if [ -z "${TFBS_PROJECT_ROOT}" ]; then
+  for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"                "$(cd "${SLURM_SUBMIT_DIR:-$PWD}/../.." 2>/dev/null && pwd)"                "${SLURM_SUBMIT_DIR:-$PWD}"; do
+    if [ -n "${_cand}" ] && [ -d "${_cand}/tfbs" ] && [ -d "${_cand}/scripts" ]; then
+      TFBS_PROJECT_ROOT="${_cand}"
+      break
+    fi
+  done
+fi
+if [ -z "${TFBS_PROJECT_ROOT}" ]; then
+  echo "ERROR: could not locate the tfbs-mcp checkout. Set TFBS_PROJECT_ROOT." >&2
+  exit 1
+fi
+
 # --- CONFIGURATION ---
 
 # Model and Dataset Definitions
@@ -24,7 +44,7 @@ WANDB_SWEEP_ID_FULL=""
 SWEEP_CONFIG="wandb_sweep_config.yaml"
 
 # Define the base checkpoint directory
-CHECKPOINT_DIR="/sc-projects/sc-proj-cc17-P09_TFBS/saved_models_tuned"
+CHECKPOINT_DIR="${TFBS_PROJECT_ROOT}/saved_models_tuned"
 
 # --- CALCULATE TASK PARAMETERS ---
 
@@ -41,7 +61,7 @@ MODEL=${models[$MODEL_INDEX]}
 DATA_NAME=${data_names[$DATASET_INDEX]}
 
 # Construct the full data path and project name
-DATA_PATH="/sc-projects/sc-proj-cc17-P09_TFBS/data/tensors/${DATA_NAME}"
+DATA_PATH="${TFBS_PROJECT_ROOT}/data/tensors/${DATA_NAME}"
 WANDB_PROJECT="P09_TFBS_Sweep_${DATA_NAME}"
 
 # Define the dataset-specific file path for the sweep ID

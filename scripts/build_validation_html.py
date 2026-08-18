@@ -15,11 +15,15 @@ results/validation_summary.html.
 
 import base64
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path("/sc-projects/sc-proj-cc17-P09_TFBS")
+# Project root holding data/, results/ and saved_models/. Override with
+# TFBS_PROJECT_ROOT; defaults to the repo root this script lives in.
+ROOT = Path(os.environ.get("TFBS_PROJECT_ROOT")
+            or Path(__file__).resolve().parent.parent)
 RESULTS = ROOT / "results"
 OUT = RESULTS / "validation_summary.html"
 

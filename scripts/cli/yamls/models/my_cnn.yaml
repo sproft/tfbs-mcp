@@ -1,0 +1,16 @@
+# Example model config for my_cnn.
+# Small two-layer CNN used in early experiments.
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/my_cnn.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/my_cnn.yaml
+#
+# Values are the class defaults - tune them for your data.
+class_path: tfbs.nn.models.my_cnn
+init_args:
+  input_length: 24
+  input_channels: 4
+  conv_channels: [16, 32]
+  kernel_size: 3
+  dense_size: 128

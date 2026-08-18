@@ -9,18 +9,29 @@ import torchmetrics
 # Ensure you have the 'equirc' package installed if you plan to use it.
 # pip install equirc
 try:
-    from equirc.pytorch_rclayers import (RegToIrrepConv, IrrepToIrrepConv, 
-                                         IrrepActivationLayer, IrrepConcatLayer, 
+    from equirc.pytorch_rclayers import (RegToIrrepConv, IrrepToIrrepConv,
+                                         IrrepActivationLayer, IrrepConcatLayer,
                                          IrrepBatchNorm, ToKmerLayer)
-except ImportError:
-    print("Warning: 'equirc' package not found. The EquiNet model will not be available.")
-    # Define placeholder classes if the import fails so the rest of the script doesn't break
-    class ToKmerLayer(nn.Module): pass
-    class RegToIrrepConv(nn.Module): pass
-    class IrrepBatchNorm(nn.Module): pass
-    class IrrepActivationLayer(nn.Module): pass
-    class IrrepToIrrepConv(nn.Module): pass
-    class IrrepConcatLayer(nn.Module): pass
+    _EQUIRC_IMPORT_ERROR = None
+except ImportError as exc:
+    # Deliberately no print() here.  This module is imported by the MCP server,
+    # whose stdio transport carries JSON-RPC on stdout -- anything written there
+    # corrupts the protocol stream.  The stand-ins below raise instead, so the
+    # failure surfaces when EquiNet is actually constructed, with a message that
+    # says what to install.
+    _EQUIRC_IMPORT_ERROR = exc
+
+    class _MissingEquirc(nn.Module):
+        """Placeholder for an equirc layer; fails loudly rather than silently."""
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "EquiNet requires the optional 'equirc' package. "
+                "Install it with: pip install equirc"
+            ) from _EQUIRC_IMPORT_ERROR
+
+    RegToIrrepConv = IrrepToIrrepConv = IrrepActivationLayer = _MissingEquirc
+    IrrepConcatLayer = IrrepBatchNorm = ToKmerLayer = _MissingEquirc
 
 
 class BaseModel(pl.LightningModule):
@@ -162,7 +173,7 @@ class FlexibleMLP(BaseModel):
 
     def forward(self, x):
         """Forward pass through the model."""
-        x = x.view(x.size(0), -1)  # Flatten the input
+        x = x.reshape(x.size(0), -1)  # Flatten the input
         x = self.model(x)
         
         if self.classify:
@@ -206,7 +217,7 @@ class FlexibleCNN(BaseModel):
             x = F.relu(conv(x))
         
         x = self.pool(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
         
         if self.classify:
@@ -229,7 +240,7 @@ class VCNN(BaseModel):
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
         if self.classify:
             return torch.sigmoid(self.fc2(x))
@@ -272,7 +283,7 @@ class VCNNBpnet(BaseModel):
             x = F.relu(conv(x))
         
         x = self.pool(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
 
         for dense in self.dense_layers:
             x = F.relu(dense(x))
@@ -310,7 +321,7 @@ class MultiCNN(BaseModel):
         # Process sequence data
         x = F.relu(self.conv1(x_seq))
         x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
 
         # Process numerical data
         for i, layer in enumerate(self.dense_num_layers):
@@ -384,7 +395,7 @@ class CNN(BaseModel):
         for conv_block in self.convs:
             x = conv_block(x)
         x = self.pool(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
         x = self.dropout_fc(x)
         
@@ -410,7 +421,7 @@ class SimpleCNN(BaseModel):
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
         if self.classify:
             return torch.sigmoid(self.fc2(x))
@@ -464,7 +475,9 @@ class EquiNet(BaseModel):
         self.bn_layers = nn.ModuleList()
         self.activation_layers = nn.ModuleList()
         
-        seq_len = self.input_length - (first_kernel_size - 1)
+        # ToKmerLayer consumes (kmers - 1) positions before the first conv,
+        # so the dense layer is mis-sized for kmers > 1 without this term.
+        seq_len = self.input_length - (self.kmers - 1) - (first_kernel_size - 1)
         for i in range(1, len(filters)):
             prev_a, prev_b = filters[i - 1]
             next_a, next_b = filters[i]
@@ -474,6 +487,17 @@ class EquiNet(BaseModel):
             self.bn_layers.append(IrrepBatchNorm(a=next_a, b=next_b, placeholder=placeholder_bn))
             self.activation_layers.append(IrrepActivationLayer(a=next_a, b=next_b))
             seq_len -= (kernel_sizes[i] - 1)
+
+        # equirc's IrrepBatchNorm registers running_sigma_{a,b} as ZEROS, and its
+        # eval branch divides by them -- so a freshly built EquiNet returns NaN in
+        # eval() before it has ever seen a training batch.  torch's own BatchNorm
+        # initialises running_var to ones; do the same here.  Loading a trained
+        # checkpoint overwrites these buffers, so this only affects fresh models.
+        for _bn in [self.first_bn, *self.bn_layers]:
+            for _buf_name in ("running_sigma_a", "running_sigma_b"):
+                _buf = getattr(_bn, _buf_name, None)
+                if _buf is not None and not _buf.any():
+                    _buf.fill_(1.0)
 
         self.concat = IrrepConcatLayer(a=self.last_a, b=self.last_b)
         self.pool = nn.MaxPool1d(kernel_size=pool_size, stride=pool_length)
@@ -537,7 +561,7 @@ class MLP(BaseModel):
         self.layers.append(nn.Linear(in_dim, output_dim))
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         for layer in self.layers:
             x = layer(x)
         
@@ -584,7 +608,7 @@ class BPNet(BaseModel):
             x = F.relu(conv(x))
         
         x = self.pool(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
 
         for dense in self.dense_layers:
             x = F.relu(dense(x))
@@ -621,6 +645,10 @@ class BPNetReal(BaseModel):
         
         n_count_control = 1 if n_control_tracks > 0 else 0
         self.linear = nn.Linear(n_filters + n_count_control, 1, bias=count_output_bias)
+        # Every other architecture squashes to (0, 1) when classify=True; without
+        # this BPNetReal returns raw counts and BaseModel's binary_cross_entropy
+        # rejects them ("all elements of input should be between 0 and 1").
+        self.final_activation = nn.Sigmoid()
 
     def forward(self, x, control=None):
         x = self.irelu(self.iconv(x))
@@ -637,6 +665,8 @@ class BPNetReal(BaseModel):
             x_pooled = torch.cat([x_pooled, control_sum], dim=1)
 
         counts = self.linear(x_pooled)
+        if self.classify:
+            counts = self.final_activation(counts)
         return counts
 
 

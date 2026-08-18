@@ -1,0 +1,23 @@
+# Example model config for CNN.
+# Configurable multi-layer CNN with per-layer padding/dilation.
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/CNN.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/CNN.yaml
+#
+# Values are the class defaults - tune them for your data.
+class_path: tfbs.nn.models.CNN
+init_args:
+  input_length: 24
+  input_channels: 4
+  num_channels: [32, 64]
+  paddings: [1, 1]
+  dilations: [1, 1]
+  kernel_sizes: [3, 3]
+  max_pool: true
+  max_pool_size: 2
+  max_pool_stride: 2
+  dense_size: 128
+  dropout_conv: 0.25
+  dropout_fc: 0.5
