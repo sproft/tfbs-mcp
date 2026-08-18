@@ -593,7 +593,7 @@ async def tfbs_analyze(
     """Run attribution analysis to identify important sequence positions.
 
     Uses Captum to compute per-base importance scores for a loaded model.
-    Requires the viz extras: pip install 'tfbs-nn[viz]'
+    Requires the viz extras: pip install 'tfbs-mcp[viz]'
 
     Args:
         model_id: Identifier of a model loaded via tfbs_load_model.
@@ -613,7 +613,7 @@ async def tfbs_analyze(
     except ImportError:
         return json.dumps({
             "error": "captum and tangermeme required. "
-                     "Install with: pip install 'tfbs-nn[viz]'"
+                     "Install with: pip install 'tfbs-mcp[viz]'"
         })
 
     _ensure_imports()
@@ -723,7 +723,7 @@ async def tfbs_mutagenesis(
     and records the change in model prediction.  This reveals which
     positions and substitutions most affect the score.
 
-    Requires tangermeme: pip install 'tfbs-nn[viz]'
+    Requires tangermeme: pip install 'tfbs-mcp[viz]'
 
     Args:
         model_id: Identifier of a model loaded via tfbs_load_model.
@@ -739,11 +739,15 @@ async def tfbs_mutagenesis(
         or with raw_outputs=true: "original_scores" and "mutant_scores".
     """
     try:
-        from tangermeme.ism import saturation_mutagenesis
+        # tangermeme >= 1.0 moved this out of tangermeme.ism.
+        from tangermeme.saturation_mutagenesis import saturation_mutagenesis
     except ImportError:
-        return json.dumps({
-            "error": "tangermeme required. Install with: pip install 'tfbs-nn[viz]'"
-        })
+        try:
+            from tangermeme.ism import saturation_mutagenesis
+        except ImportError:
+            return json.dumps({
+                "error": "tangermeme required. Install with: pip install 'tfbs-mcp[viz]'"
+            })
 
     _ensure_imports()
     _validate_dna(sequences)
@@ -811,7 +815,7 @@ async def tfbs_marginalize(
     set n_background to generate random one-hot backgrounds of the
     model's input length.
 
-    Requires tangermeme: pip install 'tfbs-nn[viz]'
+    Requires tangermeme: pip install 'tfbs-mcp[viz]'
 
     Args:
         model_id: Identifier of a model loaded via tfbs_load_model.
@@ -830,7 +834,7 @@ async def tfbs_marginalize(
         from tangermeme.utils import one_hot_encode, random_one_hot
     except ImportError:
         return json.dumps({
-            "error": "tangermeme required. Install with: pip install 'tfbs-nn[viz]'"
+            "error": "tangermeme required. Install with: pip install 'tfbs-mcp[viz]'"
         })
 
     _ensure_imports()
@@ -2008,7 +2012,7 @@ async def tfbs_extract_loci(
     Supports standard BED (3+ columns) and ChIP-Atlas aggregated BED
     format (9 columns with MACS2 score in column 5).
 
-    Requires pyfaidx: pip install 'tfbs-nn[genomics]'
+    Requires pyfaidx: pip install 'tfbs-mcp[genomics]'
 
     Args:
         bed_path: Path to a BED file (tab-separated, at least 3 columns).
@@ -2464,7 +2468,7 @@ async def tfbs_seqlets(
     recursive seqlet discovery.  Optionally annotates seqlets against
     a JASPAR/MEME motif database.
 
-    Requires captum and tangermeme: pip install 'tfbs-nn[viz]'
+    Requires captum and tangermeme: pip install 'tfbs-mcp[viz]'
 
     Args:
         model_id: Identifier of a loaded model.
@@ -2484,7 +2488,7 @@ async def tfbs_seqlets(
         from tangermeme.deep_lift_shap import deep_lift_shap as tangermeme_dls
     except ImportError:
         return json.dumps({
-            "error": "tangermeme required. Install with: pip install 'tfbs-nn[viz]'"
+            "error": "tangermeme required. Install with: pip install 'tfbs-mcp[viz]'"
         })
 
     _ensure_imports()

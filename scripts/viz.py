@@ -34,7 +34,11 @@ try:
     from tangermeme.deep_lift_shap import deep_lift_shap as tangermeme_deep_lift_shap 
     from tangermeme.deep_lift_shap import _captum_deep_lift_shap, hypothetical_attributions
     from tangermeme.variant_effect import substitution_effect, deletion_effect, insertion_effect
-    from tangermeme.ism import saturation_mutagenesis
+    try:
+        # tangermeme >= 1.0 moved this out of tangermeme.ism.
+        from tangermeme.saturation_mutagenesis import saturation_mutagenesis
+    except ImportError:
+        from tangermeme.ism import saturation_mutagenesis
     import seaborn
     seaborn.set_style('whitegrid')
 except ImportError as e:
