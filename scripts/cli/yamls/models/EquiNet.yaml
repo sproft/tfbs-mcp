@@ -1,0 +1,23 @@
+# Example model config for EquiNet.
+# Reverse-complement equivariant network - learns a representation that is
+# consistent for a sequence and its reverse complement.
+#
+# REQUIRES the optional equirc package:
+#   pip install equirc
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/EquiNet.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/EquiNet.yaml
+#
+# Values are the class defaults - tune them for your data.
+class_path: tfbs.nn.models.EquiNet
+init_args:
+  input_length: 24
+  filters: [[8, 8], [8, 8], [8, 8]]
+  kernel_sizes: [3, 3, 3]
+  pool_size: 2
+  pool_length: 2
+  out_size: 1
+  placeholder_bn: false
+  kmers: 1

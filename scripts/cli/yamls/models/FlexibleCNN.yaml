@@ -1,0 +1,16 @@
+# Example model config for FlexibleCNN.
+# CNN with per-layer channel and kernel lists.
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/FlexibleCNN.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/FlexibleCNN.yaml
+#
+# Values are the class defaults - tune them for your data.
+class_path: tfbs.nn.models.FlexibleCNN
+init_args:
+  input_length: 24
+  input_channels: 4
+  num_channels: [32, 64]
+  kernel_sizes: [3, 3]
+  dense_size: 128

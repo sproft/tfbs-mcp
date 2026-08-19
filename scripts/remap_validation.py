@@ -23,6 +23,7 @@ Outputs:
 """
 
 import argparse
+import os
 import sys
 import tempfile
 import subprocess
@@ -35,7 +36,8 @@ import pyfaidx
 import torch
 from sklearn.metrics import auc, roc_curve
 
-sys.path.insert(0, "/sc-projects/sc-proj-cc17-P09_TFBS/scripts")
+# Import the sibling script from whichever checkout this file lives in.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from chipseq_benchmark_with_foldx import (
     NUC_TO_IDX,
     score_nn,
@@ -270,12 +272,13 @@ def main():
     parser.add_argument("--score-min", type=int, default=4)
     parser.add_argument("--max-positives", type=int, default=500)
     parser.add_argument("--genome",
-                        default="/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa")
+                        default=os.environ.get("TFBS_GENOME_FASTA", ""))
     parser.add_argument("--motif-file",
-                        default="/sc-projects/sc-proj-cc17-P09_TFBS/data/JASPAR/MA1994.1.meme")
+                        default=os.environ.get("TFBS_MOTIF_FILE", ""))
     parser.add_argument("--foldx-pdb",
-                        default="/sc-projects/sc-proj-cc17-P09_TFBS/data/structures/repaired/NKX2-1_complex_CAB_Repair.pdb")
-    parser.add_argument("--foldx-bin", default="/home/profts/.local/bin/foldx")
+                        default=os.environ.get("TFBS_FOLDX_PDB", ""))
+    parser.add_argument("--foldx-bin",
+                        default=os.environ.get("TFBS_FOLDX_BIN", "foldx"))
     parser.add_argument("--datasets", nargs="+",
                         default=["all_mean", "core_mean", "flank_mean"])
     parser.add_argument("--models-dir", default="saved_models_final")

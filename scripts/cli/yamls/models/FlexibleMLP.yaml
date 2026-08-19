@@ -1,0 +1,18 @@
+# Example model config for FlexibleMLP.
+# MLP with a configurable hidden-layer stack.
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/FlexibleMLP.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/FlexibleMLP.yaml
+#
+# NOTE: FlexibleMLP is for TABULAR input of shape (batch, input_length) -- it
+# sizes its first layer from input_length directly, so it does not take
+# one-hot (batch, 4, L) sequence. Set input_length to your feature count.
+# Values are the class defaults - tune them for your data.
+class_path: tfbs.nn.models.FlexibleMLP
+init_args:
+  input_length: 24
+  hidden_dims: [64, 32]
+  output_dim: 1
+  dropout_p: 0.5

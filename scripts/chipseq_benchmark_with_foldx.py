@@ -145,7 +145,6 @@ def score_fimo(sequences: list[str], motif_file: str) -> np.ndarray:
 def score_foldx_one(args_tuple):
     """Score one sequence — picklable for multiprocessing."""
     seq, structure, foldx_bin = args_tuple
-    sys.path.insert(0, "/sc-projects/sc-proj-cc17-P09_TFBS")
     from tfbs.mcp.foldx_tools import (
         _parse_dna_from_pdb, _build_foldx_mutation_string, _run_foldx_energy,
     )
@@ -239,7 +238,6 @@ def main():
         print(f"{tf}: {len(merged):,} merged regions → {len(seqs)} sequences")
 
     # 2. Load NN models
-    sys.path.insert(0, "/sc-projects/sc-proj-cc17-P09_TFBS")
     import tfbs.nn.models as models_mod
     cls = getattr(models_mod, args.model_type)
     loaded = {}

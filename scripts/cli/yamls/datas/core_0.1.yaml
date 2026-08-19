@@ -1,4 +1,4 @@
-data_path: /sc-projects/sc-proj-cc17-P09_TFBS/data/tensors/core_0.1
+data_path: /path/to/tfbs-project/data/tensors/core_0.1
 batch_size: 8
 num_workers: 24
 preprocess: false

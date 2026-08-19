@@ -46,11 +46,15 @@ mcp = [
 foldx = [
     "pyBigWig>=0.3",
 ]
+# Reverse-complement equivariant layers backing the EquiNet architecture.
+equinet = [
+    "equirc>=1.0",
+]
 dev = [
     "pytest>=7.0",
 ]
 all = [
-    "tfbs-mcp[viz,genomics,tracking,mcp,dev,foldx]",
+    "tfbs-mcp[viz,genomics,tracking,mcp,dev,foldx,equinet]",
 ]
 
 [project.scripts]
@@ -65,6 +69,12 @@ Issues = "https://github.com/sproft/tfbs-mcp/issues"
 
 [tool.setuptools.packages.find]
 include = ["tfbs*"]
+
+# Ship non-.py package data explicitly. Without this it rides along only via
+# setuptools-scm's git file finder, so a build from a non-git export (e.g. a
+# release tarball) silently omits it.
+[tool.setuptools.package-data]
+"tfbs.prediction" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,51 @@
+# EXAMPLE training config for `tfbs-train fit --config <this file>`.
+#
+# Copy it, then replace every /path/to/... placeholder with your own locations.
+# `data.data_path` must point at a directory produced by the data-pipeline
+# tools (sequences.pt, plus scores.pt for regression), and the checkpoint
+# `dirpath` at somewhere writable.
+#
+# Compose it with any of the per-model configs in yamls/models/ (the --model
+# file overrides the model block below):
+#   tfbs-train fit --config config.example.yaml --model yamls/models/VCNNBpnet.yaml
+#
+# Deliberately minimal. Run `tfbs-train fit --print_config` for the exhaustive
+# list of every available option.
+
+seed_everything: 42
+
+trainer:
+  accelerator: auto
+  devices: auto
+  max_epochs: 100
+  log_every_n_steps: 10
+  # CSVLogger has no external dependency. For Weights & Biases use
+  # pytorch_lightning.loggers.WandbLogger instead (needs the `tracking` extra).
+  logger:
+    class_path: pytorch_lightning.loggers.CSVLogger
+    init_args:
+      save_dir: /path/to/tfbs-project/logs
+      name: tfbs
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.EarlyStopping
+      init_args:
+        monitor: val_loss
+        patience: 10
+        mode: min
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: /path/to/tfbs-project/saved_models
+        filename: best
+        monitor: val_loss
+        mode: min
+        save_top_k: 1
+
+data:
+  data_path: /path/to/tfbs-project/data/tensors/core_mean
+  batch_size: 64
+  scaling_method: standardize
+
+model:
+  class_path: tfbs.nn.models.VCNNBpnet
+  init_args:
+    input_length: 24

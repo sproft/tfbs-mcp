@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -92,6 +93,75 @@ def _detect_environment() -> dict[str, Any]:
 
 
 _ENV = _detect_environment()
+
+
+# ---------------------------------------------------------------------------
+# Reference-data locations
+#
+# These paths used to be hardcoded to the developers' HPC cluster, so every
+# tool signature advertised a filesystem nobody else can reach and the first
+# call a new user made failed on someone else's disk.  A path now comes from
+# the caller or, failing that, from an environment variable set in the MCP
+# client config -- and a tool that cannot find what it needs says which
+# argument and which variable would fix it.
+# ---------------------------------------------------------------------------
+REFERENCE_DATA_ENV = {
+    "genome_fasta": "TFBS_GENOME_FASTA",
+    "motif_file": "TFBS_MOTIF_FILE",
+    "foldx_pdb": "TFBS_FOLDX_PDB",
+    "clinvar_vcf": "TFBS_CLINVAR_VCF",
+}
+
+_REFERENCE_DATA_LABEL = {
+    "genome_fasta": "reference genome FASTA",
+    "motif_file": "JASPAR/MEME motif file",
+    "foldx_pdb": "FoldX TF-DNA complex PDB",
+    "clinvar_vcf": "ClinVar VCF",
+}
+
+
+def _project_root() -> Path:
+    """Directory holding scripts/, data/ and saved_models/.
+
+    Several tools shell out to helper scripts under ``scripts/``, which pip does
+    not install.  That resolves correctly for an editable install (the package
+    sits inside the checkout); otherwise TFBS_PROJECT_ROOT points at a clone.
+    The shell scripts under scripts/cli/ read the same variable.
+    """
+    env = os.environ.get("TFBS_PROJECT_ROOT", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _resolve_reference(value: str | None, arg: str) -> tuple[Path | None, str | None]:
+    """Resolve a reference-data path from an argument or the environment.
+
+    Returns ``(path, None)`` when the file exists, otherwise
+    ``(None, error_json)`` -- a ready-to-return JSON string naming both the
+    argument and the environment variable that would satisfy it, so callers
+    can write::
+
+        genome, err = _resolve_reference(genome_fasta, "genome_fasta")
+        if err:
+            return err
+    """
+    env_var = REFERENCE_DATA_ENV[arg]
+    what = _REFERENCE_DATA_LABEL[arg]
+    raw = (value or "").strip() or os.environ.get(env_var, "").strip()
+    if not raw:
+        return None, json.dumps({
+            "error": f"No {what} configured.",
+            "fix": f"Pass {arg}=/path/to/file, or set {env_var} in the 'env' "
+                   f"block of your MCP client config.",
+        })
+    path = Path(raw).expanduser().resolve()
+    if not path.exists():
+        return None, json.dumps({
+            "error": f"{what} not found: {path}",
+            "fix": f"Check the {arg} argument or the {env_var} environment variable.",
+        })
+    return path, None
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +259,12 @@ def _sequences_to_tensor(sequences: list[str]):
         dtype=_torch.long,
     )
     ohe = _F.one_hot(indices, num_classes=4).float()  # (N, L, 4)
-    return ohe.permute(0, 2, 1)  # (N, 4, L)
+    # .contiguous() matters: permute() returns a non-contiguous view, and the
+    # models that flatten their input with .view() (MLP, FlexibleMLP) raise
+    # "view size is not compatible with input tensor's size and stride" on one.
+    # Batches from the DataLoader are contiguous via collation, so this path
+    # was the only one that hit it.
+    return ohe.permute(0, 2, 1).contiguous()  # (N, 4, L)
 
 
 def _tensor_to_sequences(tensor) -> list[str]:
@@ -518,7 +593,7 @@ async def tfbs_analyze(
     """Run attribution analysis to identify important sequence positions.
 
     Uses Captum to compute per-base importance scores for a loaded model.
-    Requires the viz extras: pip install 'tfbs-nn[viz]'
+    Requires the viz extras: pip install 'tfbs-mcp[viz]'
 
     Args:
         model_id: Identifier of a model loaded via tfbs_load_model.
@@ -538,7 +613,7 @@ async def tfbs_analyze(
     except ImportError:
         return json.dumps({
             "error": "captum and tangermeme required. "
-                     "Install with: pip install 'tfbs-nn[viz]'"
+                     "Install with: pip install 'tfbs-mcp[viz]'"
         })
 
     _ensure_imports()
@@ -648,7 +723,7 @@ async def tfbs_mutagenesis(
     and records the change in model prediction.  This reveals which
     positions and substitutions most affect the score.
 
-    Requires tangermeme: pip install 'tfbs-nn[viz]'
+    Requires tangermeme: pip install 'tfbs-mcp[viz]'
 
     Args:
         model_id: Identifier of a model loaded via tfbs_load_model.
@@ -664,11 +739,15 @@ async def tfbs_mutagenesis(
         or with raw_outputs=true: "original_scores" and "mutant_scores".
     """
     try:
-        from tangermeme.ism import saturation_mutagenesis
+        # tangermeme >= 1.0 moved this out of tangermeme.ism.
+        from tangermeme.saturation_mutagenesis import saturation_mutagenesis
     except ImportError:
-        return json.dumps({
-            "error": "tangermeme required. Install with: pip install 'tfbs-nn[viz]'"
-        })
+        try:
+            from tangermeme.ism import saturation_mutagenesis
+        except ImportError:
+            return json.dumps({
+                "error": "tangermeme required. Install with: pip install 'tfbs-mcp[viz]'"
+            })
 
     _ensure_imports()
     _validate_dna(sequences)
@@ -736,7 +815,7 @@ async def tfbs_marginalize(
     set n_background to generate random one-hot backgrounds of the
     model's input length.
 
-    Requires tangermeme: pip install 'tfbs-nn[viz]'
+    Requires tangermeme: pip install 'tfbs-mcp[viz]'
 
     Args:
         model_id: Identifier of a model loaded via tfbs_load_model.
@@ -755,7 +834,7 @@ async def tfbs_marginalize(
         from tangermeme.utils import one_hot_encode, random_one_hot
     except ImportError:
         return json.dumps({
-            "error": "tangermeme required. Install with: pip install 'tfbs-nn[viz]'"
+            "error": "tangermeme required. Install with: pip install 'tfbs-mcp[viz]'"
         })
 
     _ensure_imports()
@@ -893,7 +972,7 @@ async def tfbs_classify_metrics(
 )
 async def tfbs_fimo(
     sequences: list[str],
-    motif_file: str,
+    motif_file: str = "",
     threshold: float = 1e-4,
     output_dir: str | None = None,
 ) -> str:
@@ -915,9 +994,9 @@ async def tfbs_fimo(
     """
     import pandas as pd
 
-    motif_path = Path(motif_file).resolve()
-    if not motif_path.exists():
-        return json.dumps({"error": f"Motif file not found: {motif_file}"})
+    motif_path, err = _resolve_reference(motif_file, "motif_file")
+    if err:
+        return err
     # Basic path validation — motif_file is passed to subprocess
     if not motif_path.is_file():
         return json.dumps({"error": f"Not a regular file: {motif_file}"})
@@ -1434,7 +1513,7 @@ async def tfbs_train(
     else:
         gres_line = "#SBATCH --gres=gpu:1"
 
-    train_cmd = f"python /sc-projects/sc-proj-cc17-P09_TFBS/scripts/cli/train_cli.py fit --config {config_p}"
+    train_cmd = f"{sys.executable} -m tfbs.cli.train_cli fit --config {config_p}"
     if extra_args:
         train_cmd += " " + " ".join(extra_args)
 
@@ -1560,7 +1639,7 @@ async def tfbs_sweep(
 #SBATCH --error=sweep_{sweep_id}_%j.err
 #SBATCH --ntasks=1
 
-python scripts/cli/run_sweep.py \\
+{sys.executable} scripts/cli/run_sweep.py \\
     --model {model} \\
     --data-path {data_path} \\
     --data-name {data_name} \\
@@ -1629,7 +1708,7 @@ async def tfbs_validate(
         JSON with job_id, the generated sbatch script, and the
         validation command.
     """
-    project_root = Path(__file__).resolve().parent.parent.parent
+    project_root = _project_root()
     validate_script = project_root / "scripts" / "validate.py"
 
     if not validate_script.exists():
@@ -1650,7 +1729,7 @@ async def tfbs_validate(
     name = job_name or "tfbs_validate"
 
     validate_cmd = (
-        f"python {validate_script}"
+        f"{sys.executable} {validate_script}"
         f" --checkpoint_path {ckpt}"
         f" --model_name {model_name}"
         f" --data_path {data}"
@@ -1781,7 +1860,7 @@ async def tfbs_config(
     if not data.exists():
         return json.dumps({"error": f"Data path not found: {data_path}"})
 
-    project_root = Path(__file__).resolve().parent.parent.parent
+    project_root = _project_root()
     params = model_params or {}
 
     # --- Model section ---
@@ -1918,7 +1997,7 @@ async def tfbs_config(
 async def tfbs_extract_loci(
     bed_path: str,
     output_dir: str,
-    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    genome_fasta: str = "",
     in_window: int = 200,
     max_sequences: int | None = None,
     score_column: int | None = 4,
@@ -1933,13 +2012,14 @@ async def tfbs_extract_loci(
     Supports standard BED (3+ columns) and ChIP-Atlas aggregated BED
     format (9 columns with MACS2 score in column 5).
 
-    Requires pyfaidx: pip install 'tfbs-nn[genomics]'
+    Requires pyfaidx: pip install 'tfbs-mcp[genomics]'
 
     Args:
         bed_path: Path to a BED file (tab-separated, at least 3 columns).
         output_dir: Directory to save sequences.pt (and scores.pt if scores
                     are extracted).
-        genome_fasta: Path to reference genome FASTA file.
+        genome_fasta: Path to reference genome FASTA file. Falls back
+                      to $TFBS_GENOME_FASTA.
         in_window: Window size in bp centered on peak midpoints (default 200).
         max_sequences: If set, randomly sample this many peaks before
                        extraction (useful for large ChIP-Atlas files).
@@ -1957,9 +2037,9 @@ async def tfbs_extract_loci(
     if not bed.exists():
         return json.dumps({"error": f"BED file not found: {bed_path}"})
 
-    genome_path = Path(genome_fasta).resolve()
-    if not genome_path.exists():
-        return json.dumps({"error": f"Genome FASTA not found: {genome_fasta}"})
+    genome_path, err = _resolve_reference(genome_fasta, "genome_fasta")
+    if err:
+        return err
 
     # Read BED file
     bed_df = _pd.read_csv(bed, sep="\t", header=None, comment="#")
@@ -2388,7 +2468,7 @@ async def tfbs_seqlets(
     recursive seqlet discovery.  Optionally annotates seqlets against
     a JASPAR/MEME motif database.
 
-    Requires captum and tangermeme: pip install 'tfbs-nn[viz]'
+    Requires captum and tangermeme: pip install 'tfbs-mcp[viz]'
 
     Args:
         model_id: Identifier of a loaded model.
@@ -2408,7 +2488,7 @@ async def tfbs_seqlets(
         from tangermeme.deep_lift_shap import deep_lift_shap as tangermeme_dls
     except ImportError:
         return json.dumps({
-            "error": "tangermeme required. Install with: pip install 'tfbs-nn[viz]'"
+            "error": "tangermeme required. Install with: pip install 'tfbs-mcp[viz]'"
         })
 
     _ensure_imports()
@@ -2732,7 +2812,7 @@ async def tfbs_chipseq_benchmark(
     cutoffs: list[int] | None = None,
     model_type: str = "VCNNBpnet",
     models_dir: str = "saved_models_final",
-    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    genome_fasta: str = "",
     max_sequences: int = 15000,
     slurm: bool = False,
     partition: str = "gpu",
@@ -2755,7 +2835,8 @@ async def tfbs_chipseq_benchmark(
         cutoffs: Experiment-count cutoffs for classification (default 1,3,5,8).
         model_type: Architecture class name (default VCNNBpnet).
         models_dir: Base checkpoint directory.
-        genome_fasta: Reference genome FASTA path.
+        genome_fasta: Reference genome FASTA path. Falls back to
+            $TFBS_GENOME_FASTA.
         max_sequences: Max sequences per TF for speed.
         slurm: Submit as SLURM job instead of running directly.
         partition: SLURM partition.
@@ -2775,7 +2856,11 @@ async def tfbs_chipseq_benchmark(
     if not intersect_path.is_dir():
         return json.dumps({"error": f"Intersect directory not found: {intersect_dir}"})
 
-    project_root = Path(__file__).resolve().parent.parent.parent
+    genome_path, err = _resolve_reference(genome_fasta, "genome_fasta")
+    if err:
+        return err
+
+    project_root = _project_root()
     script = project_root / "scripts" / "chipseq_benchmark.py"
     if not script.exists():
         return json.dumps({"error": f"Benchmark script not found: {script}"})
@@ -2784,7 +2869,7 @@ async def tfbs_chipseq_benchmark(
     out.mkdir(parents=True, exist_ok=True)
 
     cmd = (
-        f"python {script}"
+        f"{sys.executable} {script}"
         f" --intersect-dir {intersect_path}"
         f" --output-dir {out}"
         f" --pos-tf {pos_tf}"
@@ -2793,7 +2878,7 @@ async def tfbs_chipseq_benchmark(
         f" --cutoffs {' '.join(str(c) for c in cutoffs)}"
         f" --model-type {model_type}"
         f" --models-dir {models_dir}"
-        f" --genome {genome_fasta}"
+        f" --genome {genome_path}"
         f" --max-sequences {max_sequences}"
     )
 
@@ -2863,14 +2948,14 @@ async def tfbs_chipseq_benchmark(
 async def tfbs_chipseq_method_comparison(
     intersect_dir: str,
     output_dir: str,
-    motif_file: str,
-    foldx_pdb: str,
+    motif_file: str = "",
+    foldx_pdb: str = "",
     pos_tf: str = "NKX2-1",
     neg_tfs: list[str] | None = None,
     datasets: list[str] | None = None,
     model_type: str = "VCNNBpnet",
     models_dir: str = "saved_models_final",
-    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    genome_fasta: str = "",
     n_per_tf: int = 500,
     foldx_workers: int = 32,
     slurm: bool = True,
@@ -2892,8 +2977,9 @@ async def tfbs_chipseq_method_comparison(
         intersect_dir: Directory with *.allintersect.bed files.
         output_dir: Where to save plots, raw scores, and AUC tables.
         motif_file: JASPAR/MEME motif file for FIMO (e.g. MA1994.1.meme
-            for NKX2-1).
-        foldx_pdb: Repaired TF-DNA complex PDB. The DNA length in the
+            for NKX2-1). Falls back to $TFBS_MOTIF_FILE.
+        foldx_pdb: Repaired TF-DNA complex PDB, or $TFBS_FOLDX_PDB. The
+            DNA length in the
             PDB defines the FoldX scoring window (must be <= the
             sequence window, typically 11 bp for NKX2-1).
         pos_tf: Positive transcription factor name.
@@ -2901,7 +2987,8 @@ async def tfbs_chipseq_method_comparison(
         datasets: NN dataset names (subdirectories of models_dir).
         model_type: Model architecture class name.
         models_dir: Base checkpoint directory.
-        genome_fasta: Reference genome FASTA.
+        genome_fasta: Reference genome FASTA. Falls back to
+            $TFBS_GENOME_FASTA.
         n_per_tf: Sequences sampled per TF (FoldX bottleneck).
         foldx_workers: Parallel CPU workers for FoldX.
         slurm: Submit as SLURM job (recommended).
@@ -2916,7 +3003,17 @@ async def tfbs_chipseq_method_comparison(
     if datasets is None:
         datasets = ["all_mean", "core_mean", "flank_mean"]
 
-    project_root = Path(__file__).resolve().parent.parent.parent
+    genome_path, err = _resolve_reference(genome_fasta, "genome_fasta")
+    if err:
+        return err
+    motif_path, err = _resolve_reference(motif_file, "motif_file")
+    if err:
+        return err
+    foldx_path, err = _resolve_reference(foldx_pdb, "foldx_pdb")
+    if err:
+        return err
+
+    project_root = _project_root()
     script = project_root / "scripts" / "chipseq_benchmark_with_foldx.py"
     if not script.exists():
         return json.dumps({"error": f"Script not found: {script}"})
@@ -2925,13 +3022,13 @@ async def tfbs_chipseq_method_comparison(
     out.mkdir(parents=True, exist_ok=True)
 
     cmd_parts = [
-        "/home/profts/.conda/envs/mamba/envs/sams/bin/python",
+        sys.executable,
         str(script),
         "--intersect-dir", str(Path(intersect_dir).resolve()),
         "--output-dir", str(out),
-        "--genome", str(Path(genome_fasta).resolve()),
-        "--motif-file", str(Path(motif_file).resolve()),
-        "--foldx-pdb", str(Path(foldx_pdb).resolve()),
+        "--genome", str(genome_path),
+        "--motif-file", str(motif_path),
+        "--foldx-pdb", str(foldx_path),
         "--pos-tf", pos_tf,
         "--neg-tfs", *neg_tfs,
         "--datasets", *datasets,
@@ -3002,15 +3099,15 @@ async def tfbs_chipseq_method_comparison(
 async def tfbs_remap_validation(
     remap_bed: str,
     output_dir: str,
-    motif_file: str = "/sc-projects/sc-proj-cc17-P09_TFBS/data/JASPAR/MA1994.1.meme",
-    foldx_pdb: str = "/sc-projects/sc-proj-cc17-P09_TFBS/data/structures/repaired/NKX2-1_complex_CAB_Repair.pdb",
+    motif_file: str = "",
+    foldx_pdb: str = "",
     score_min: int = 4,
     max_positives: int = 500,
     negative_mode: str = "shuffle",
     datasets: list[str] | None = None,
     model_type: str = "VCNNBpnet",
     models_dir: str = "saved_models_final",
-    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    genome_fasta: str = "",
     foldx_workers: int = 32,
     foldx_window: int = 11,
     nn_window: int = 24,
@@ -3044,8 +3141,11 @@ async def tfbs_remap_validation(
             Column 5 must encode the experiment count.
         output_dir: Where the script writes summary.csv, the two scores
             CSVs, and roc_all_methods.png.
-        motif_file: JASPAR / MEME motif file for FIMO.
+        motif_file: JASPAR / MEME motif file for FIMO. Falls back to
+            $TFBS_MOTIF_FILE.
         foldx_pdb: Repaired TF-DNA complex PDB for FoldX scoring.
+            Falls back to $TFBS_FOLDX_PDB. Not required when
+            skip_foldx is true.
         score_min: Minimum experiment count in the ReMap BED.
         max_positives: Subsample the high-confidence set to this many
             peaks (FoldX is the bottleneck; default 500).
@@ -3054,7 +3154,8 @@ async def tfbs_remap_validation(
         datasets: NN dataset names (subdirectories of models_dir).
         model_type: Model architecture class name.
         models_dir: Base checkpoint directory.
-        genome_fasta: Reference genome FASTA.
+        genome_fasta: Reference genome FASTA. Falls back to
+            $TFBS_GENOME_FASTA.
         foldx_workers: Parallel CPU workers for FoldX.
         foldx_window: DNA window for FoldX (must match the PDB).
         nn_window: Tile size for the NN score.
@@ -3074,7 +3175,21 @@ async def tfbs_remap_validation(
     if datasets is None:
         datasets = ["all_mean", "core_mean", "flank_mean"]
 
-    project_root = Path(__file__).resolve().parent.parent.parent
+    genome_path, err = _resolve_reference(genome_fasta, "genome_fasta")
+    if err:
+        return err
+    motif_path, err = _resolve_reference(motif_file, "motif_file")
+    if err:
+        return err
+    # FoldX is the only leg that needs the crystal structure, so skip_foldx
+    # runs are not asked for a PDB they will never open.
+    foldx_path = None
+    if not skip_foldx:
+        foldx_path, err = _resolve_reference(foldx_pdb, "foldx_pdb")
+        if err:
+            return err
+
+    project_root = _project_root()
     script = project_root / "scripts" / "remap_validation.py"
     if not script.exists():
         return json.dumps({"error": f"Script not found: {script}"})
@@ -3083,13 +3198,12 @@ async def tfbs_remap_validation(
     out.mkdir(parents=True, exist_ok=True)
 
     cmd_parts = [
-        "/home/profts/.conda/envs/mamba/envs/sams/bin/python",
+        sys.executable,
         str(script),
         "--remap-bed", str(Path(remap_bed).resolve()),
         "--output-dir", str(out),
-        "--genome", str(Path(genome_fasta).resolve()),
-        "--motif-file", str(Path(motif_file).resolve()),
-        "--foldx-pdb", str(Path(foldx_pdb).resolve()),
+        "--genome", str(genome_path),
+        "--motif-file", str(motif_path),
         "--score-min", str(score_min),
         "--max-positives", str(max_positives),
         "--negative-mode", negative_mode,
@@ -3105,6 +3219,8 @@ async def tfbs_remap_validation(
     ]
     if skip_foldx:
         cmd_parts.append("--skip-foldx")
+    else:
+        cmd_parts.extend(["--foldx-pdb", str(foldx_path)])
     cmd = " ".join(cmd_parts)
 
     if slurm:
@@ -3192,8 +3308,8 @@ async def tfbs_remap_validation(
 async def tfbs_disease_variant_validation(
     peaks_bed: str,
     output_dir: str,
-    clinvar_vcf: str = "/sc-projects/sc-proj-cc17-P09_TFBS/data/clinvar/clinvar.vcf.gz",
-    genome_fasta: str = "/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+    clinvar_vcf: str = "",
+    genome_fasta: str = "",
     peak_confidence: int = 1,
     nn_models: dict | None = None,
     motif_file: str | None = None,
@@ -3222,8 +3338,10 @@ async def tfbs_disease_variant_validation(
             ChIP-Atlas allintersect format (4th column = experiment
             overlap count) or any BED with 3+ columns.
         output_dir: Directory to write results, plots, and summary CSV.
-        clinvar_vcf: Indexed ClinVar VCF (.vcf.gz with .tbi).
-        genome_fasta: Reference genome FASTA file.
+        clinvar_vcf: Indexed ClinVar VCF (.vcf.gz with .tbi). Falls
+            back to $TFBS_CLINVAR_VCF.
+        genome_fasta: Reference genome FASTA file. Falls back to
+            $TFBS_GENOME_FASTA.
         peak_confidence: Minimum value of the BED 4th column to keep
             (e.g. ChIP-Atlas overlap >= 3). Default 1.
         nn_models: Dict mapping model name to checkpoint path, e.g.
@@ -3243,7 +3361,14 @@ async def tfbs_disease_variant_validation(
     Returns:
         JSON with output_dir, file list, and (if slurm=true) job_id.
     """
-    project_root = Path(__file__).resolve().parent.parent.parent
+    clinvar_path, err = _resolve_reference(clinvar_vcf, "clinvar_vcf")
+    if err:
+        return err
+    genome_path, err = _resolve_reference(genome_fasta, "genome_fasta")
+    if err:
+        return err
+
+    project_root = _project_root()
     script = project_root / "scripts" / "disease_variant_validation.py"
     if not script.exists():
         return json.dumps({"error": f"Script not found: {script}"})
@@ -3252,11 +3377,11 @@ async def tfbs_disease_variant_validation(
     out.mkdir(parents=True, exist_ok=True)
 
     cmd_parts = [
-        "/home/profts/.conda/envs/mamba/envs/sams/bin/python",
+        sys.executable,
         str(script),
         "--peaks-bed", str(Path(peaks_bed).resolve()),
-        "--clinvar-vcf", str(Path(clinvar_vcf).resolve()),
-        "--genome", str(Path(genome_fasta).resolve()),
+        "--clinvar-vcf", str(clinvar_path),
+        "--genome", str(genome_path),
         "--output-dir", str(out),
         "--peak-confidence", str(peak_confidence),
         "--nn-window", str(nn_window),

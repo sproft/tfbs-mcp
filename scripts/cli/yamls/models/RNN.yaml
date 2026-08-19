@@ -1,0 +1,22 @@
+# Example model config for RNN.
+# Conv front-end into a GRU.
+#
+# Use from the scripts/cli/ directory:
+#   tfbs-train fit --config config.example.yaml --model yamls/models/RNN.yaml
+# ...or from the repo root:
+#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/RNN.yaml
+#
+# Values are the tuned settings from do_train_final.sh (all_mean, 24 bp).
+class_path: tfbs.nn.models.RNN
+init_args:
+  input_length: 24
+  input_channels: 4
+  conv_out_channels: 115
+  kernel_size: 7
+  pool_size: 3
+  dropout_conv: 0.30385810801659574
+  gru_hidden_size: 57
+  gru_num_layers: 2
+  bidirectional: true
+  dense_size: 193
+  dropout_fc: 0.42671878718015466

@@ -1,4 +1,4 @@
-program: /sc-projects/sc-proj-cc17-P09_TFBS/scripts/cli/train_cli.py
+program: scripts/cli/train_cli.py
 method: bayes
 metric:
   goal: minimize
@@ -25,15 +25,15 @@ early_terminate:
 
 command:
 - ${env}
-- /home/profts/.conda/envs/mamba/envs/sams/bin/python
+- python
 - ${program}
 - fit
 - --model=my_cnn
 - --model.input_length=24
-- --data.data_path=/sc-projects/sc-proj-cc17-P09_TFBS/data/tensors/flank_mean
+- --data.data_path=/path/to/tfbs-project/data/tensors/flank_mean
 - --data.scaling_method=standardize
-- --trainer=/sc-projects/sc-proj-cc17-P09_TFBS/scripts/cli/yamls/trainers/default.yaml
+- --trainer=scripts/cli/yamls/trainers/default.yaml
 - --trainer.logger.init_args.project=P09_flank_mean_standardize_my_cnn
-- --trainer.callbacks.init_args.dirpath=/sc-projects/sc-proj-cc17-P09_TFBS/saved_models_tuned/flank_mean/standardize
+- --trainer.callbacks.init_args.dirpath=/path/to/tfbs-project/saved_models_tuned/flank_mean/standardize
 - --trainer.callbacks.init_args.filename=best_my_cnn
 - ${args}

@@ -19,6 +19,7 @@ Output: ROC curve plots, scatter/binned regression plots, CSV summary tables.
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -251,7 +252,7 @@ def main():
     parser.add_argument("--intersect-dir", type=str, required=True,
                         help="Directory with *.allintersect.bed files")
     parser.add_argument("--genome", type=str,
-                        default="/sc-projects/sc-proj-btg/P09/data/genomes/hg38/hg38.fa",
+                        default=os.environ.get("TFBS_GENOME_FASTA", ""),
                         help="Reference genome FASTA")
     parser.add_argument("--output-dir", type=str, required=True,
                         help="Output directory for plots and CSVs")
