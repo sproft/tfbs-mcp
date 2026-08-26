@@ -26,6 +26,30 @@ you need a specific CUDA version, install torch first per
 New to MCP? See [Setting up the MCP server](#setting-up-the-mcp-server-beginner-guide)
 for a step-by-step walkthrough.
 
+### Which Python version
+
+Python **3.10 or newer**; tested on 3.14. `torch>=2.0` does not cap the Python
+version on a current OS — torch 2.11 ships wheels through CPython 3.14.
+
+The constraint that actually bites on older machines is **glibc, not Python**.
+PyTorch stopped shipping old-glibc (`manylinux1`) wheels after **2.6.0**;
+everything from 2.7.0 on is built for `manylinux_2_28` and needs glibc >= 2.28.
+On an older distribution, pip can therefore only use torch <= 2.6.0 — and those
+wheels stop at CPython 3.13.
+
+| Your system | Use |
+|---|---|
+| Current Linux (glibc >= 2.28), macOS, Windows | Python 3.10 – 3.14 |
+| CentOS 7 / RHEL 7, or any glibc < 2.28 | **Python 3.11** |
+
+Python 3.11 is the safe choice on old systems: every torch 2.x line from 2.0 to
+2.6 ships a CPython 3.11 wheel that installs there.
+
+If you see `No matching distribution found for torch`, you are on the second
+row. Check with `ldd --version`, then create the environment with Python 3.11.
+Make sure pip is current too (`pip install -U pip`) — the pip that ships with
+CentOS 7 predates the `manylinux2014` tag.
+
 ## Setting up the MCP server (beginner guide)
 
 An **MCP server** is a small program that sits on your computer and offers a set
@@ -67,6 +91,12 @@ Three things can happen:
   <https://www.python.org/downloads/>, tick **"Add python.exe to PATH"** in the
   installer, then close and reopen PowerShell and check again.
 - On macOS/Linux, try `python3 --version` and use `python3` everywhere below.
+
+> **On an older Linux server (CentOS 7 / RHEL 7), use Python 3.11.** PyTorch's
+> recent wheels need a newer system library than those distributions ship, so
+> pip falls back to older torch builds that stop at Python 3.13 — and fails
+> outright on 3.14 with `No matching distribution found for torch`. See
+> [Which Python version](#which-python-version).
 
 Now create the venv. Windows PowerShell:
 
