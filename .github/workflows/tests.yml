@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The range the README documents as supported.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # The default PyPI torch wheel on Linux pulls several GB of CUDA
+      # libraries the tests never use.
+      - name: Install CPU-only PyTorch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install tfbs-mcp with the test extras
+        run: python -m pip install ".[dev,mcp,viz,genomics]"
+
+      # Fails if the server cannot start, e.g. an incompatible mcp version.
+      - name: tfbs-mcp --check
+        run: tfbs-mcp --check
+
+      - name: pytest
+        run: python -m pytest -q
