@@ -41,7 +41,9 @@ tracking = [
     "wandb>=0.16",
 ]
 mcp = [
-    "mcp>=1.0",
+    # mcp 2 renamed FastMCP, which the server is built on. Keep in sync with
+    # MCP_REQUIREMENT in tfbs/mcp/cli.py.
+    "mcp>=1.28,<2",
 ]
 foldx = [
     "pyBigWig>=0.3",
@@ -60,7 +62,7 @@ all = [
 [project.scripts]
 tfbs-train = "tfbs.cli.train_cli:cli_main"
 tfbs-predict = "tfbs.predict:main"
-tfbs-mcp = "tfbs.mcp.server:main"
+tfbs-mcp = "tfbs.mcp.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sproft/tfbs-mcp"
