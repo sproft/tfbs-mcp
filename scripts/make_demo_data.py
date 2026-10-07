@@ -111,7 +111,10 @@ def main() -> None:
     fa_path = args.out / "demo_genome.fa"
     source = f"{args.source or args.fasta.name}:{args.record}:{args.start}-{args.end}"
     header = f">{args.name} {source}" + (f" {args.description}" if args.description else "")
-    fa_path.write_text(header + "\n" + "\n".join(textwrap.wrap(seq, 80)) + "\n")
+    # The .fai records byte offsets and the line width, so the endings must be
+    # LF on every platform or the index is wrong wherever the file is checked out.
+    with open(fa_path, "w", newline="\n") as fh:
+        fh.write(header + "\n" + "\n".join(textwrap.wrap(seq, 80)) + "\n")
     for stale in (fa_path.with_suffix(".fa.fai"), Path(str(fa_path) + ".fai")):
         if stale.exists():
             stale.unlink()
@@ -129,7 +132,8 @@ def main() -> None:
         centre = pos + len(lo) // 2
         bed_lines.append("\t".join([args.name, str(centre - half), str(centre + half),
                                     f"{motif_id}_hit_{k}", f"{s:.2f}", strand]))
-    (args.out / "demo_peaks.bed").write_text("\n".join(bed_lines) + "\n")
+    with open(args.out / "demo_peaks.bed", "w", newline="\n") as fh:
+        fh.write("\n".join(bed_lines) + "\n")
 
     shutil.copyfile(args.meme, args.out / args.meme.name)
 

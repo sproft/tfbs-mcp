@@ -372,6 +372,13 @@ def test_demo_data_is_installed_and_consistent():
     assert list(records) == ["demo_chr8"]
     length = len(records["demo_chr8"])
     assert length == 10_001
+    # The .fai stores byte offsets and the line width, so the FASTA must keep
+    # the LF endings it was indexed with on every platform.
+    raw = genome.read_bytes()
+    assert b"\r" not in raw
+    name, _, offset, linebases, linewidth = Path(str(genome) + ".fai").read_text().split()
+    assert (name, int(linebases), int(linewidth)) == ("demo_chr8", 80, 81)
+    assert raw[int(offset):int(offset) + 80].decode() == records["demo_chr8"][:80]
     assert set(records["demo_chr8"]) <= set("ACGTN")
     rows = [line.split("\t") for line in bed.read_text().splitlines() if line.strip()]
     assert len(rows) >= 3
