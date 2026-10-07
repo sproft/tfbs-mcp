@@ -158,7 +158,7 @@ Claude calls `tfbs_fetch_structure` with the PDB id `3RKQ`, downloads the struct
 
 Claude calls `tfbs_server_info` once more. The first two prompts made the server load PyTorch, so the answer now also includes the PyTorch version and whether CUDA is available.
 
-Setup is complete. The remaining tools need reference files such as a genome, which you can add at any time; see [Adding your data](#adding-your-data). The full list of tools is under [Available tools](#available-tools).
+Setup is complete. The remaining tools need reference files such as a genome, which you can add at any time; see [Adding your data](#adding-your-data), which starts with a bundled example that needs no download. The full list of tools is under [Available tools](#available-tools).
 
 ### Windows
 
@@ -210,9 +210,29 @@ In most cases, run `tfbs-mcp --check` in the activated environment first. It nam
 
 You do not need any of this to finish setup: steps 1 to 5 above are complete without it. Five tools work with nothing but the install (`tfbs_server_info`, `tfbs_list_models`, `tfbs_preprocess`, `tfbs_classify_metrics`, and `tfbs_fetch_structure`, which needs internet). Each tool group below needs one input. Get it from the link in the table, then run `tfbs-mcp --setup` once: it prints the Claude Code command and the Claude Desktop block with your paths filled in, and can run the Claude Code command for you.
 
+### Try it first with the bundled example
+
+The package ships a 10 kb slice of human chromosome 8 around the thyroglobulin promoter (thyroglobulin is the classic NKX2-1 target; the study's EMSA-seq libraries were anchored on the NKX2-1 site of its rat promoter), a BED file with four NKX2-1 motif hits in that slice, and the JASPAR `MA1994.1` motif. Register them with:
+
+```bash
+tfbs-mcp --setup --demo
+```
+
+It prints the path of the demo BED file. Then, in Claude's chat:
+
+> Extract 200 bp sequences around every peak in <the demo_peaks.bed path it printed> and save the tensors to /tmp/tfbs-demo.
+
+Claude calls `tfbs_extract_loci` on the bundled slice and reports four 200 bp sequences, one-hot encoded as a tensor of shape `[4, 4, 200]`. With the MEME Suite installed:
+
+> Scan the sequence CTCACTTGACCTT for the NKX2-1 motif with FIMO.
+
+That 13-mer is the strongest match in the slice, about 4.2 kb upstream of the thyroglobulin transcription start, so `tfbs_fimo` reports a hit. Where the files come from and how they were cut is documented in `tfbs/data/demo/README.md` in the repository. When you have your own data, run `tfbs-mcp --setup` again without `--demo`; it replaces the registration.
+
+### Your own data
+
 | What it enables | What you need | Where to get it | Variable |
 |---|---|---|---|
-| Sequence extraction and the ChIP-seq benchmarks (`tfbs_extract_loci`, `tfbs_chipseq_benchmark`, ...) | A reference genome FASTA, uncompressed (hg38 is about 3 GB uncompressed) | hg38 from UCSC: <https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz> (just under 1 GB), then `gunzip hg38.fa.gz`. Register the resulting `hg38.fa`; the server writes an index next to it on first use | `TFBS_GENOME_FASTA` |
+| Sequence extraction and the ChIP-seq benchmarks (`tfbs_extract_loci`, `tfbs_chipseq_benchmark`, ...) | A reference genome FASTA, uncompressed (hg38 is about 3 GB uncompressed) | hg38 from UCSC: <https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz> (just under 1 GB), then `gunzip hg38.fa.gz`. Register the resulting `hg38.fa`; the server writes an index next to it on first use. NCBI Datasets offers the same assembly (GRCh38.p14, <https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000001405.40/>); note that NCBI names sequences by accession (`NC_000008.11`, not `chr8`), and the chromosome names in your BED files must match the record names in whichever FASTA you register | `TFBS_GENOME_FASTA` |
 | Peaks to extract from or train on | A BED file of ChIP-seq peaks for your transcription factor | ChIP-Atlas: <https://chip-atlas.org/> | none; name the file in your prompt |
 | Motif scanning (`tfbs_fimo`) | The `fimo` program on your PATH, plus a MEME-format motif file | MEME Suite: <https://meme-suite.org/meme/doc/download.html>. Motif: JASPAR `MA1994.1` (NKX2-1) from <https://jaspar.elixir.no/api/v1/matrix/MA1994.1.meme>, licensed CC BY 4.0 (<https://creativecommons.org/licenses/by/4.0/>) | `TFBS_MOTIF_FILE` |
 | Structure-based scoring (`tfbs_binding_energy`, `tfbs_binding_scan`) | **FoldX**, a separately licensed program (free for academic use after registration; the `foldx` pip extra installs pyBigWig, not FoldX), plus a repaired TF-DNA complex PDB | FoldX from the FoldX Suite site: <https://foldxsuite.crg.eu/>. PDB: `tfbs_fetch_structure` downloads one from RCSB, for example <https://www.rcsb.org/structure/3RKQ>; `tfbs_binding_energy` can run FoldX `RepairPDB` on it with its `repair` option | `TFBS_FOLDX_PDB` |

@@ -97,6 +97,14 @@ pip install equirc
 
 Without it, constructing an `EquiNet` raises an `ImportError` naming that command. Every other architecture works without the extra.
 
+## Demo data
+
+`tfbs/data/demo/` ships a 10 kb GRCh38 slice around the thyroglobulin promoter, a BED of four NKX2-1 motif hits in it, and the JASPAR MA1994.1 motif. It is installed as package data, so `tfbs-mcp --setup --demo` works on a plain pip install. Provenance and coordinates are in `tfbs/data/demo/README.md`. To rebuild it from a FASTA that contains chromosome 8 (`NC_000008.11`), with `pyfaidx` installed:
+
+```bash
+python scripts/make_demo_data.py --fasta chr8.fa --record NC_000008.11 --start 132861953 --end 132871953 --source GCF_000001405.40 --meme MA1994.1.meme --out tfbs/data/demo
+```
+
 ## Project structure
 
 ```
@@ -106,6 +114,7 @@ tfbs/                     Python package
 ├── prediction/           Window-based scoring and analysis
 ├── predict.py            ChIP-seq peak prediction CLI
 ├── cli/train_cli.py      Lightning CLI backing the tfbs-train command
+├── data/demo/            Bundled demo genome slice, peaks and motif (package data)
 └── mcp/                  MCP server
     ├── cli.py            tfbs-mcp command: version guard, --check and --setup
     ├── server.py         FastMCP server, 30 of 33 tools
@@ -113,6 +122,7 @@ tfbs/                     Python package
 
 scripts/                  Repo-only analysis scripts (not installed by pip)
 ├── cli/                  Training configs and SLURM job templates
+├── make_demo_data.py     Rebuilds tfbs/data/demo/ from a GRCh38 FASTA
 ├── chipseq_benchmark*.py ChIP-seq classification benchmarks
 ├── disease_variant_validation.py
 ├── remap_validation.py   ReMap external validation

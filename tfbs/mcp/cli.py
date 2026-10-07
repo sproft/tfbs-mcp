@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
+import importlib.resources
 import json
 import shutil
 import subprocess
@@ -42,7 +43,9 @@ usage: tfbs-mcp [--check | --setup [options]]
                   PATH it offers to register the server with Claude Code.
                   Options: --genome PATH, --motif PATH, --clinvar PATH,
                   --foldx-pdb PATH and --project-root PATH prefill a variable;
-                  --non-interactive asks nothing and uses only the flags.
+                  --non-interactive asks nothing and uses only the flags;
+                  --demo uses the bundled 10 kb genome slice and NKX2-1 motif,
+                  so the data tools can be tried without downloading anything.
 """
 
 
@@ -87,6 +90,21 @@ def find_executable() -> str | None:
 def find_claude() -> str | None:
     """Path of the claude CLI on PATH, or None when it is not installed."""
     return shutil.which("claude")
+
+
+DEMO_FILES = {"TFBS_GENOME_FASTA": "demo_genome.fa", "TFBS_MOTIF_FILE": "MA1994.1.meme"}
+DEMO_BED = "demo_peaks.bed"
+
+
+def demo_dir() -> Path:
+    """Directory of the bundled demo data (a 10 kb GRCh38 slice around the TG promoter)."""
+    return Path(str(importlib.resources.files("tfbs.data") / "demo"))
+
+
+def demo_paths() -> dict[str, str]:
+    """The demo genome and motif as --setup prefill values."""
+    folder = demo_dir()
+    return {env: str(folder / name) for env, name in DEMO_FILES.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +361,10 @@ def parse_setup_args(args: list[str]) -> argparse.Namespace:
     parser.add_argument("--non-interactive", action="store_true",
                         help="never prompt: use only the flags above and only print "
                              "the commands")
+    parser.add_argument("--demo", action="store_true",
+                        help="prefill --genome and --motif with the bundled demo data: a "
+                             "10 kb GRCh38 slice around the thyroglobulin promoter and "
+                             "the JASPAR MA1994.1 (NKX2-1) motif")
     return parser.parse_args(args)
 
 
@@ -419,7 +441,15 @@ def main() -> None:
         options = parse_setup_args(args[1:])
         prefilled = {v.env: getattr(options, v.dest) for v in SETUP_VARIABLES
                      if getattr(options, v.dest) is not None}
-        sys.exit(setup(prefilled, interactive=not options.non_interactive))
+        if options.demo:
+            # Explicit flags win over the demo files.
+            prefilled = {**demo_paths(), **prefilled}
+        code = setup(prefilled, interactive=not options.non_interactive)
+        if options.demo and code == 0:
+            print(f"Demo peaks for tfbs_extract_loci: {demo_dir() / DEMO_BED}")
+            print("Name that file in your prompt, for example: extract 200 bp sequences "
+                  "around every peak in it.")
+        sys.exit(code)
     if args:
         sys.exit(f"tfbs-mcp: unknown argument {args[0]!r}\n\n{USAGE}")
 

@@ -343,5 +343,56 @@ def test_setup_help_lists_every_flag(capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
     for flag in ("--genome", "--motif", "--clinvar", "--foldx-pdb", "--project-root",
-                 "--non-interactive"):
+                 "--non-interactive", "--demo"):
         assert flag in out
+
+
+# ---------------------------------------------------------------------------
+# --setup --demo: the bundled demo data
+# ---------------------------------------------------------------------------
+
+def _read_fasta(path: Path) -> dict[str, str]:
+    records, name = {}, None
+    for line in path.read_text().splitlines():
+        if line.startswith(">"):
+            name = line[1:].split()[0]
+            records[name] = ""
+        elif name:
+            records[name] += line.strip()
+    return records
+
+
+def test_demo_data_is_installed_and_consistent():
+    paths = cli.demo_paths()
+    genome, motif = Path(paths["TFBS_GENOME_FASTA"]), Path(paths["TFBS_MOTIF_FILE"])
+    bed = cli.demo_dir() / cli.DEMO_BED
+    for f in (genome, motif, bed, Path(str(genome) + ".fai")):
+        assert f.is_file(), f
+    records = _read_fasta(genome)
+    assert list(records) == ["demo_chr8"]
+    length = len(records["demo_chr8"])
+    assert length == 10_001
+    assert set(records["demo_chr8"]) <= set("ACGTN")
+    rows = [line.split("\t") for line in bed.read_text().splitlines() if line.strip()]
+    assert len(rows) >= 3
+    for chrom, start, end, *_ in rows:
+        # tfbs_extract_loci needs the chrom to be a record and the window inside it
+        assert chrom == "demo_chr8"
+        assert 0 <= int(start) and int(end) < length
+        assert int(end) - int(start) == 200
+    text = motif.read_text()
+    assert text.startswith("MEME version")
+    assert "MOTIF MA1994.1" in text
+
+
+def test_setup_demo_prefills_genome_and_motif_and_names_the_bed(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "find_executable", lambda: "/opt/env/bin/tfbs-mcp")
+    monkeypatch.setattr("builtins.input", _no_prompt)
+    monkeypatch.setattr(sys, "argv", ["tfbs-mcp", "--setup", "--demo", "--non-interactive"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    for env, path in cli.demo_paths().items():
+        assert f"{env}={Path(path).resolve()}" in out
+    assert cli.DEMO_BED in out
