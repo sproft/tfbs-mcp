@@ -4,7 +4,7 @@ The [README](../README.md) covers Claude Code and Claude Desktop. This page is f
 
 ## Before you start
 
-**Use the full path.** Your AI app is not started from your terminal, so it does not know about your environment, and the bare command `tfbs-mcp` will not be found. Every config below needs the absolute path that `tfbs-mcp --check` prints on its `executable:` line. The examples use `C:\Users\you\...` as a placeholder.
+**Use the full path.** Your AI app is not started from your terminal, so it does not know about your environment, and the bare command `tfbs-mcp` will not be found. Every config below needs the absolute path that `tfbs-mcp --check` prints on its `executable:` line. The examples use `/home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp` as a placeholder. On Windows, use the `.exe` path that `--check` prints, with every backslash doubled inside JSON.
 
 **How the app talks to the server.** The app starts `tfbs-mcp` itself and talks to it through the program's input and output (MCP calls this the *stdio* transport). The server does not open a network port. Apps that can only connect to a URL need a bridge, described under [ChatGPT and the Responses API](#chatgpt-and-the-responses-api).
 
@@ -12,7 +12,7 @@ The [README](../README.md) covers Claude Code and Claude Desktop. This page is f
 
 - On Windows, write every backslash in a path twice: `C:\\Users\\you\\...`. Forward slashes also work: `C:/Users/you/...`.
 - A JSON file has exactly one outer `{ }`. If the file already has a servers section, add the `"tfbs"` entry inside it, with a comma after the previous entry, instead of pasting a second block.
-- Many of these files live in folders whose names start with a dot, which Windows Explorer will not create. Create them from the terminal, e.g. `mkdir $HOME\.gemini`.
+- Many of these files live in folders whose names start with a dot, which some file managers refuse to create. Create them from the terminal, e.g. `mkdir -p ~/.gemini`.
 
 ## Code editors
 
@@ -31,7 +31,7 @@ VS Code uses `servers`, not `mcpServers`. A Cursor snippet pasted into VS Code d
   "servers": {
     "tfbs": {
       "type": "stdio",
-      "command": "C:\\Users\\you\\tfbs-env\\Scripts\\tfbs-mcp.exe",
+      "command": "/home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp",
       "args": []
     }
   }
@@ -44,7 +44,7 @@ Cursor, Windsurf and Cline use the same shape as Claude Desktop:
 {
   "mcpServers": {
     "tfbs": {
-      "command": "C:\\Users\\you\\tfbs-env\\Scripts\\tfbs-mcp.exe",
+      "command": "/home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp",
       "args": []
     }
   }
@@ -56,7 +56,7 @@ Zed nests the same entry under `context_servers`. **Continue** uses `~/.continue
 ```yaml
 mcpServers:
   - name: tfbs
-    command: C:\Users\you\tfbs-env\Scripts\tfbs-mcp.exe
+    command: /home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp
     args: []
 ```
 
@@ -73,7 +73,7 @@ mcpServers:
 
 ```toml
 [mcp_servers.tfbs]
-command = "C:\\Users\\you\\tfbs-env\\Scripts\\tfbs-mcp.exe"
+command = "/home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp"
 args = []
 ```
 
@@ -86,7 +86,7 @@ import asyncio
 from agents import Agent, Runner
 from agents.mcp import MCPServerStdio
 
-TFBS = r"C:\Users\you\tfbs-env\Scripts\tfbs-mcp.exe"
+TFBS = r"/home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp"
 
 async def main():
     async with MCPServerStdio(
@@ -107,7 +107,7 @@ asyncio.run(main())
 These cannot start a program on your computer: OpenAI's servers make the call, so the server has to be reachable over HTTPS. A bridge turns it into a web service:
 
 ```bash
-npx -y supergateway --stdio "C:/Users/you/tfbs-env/Scripts/tfbs-mcp.exe" --outputTransport streamableHttp --port 8000
+npx -y supergateway --stdio "/home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp" --outputTransport streamableHttp --port 8000
 ```
 
 That serves `http://localhost:8000/mcp`. ChatGPT can only reach it once it is exposed publicly (e.g. `cloudflared tunnel --url http://127.0.0.1:8000`) and the resulting HTTPS URL is added in ChatGPT's connector settings. Be careful with this: it puts a tool that reads files on your computer behind a public URL.
@@ -132,7 +132,7 @@ ollmcp --servers-json tfbs-servers.json --model qwen3:8b
 Open WebUI needs the server turned into an OpenAPI service first:
 
 ```bash
-uvx mcpo --port 8000 --api-key "choose-a-secret" -- "C:/Users/you/tfbs-env/Scripts/tfbs-mcp.exe"
+uvx mcpo --port 8000 --api-key "choose-a-secret" -- "/home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp"
 ```
 
 Then add `http://localhost:8000` as a Tool in Open WebUI.

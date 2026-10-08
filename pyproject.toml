@@ -77,6 +77,7 @@ include = ["tfbs*"]
 # release tarball) silently omits it.
 [tool.setuptools.package-data]
 "tfbs.prediction" = ["*.yaml"]
+"tfbs.data" = ["demo/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
