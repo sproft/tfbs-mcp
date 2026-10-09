@@ -71,7 +71,6 @@ def test_every_architecture_builds_and_runs_on_a_51_bp_window(tmp_path, name):
     "name", [pytest.param(n, marks=_marks(n)) for n in TEMPLATE_NAMES]
 )
 def test_lightningcli_parses_every_generated_config(tmp_path, monkeypatch, name):
-    pytest.importorskip("jsonargparse")
     monkeypatch.setattr(sys, "argv", ["tfbs-train"])
     from pytorch_lightning.cli import LightningCLI
 
@@ -96,7 +95,6 @@ def test_lightningcli_parses_every_generated_config(tmp_path, monkeypatch, name)
 
 
 def test_application_note_example_trains_through_lightningcli(tmp_path, monkeypatch):
-    pytest.importorskip("jsonargparse")
     monkeypatch.setattr(sys, "argv", ["tfbs-train"])
     from pytorch_lightning.cli import LightningCLI
 

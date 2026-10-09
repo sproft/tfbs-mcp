@@ -36,7 +36,7 @@ python -c "import tfbs.configs as c; print(c.config_dir())"
 
 Copy `config.example.yaml` from there and replace the `/path/to/...` placeholders with your own data and checkpoint locations. The `tfbs_config` MCP tool generates a fresh config from the same model templates if you would rather start from scratch; it errors unless the `data_path` you give it already exists.
 
-The MCP tools resolve data, checkpoints and results against `TFBS_PROJECT_ROOT`, the directory holding `data/`, `saved_models/` and `results/`; the benchmark and validation pipelines run with it as their working directory. It defaults to the repository root in a clone and to the server's working directory otherwise. The SLURM helpers under `scripts/cli/` read it too. Set it if your data lives elsewhere:
+The MCP tools resolve data, checkpoints and results against `TFBS_PROJECT_ROOT`, the directory holding `data/`, `saved_models/` and `results/`; the benchmark and validation pipelines run with it as their working directory. A config from `tfbs_config` trains to `saved_models/<dataset>/<scaling_method>/best_<model_type>.ckpt` (the tool reports it as `checkpoint_path`), and the benchmark tools look there; the pipelines take `--scaling-method` or explicit `--checkpoints NAME=PATH`. It defaults to the repository root in a clone and to the server's working directory otherwise. The SLURM helpers under `scripts/cli/` read it too. Set it if your data lives elsewhere:
 
 ```bash
 export TFBS_PROJECT_ROOT=/mnt/lab/tfbs
@@ -50,7 +50,7 @@ The six tools that run a longer job (`tfbs_validate`, `tfbs_sweep`, `tfbs_chipse
 python -m tfbs.pipelines.remap_validation --help
 ```
 
-The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working.
+The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working, including `main(args)` with an `argparse.Namespace` for `validate` and `run_sweep`.
 
 ## Prediction
 
@@ -77,7 +77,7 @@ The install command in the README already includes everything the server needs. 
 | Extra | Installs | Needed for |
 |---|---|---|
 | `mcp` | the MCP protocol library | the server itself |
-| `genomics` | pyfaidx, tangermeme, pysam (not on Windows) | reading a genome FASTA (`tfbs_extract_loci`, the benchmark and validation tools); pysam reads the ClinVar VCF in `tfbs_disease_variant_validation` |
+| `genomics` | pyfaidx, tangermeme, pysam (Linux and macOS; Windows has no pysam wheel) | reading a genome FASTA (`tfbs_extract_loci`, the benchmark and validation tools); pysam reads the ClinVar VCF in `tfbs_disease_variant_validation`, which therefore needs Linux, macOS or WSL |
 | `viz` | captum, tangermeme, logomaker, seaborn | attribution, mutagenesis, seqlets |
 | `tracking` | wandb | `tfbs_sweep`, and Weights & Biases logging during training |
 | `foldx` | pyBigWig | the bigWig track of `tfbs_binding_scan`; not FoldX itself, see [Adding your data](../README.md#adding-your-data) in the README |
@@ -103,7 +103,7 @@ Each has a ready-to-use config in `tfbs/configs/models/`, installed with the pac
 tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/VCNNBpnet.yaml
 ```
 
-`VCNNBpnet.yaml` and `RNN.yaml` carry the tuned settings from `do_train_final.sh`; the rest use class defaults. All thirteen instantiate at a 24 bp window, and eleven accept one-hot `(batch, 4, L)` input directly. `FlexibleMLP` expects tabular features and `MultiCNN` also needs a covariate tensor, as noted in those files.
+`VCNNBpnet.yaml` and `RNN.yaml` carry the tuned settings from `do_train_final.sh`; the rest use class defaults. All thirteen instantiate at a 24 bp window and take one-hot `(batch, 4, L)` input. `FlexibleMLP` flattens that input and sizes its first layer from `input_length`, so its template sets `input_length: 96` (4 x 24) and `tfbs_config` sets it to 4 x the window. `MultiCNN` also needs a covariate tensor, as noted in its file.
 
 `EquiNet` additionally needs the `equirc` package, which is on PyPI. Install it directly, or add the `equinet` extra to the install command from the README:
 

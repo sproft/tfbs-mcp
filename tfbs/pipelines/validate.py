@@ -1,4 +1,6 @@
-"""Evaluate a checkpoint on the held-out test split and append test_loss to a CSV.
+"""Evaluate a checkpoint on the held-out test split and append its metrics to a CSV.
+
+The row holds test_loss and, for a classifier, test_acc and test_auc.
 
 Run as ``python -m tfbs.pipelines.validate --help``; the tfbs_validate MCP tool
 submits this module as a SLURM job.
@@ -26,37 +28,54 @@ def get_model_class(model_name: str):
         sys.exit(1)
 
 
-def save_results(args, loss_value):
-    """Saves the prediction results and metadata to a CSV file."""
-    
-    # Define the output data row
-    result_data = {
+BASE_FIELDS = ['modeltype', 'scaling_method', 'dataset_path']
+
+
+def save_results(args, metrics):
+    """Append one row (the run's settings plus every test metric) to the CSV.
+
+    ``metrics`` is the dict trainer.test() returns, e.g. test_loss and, for a
+    classifier, test_acc and test_auc; a bare number is taken as test_loss.
+    A file whose header lacks a new metric column is rewritten with the
+    wider header, so earlier rows keep their values.
+    """
+    if not isinstance(metrics, dict):
+        metrics = {'test_loss': metrics}
+    row = {
         'modeltype': args.model_name,
         'scaling_method': args.scaling_method,
-        'dataset_path': os.path.basename(args.data_path),
-        'test_loss': loss_value
+        'dataset_path': os.path.basename(os.path.normpath(args.data_path)),
+        **{k: float(v) for k, v in metrics.items()},
     }
+    metric_fields = ['test_loss'] + sorted(k for k in metrics if k != 'test_loss')
 
-    fieldnames = ['modeltype', 'scaling_method', 'dataset_path', 'test_loss']
-    
-    # Check if the file exists to determine if we need to write the header
-    file_exists = os.path.exists(args.output_file)
-    
+    existing_rows, existing_fields = [], []
+    if os.path.exists(args.output_file):
+        with open(args.output_file, newline='') as f:
+            reader = csv.DictReader(f)
+            existing_fields = list(reader.fieldnames or [])
+            existing_rows = list(reader)
+    fieldnames = list(existing_fields or BASE_FIELDS)
+    for name in BASE_FIELDS + metric_fields:
+        if name not in fieldnames:
+            fieldnames.append(name)
+
     try:
-        with open(args.output_file, 'a', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
-            # Write the header only if the file did not exist before
-            if not file_exists:
+        if existing_fields and fieldnames != existing_fields:
+            with open(args.output_file, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, restval='')
                 writer.writeheader()
-                
-            # Write the data row
-            writer.writerow(result_data)
-            
-        print(f"\nSuccessfully wrote results to: {args.output_file}")
-        
-    except Exception as e:
-        print(f"Error writing to output file {args.output_file}: {e}")
+                writer.writerows(existing_rows)
+                writer.writerow(row)
+        else:
+            with open(args.output_file, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, restval='')
+                if not existing_fields:
+                    writer.writeheader()
+                writer.writerow(row)
+        print(f"Successfully wrote results to: {args.output_file}")
+    except OSError as e:
+        print(f"Error writing to output file {args.output_file}: {e}", file=sys.stderr)
 
 
 def run(args):
@@ -126,14 +145,13 @@ def run(args):
     print(results)
     print("--------------------")
 
-    # 5. Extract and Save Results
-    test_loss_key = 'test_loss'
-    test_loss = results[0].get(test_loss_key)
-
-    if test_loss is not None:
-        save_results(args, test_loss)
+    # 5. Save every metric trainer.test() reports: test_loss, and for a
+    # classifier also test_acc and test_auc.
+    metrics = dict(results[0]) if results else {}
+    if 'test_loss' in metrics:
+        save_results(args, metrics)
     else:
-        print(f"Warning: Could not find '{test_loss_key}' in test results to save.")
+        print(f"Warning: no 'test_loss' in the test results {metrics}; nothing saved.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,7 +182,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None):
-    run(build_parser().parse_args(argv))
+    """Run from a list of command-line arguments, or from parsed arguments.
+
+    ``main(args)`` with an argparse.Namespace is the signature of the
+    former scripts/validate.py and still works.
+    """
+    if isinstance(argv, argparse.Namespace):
+        return run(argv)
+    return run(build_parser().parse_args(argv))
 
 
 if __name__ == '__main__':

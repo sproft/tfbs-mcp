@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -31,6 +32,9 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import auc, roc_curve
 
 import tfbs.nn.models as models
+from tfbs.pipelines.checkpoints import (
+    DEFAULT_SCALING, describe_problems, parse_named_paths, resolve_checkpoints,
+)
 
 
 NUC_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
@@ -269,6 +273,13 @@ def main(argv=None):
     parser.add_argument("--datasets", type=str, nargs="+",
                         default=["all_mean", "core_mean", "flank_mean"],
                         help="Dataset names (subdirectories of models-dir)")
+    parser.add_argument("--scaling-method", type=str, default=DEFAULT_SCALING,
+                        help="Scaling subdirectory of each dataset's checkpoint: "
+                             "<models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt; "
+                             "when that file is missing, a single "
+                             "<dataset>/*/best_<model-type>.ckpt is used")
+    parser.add_argument("--checkpoints", type=str, nargs="+", metavar="NAME=PATH",
+                        help="Explicit checkpoints; replace --models-dir and --datasets")
     parser.add_argument("--cutoffs", type=int, nargs="+", default=[1, 3, 5, 8],
                         help="Experiment-count cutoffs for classification")
     parser.add_argument("--max-sequences", type=int, default=15000,
@@ -282,14 +293,19 @@ def main(argv=None):
     intersect_dir = Path(args.intersect_dir)
 
     # Load models
+    ckpts, problems = resolve_checkpoints(
+        args.models_dir, args.datasets, args.model_type, args.scaling_method,
+        parse_named_paths(args.checkpoints),
+    )
+    if problems:
+        print(f"Warning: {describe_problems(problems)}", file=sys.stderr)
+    if not ckpts:
+        sys.exit("No checkpoint found for any dataset; nothing to benchmark.")
     loaded_models = {}
-    for dataset in args.datasets:
-        ckpt = Path(args.models_dir) / dataset / "standardize" / f"best_{args.model_type}.ckpt"
-        if not ckpt.exists():
-            print(f"Warning: checkpoint not found: {ckpt}")
-            continue
-        print(f"Loading {dataset}...")
+    for dataset, ckpt in ckpts.items():
+        print(f"Loading {dataset} from {ckpt}...")
         loaded_models[dataset] = load_model(str(ckpt), args.model_type, args.device)
+    window = next(iter(loaded_models.values())).input_length
 
     # Read and merge positive TF intersection file
     pos_file = intersect_dir / f"{args.pos_tf}.allintersect.bed"
@@ -301,7 +317,7 @@ def main(argv=None):
 
     # Extract positive sequences with nums
     pos_seqs, pos_nums = extract_sequences(
-        pos_merged, args.genome, window=loaded_models[args.datasets[0]].input_length,
+        pos_merged, args.genome, window=window,
         max_sequences=args.max_sequences,
     )
     print(f"  Extracted {len(pos_seqs):,} sequences")
@@ -334,7 +350,7 @@ def main(argv=None):
                              names=["chrom", "start", "end", "num"], header=0)
         neg_merged = merge_intervals(neg_df)
         neg_seqs, _ = extract_sequences(
-            neg_merged, args.genome, window=loaded_models[args.datasets[0]].input_length,
+            neg_merged, args.genome, window=window,
             max_sequences=args.max_sequences,
         )
         print(f"  {neg_tf}: {len(neg_seqs):,} sequences")
@@ -361,7 +377,7 @@ def main(argv=None):
                              names=["chrom", "start", "end", "num"], header=0)
         neg_merged = merge_intervals(neg_df)
         neg_seqs, _ = extract_sequences(
-            neg_merged, args.genome, window=loaded_models[args.datasets[0]].input_length,
+            neg_merged, args.genome, window=window,
             max_sequences=args.max_sequences,
         )
         for name, model in loaded_models.items():

@@ -18,6 +18,7 @@ stdout carries the MCP protocol.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -770,25 +771,56 @@ def _write_bigwig(bw_path: Path, chrom: str, chrom_length: int,
     return len(entries)
 
 
+# Parameters that decide which windows a chunk holds and how they are
+# scored; a chunk written under different values must not be merged.
+_SCAN_KEYS = ("structure", "genome_fasta", "chrom", "start", "step", "window",
+              "num_windows", "windows_per_task")
+_DIGEST_PREFIX = "# params_digest="
+
+
+def _params_digest(params: dict) -> str:
+    blob = json.dumps({k: params.get(k) for k in _SCAN_KEYS}, sort_keys=True)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _chunk_digest(path: Path) -> str | None:
+    """The params digest on a chunk CSV's first line, or None."""
+    try:
+        with open(path) as fh:
+            first = fh.readline().strip()
+    except OSError:
+        return None
+    return first[len(_DIGEST_PREFIX):] if first.startswith(_DIGEST_PREFIX) else None
+
+
+def _chunk_rows(path: Path):
+    """The data rows of a chunk CSV, without its digest line."""
+    with open(path, newline="") as fh:
+        yield from csv.DictReader(line for line in fh if not line.startswith("#"))
+
+
 def _count_csv_rows(path: Path) -> int:
-    with open(path) as fh:
-        return max(0, sum(1 for _ in fh) - 1)
+    return sum(1 for _ in _chunk_rows(path))
 
 
 def _scan_chunk_job(params_path: str) -> None:
     """Score one SLURM array task's windows into ``chunk_<task>.csv``.
 
     Entry point of the worker script that tfbs_binding_scan(slurm=True)
-    writes.  A chunk whose CSV already holds all its rows is skipped, so a
-    resubmitted array redoes only unfinished chunks.
+    writes.  Each chunk CSV starts with the digest of the scan parameters.
+    A chunk whose CSV holds all its rows under the current digest is
+    skipped, so a resubmitted array redoes only unfinished chunks, and a
+    chunk from a scan with another region, window or step is rewritten.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = json.loads(Path(params_path).read_text())
+    digest = _params_digest(p)
     task_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
     w_from = task_id * p["windows_per_task"]
     w_to = min(w_from + p["windows_per_task"], p["num_windows"])
     csv_path = Path(p["chunks_dir"]) / f"chunk_{task_id:05d}.csv"
-    if csv_path.exists() and _count_csv_rows(csv_path) >= w_to - w_from:
+    if (csv_path.exists() and _chunk_digest(csv_path) == digest
+            and _count_csv_rows(csv_path) >= w_to - w_from):
         logger.info("Chunk %d already complete; skipping.", task_id)
         return
     logger.info("Task %d: windows %d-%d of %d", task_id, w_from, w_to - 1, p["num_windows"])
@@ -800,6 +832,7 @@ def _scan_chunk_job(params_path: str) -> None:
     scorer = _WindowScorer(p["foldx_bin"], p["structure"], template, genome, p["chrom"], p["window"])
     try:
         with open(csv_path, "w", newline="") as fh:
+            fh.write(f"{_DIGEST_PREFIX}{digest}\n")
             writer = csv.writer(fh)
             writer.writerow(["position", "energy"])
             for done, i in enumerate(range(w_from, w_to), start=1):
@@ -814,18 +847,26 @@ def _scan_chunk_job(params_path: str) -> None:
 
 
 def _merge_chunks_job(params_path: str) -> None:
-    """Merge the chunk CSVs into the bigWig; entry point of the merge job."""
+    """Merge the chunk CSVs into the bigWig; entry point of the merge job.
+
+    Only chunks carrying the digest of the current scan parameters are
+    merged; a leftover chunk of an earlier scan in the same output_dir is
+    skipped with a warning.
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = json.loads(Path(params_path).read_text())
+    digest = _params_digest(p)
     scores: list[tuple[int, float]] = []
     for chunk in sorted(Path(p["chunks_dir"]).glob("chunk_*.csv")):
-        with open(chunk, newline="") as fh:
-            for row in csv.DictReader(fh):
-                try:
-                    energy = float(row["energy"])
-                except (TypeError, ValueError):
-                    energy = math.nan
-                scores.append((int(row["position"]), energy))
+        if _chunk_digest(chunk) != digest:
+            logger.warning("Skipping %s: written by a scan with other parameters.", chunk)
+            continue
+        for row in _chunk_rows(chunk):
+            try:
+                energy = float(row["energy"])
+            except (TypeError, ValueError):
+                energy = math.nan
+            scores.append((int(row["position"]), energy))
     n = _write_bigwig(Path(p["bigwig_path"]), p["chrom"], p["chrom_length"],
                       scores, p["window"], p["step"])
     logger.info("BigWig written to %s (%d of %d windows scored)", p["bigwig_path"], n, len(scores))
@@ -845,14 +886,15 @@ def _write_slurm_scan_scripts(out: Path, params_path: Path, n_tasks: int,
             "import sys\n"
             f"sys.path.insert(0, {root!r})\n"
             f"from tfbs.mcp.foldx_tools import {entry}\n"
-            f"{entry}({str(params_path.resolve())!r})\n"
+            f"{entry}({str(params_path.resolve())!r})\n",
+            newline="\n",
         )
         return f"{python} {shlex.quote(str(path.resolve()))}"
 
     def sbatch_script(name: str, directives: list[str], command: str) -> Path:
         path = out / name
         lines = ["#!/bin/bash", *(f"#SBATCH {d}" for d in directives), "", "date", command, "date", ""]
-        path.write_text("\n".join(lines))
+        path.write_text("\n".join(lines), newline="\n")
         return path
 
     partition_flag = [f"--partition={partition}"] if partition else []
@@ -934,10 +976,14 @@ async def tfbs_binding_scan(
         output_dir:     Where to write the bigWig; defaults to a temp dir.
         window:         Window size in bp.  Default None means the DNA
                         length of the structure (e.g. 11 bp), one FoldX run
-                        per window.  An explicit value is used as given: a
-                        larger window costs window - DNA length + 1 FoldX
-                        runs (shared between overlapping windows); a value
-                        below the DNA length is rejected.
+                        per window.  An explicit value is used as given,
+                        even when it is much larger than the DNA: every
+                        placement of the DNA inside the window is scored,
+                        so a window costs window - DNA length + 1 FoldX
+                        runs (shared between overlapping windows), and the
+                        result then carries a "warning" with the run count
+                        (placements x windows).  A value below the DNA
+                        length is rejected.
         step:           Distance between window starts in bp (default 50).
                         With step > window the positions between windows
                         are not scored; use step <= window for gap-free
@@ -955,8 +1001,11 @@ async def tfbs_binding_scan(
 
     Returns:
         JSON with ``bigwig_path``, ``num_windows``, and the ``window``,
-        ``dna_length`` and ``step`` actually used; with slurm=true, also
-        ``array_job_id`` and ``merge_job_id``.  When windows overlap, each
+        ``dna_length``, ``placements`` (DNA placements per window) and
+        ``step`` actually used, plus ``foldx_runs_planned`` (distinct
+        placements to score); with slurm=true, also ``array_job_id`` and
+        ``merge_job_id``.  ``warning`` reports the FoldX run count when a
+        window holds more than one placement.  When windows overlap, each
         value covers the step-wide bigWig bin centred on its window.
     """
     # --- Validate inputs -----------------------------------------------
@@ -1022,6 +1071,21 @@ async def tfbs_binding_scan(
             f"Pass window >= {dna_length}, or omit window to use the DNA length.",
         )
     num_windows = max(1, (end - start - window) // step + 1)
+    placements = window - dna_length + 1
+    if step >= placements:
+        runs_planned = placements * num_windows
+    else:
+        runs_planned = (num_windows - 1) * step + placements
+    warnings: list[str] = []
+    if placements > 1:
+        warnings.append(
+            f"window {window} bp holds {placements} placements of the {dna_length} bp "
+            f"structure DNA, so the scan costs {placements} placements x {num_windows} "
+            f"windows = {placements * num_windows} FoldX runs"
+            + (f" ({runs_planned} distinct, shared between overlapping windows)"
+               if runs_planned < placements * num_windows else "")
+            + "; omit window to score one placement per window."
+        )
 
     try:
         genome = pyfaidx.Fasta(str(fasta))
@@ -1046,36 +1110,41 @@ async def tfbs_binding_scan(
         "region": region,
         "window": window,
         "dna_length": dna_length,
+        "placements": placements,
         "step": step,
         "num_windows": num_windows,
+        "foldx_runs_planned": runs_planned,
         "output_dir": str(out.resolve()),
         "bigwig_path": str(bw_path),
     }
+    if warnings:
+        used["warning"] = " ".join(warnings)
 
     # --- SLURM mode (array job + dependent merge job) -------------------
     if slurm:
         genome.close()
-        placements = window - dna_length + 1
         windows_per_task = max(1, _FOLDX_RUNS_PER_TASK // placements)
         n_tasks = (num_windows + windows_per_task - 1) // windows_per_task
         chunks_dir = out.resolve() / "chunks"
         params_path = out.resolve() / "foldx_scan_params.json"
+        params = {
+            "structure": str(pdb),
+            "genome_fasta": str(fasta),
+            "chrom": chrom,
+            "chrom_length": chrom_length,
+            "start": start,
+            "step": step,
+            "window": window,
+            "num_windows": num_windows,
+            "windows_per_task": windows_per_task,
+            "foldx_bin": foldx,
+            "chunks_dir": str(chunks_dir),
+            "bigwig_path": str(bw_path),
+        }
+        params["params_digest"] = _params_digest(params)
         try:
             chunks_dir.mkdir(parents=True, exist_ok=True)
-            params_path.write_text(json.dumps({
-                "structure": str(pdb),
-                "genome_fasta": str(fasta),
-                "chrom": chrom,
-                "chrom_length": chrom_length,
-                "start": start,
-                "step": step,
-                "window": window,
-                "num_windows": num_windows,
-                "windows_per_task": windows_per_task,
-                "foldx_bin": foldx,
-                "chunks_dir": str(chunks_dir),
-                "bigwig_path": str(bw_path),
-            }, indent=2))
+            params_path.write_text(json.dumps(params, indent=2), newline="\n")
             array_sh, merge_sh = _write_slurm_scan_scripts(out, params_path, n_tasks, partition, max_time)
         except OSError as exc:
             return _error(f"Cannot write the SLURM job files to {out}: {exc}",
@@ -1111,6 +1180,7 @@ async def tfbs_binding_scan(
             "windows_per_task": windows_per_task,
             "chunks_dir": str(chunks_dir),
             "params_path": str(params_path),
+            "params_digest": params["params_digest"],
             **used,
         })
 
@@ -1134,6 +1204,8 @@ async def tfbs_binding_scan(
 
     result = {"mode": "local", "num_scored": num_scored, "foldx_runs": scorer.runs, **used}
     if num_scored == 0:
-        result["warning"] = ("No window could be scored: the region has no ACGT-only "
-                             "sequence or FoldX failed on every placement.")
+        warnings.append("No window could be scored: the region has no ACGT-only "
+                        "sequence or FoldX failed on every placement.")
+    if warnings:
+        result["warning"] = " ".join(warnings)
     return json.dumps(result)

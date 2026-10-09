@@ -663,5 +663,86 @@ def test_binding_scan_slurm_worker_script_runs_standalone(scan_inputs, fake_fold
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == ""
     rows = Path(result["chunks_dir"], "chunk_00000.csv").read_text().splitlines()
-    assert rows[0] == "position,energy"
-    assert [r.split(",")[0] for r in rows[1:]] == ["200", "210", "220"]
+    assert rows[0] == f"# params_digest={result['params_digest']}"
+    assert rows[1] == "position,energy"
+    assert [r.split(",")[0] for r in rows[2:]] == ["200", "210", "220"]
+
+
+# ---------------------------------------------------------------------------
+# Placement warning, chunk digests and LF job files
+# ---------------------------------------------------------------------------
+
+def test_binding_scan_warns_with_the_run_count_for_a_wide_window(scan_inputs, fake_foldx,
+                                                                 fake_bigwig, tmp_path):
+    result = _scan(scan_inputs, tmp_path / "out", region="chr1:200-300", window=15, step=50)
+    assert result["placements"] == 11
+    assert result["num_windows"] == 2
+    assert "11 placements x 2 windows = 22 FoldX runs" in result["warning"]
+    assert result["foldx_runs_planned"] == 22 == result["foldx_runs"]
+
+    overlapping = _scan(scan_inputs, tmp_path / "overlap", region="chr1:200-260", window=8, step=2)
+    assert "4 placements x 27 windows = 108 FoldX runs" in overlapping["warning"]
+    assert "(56 distinct" in overlapping["warning"]
+    assert overlapping["foldx_runs_planned"] == overlapping["foldx_runs"] == 56
+
+
+def test_binding_scan_default_window_has_no_warning(scan_inputs, fake_foldx, fake_bigwig, tmp_path):
+    result = _scan(scan_inputs, tmp_path / "out")
+    assert result["placements"] == 1
+    assert "warning" not in result
+
+
+def test_binding_scan_description_mentions_the_run_count_warning():
+    from tfbs.mcp.foldx_tools import tfbs_binding_scan
+
+    doc = " ".join(tfbs_binding_scan.__doc__.split())
+    assert "placements x windows" in doc and '"warning"' in doc
+
+
+def test_binding_scan_slurm_warns_too(scan_inputs, fake_foldx, fake_bigwig, fake_sbatch, tmp_path):
+    _, replies = fake_sbatch
+    replies += [{"job_id": "11"}, {"job_id": "12"}]
+    result = _scan(scan_inputs, tmp_path / "slurm", slurm=True, region="chr1:200-260",
+                   window=8, step=2)
+    assert "FoldX runs" in result["warning"]
+
+
+def test_binding_scan_job_files_use_lf(scan_inputs, fake_foldx, fake_bigwig, fake_sbatch, tmp_path):
+    _, replies = fake_sbatch
+    replies += [{"job_id": "11"}, {"job_id": "12"}]
+    result = _scan(scan_inputs, tmp_path / "slurm", slurm=True)
+    out = Path(result["output_dir"])
+    for name in ("foldx_scan.sh", "foldx_merge.sh", "foldx_scan_worker.py",
+                 "foldx_scan_merge.py", "foldx_scan_params.json"):
+        assert b"\r\n" not in (out / name).read_bytes(), name
+
+
+def test_resubmitted_scan_with_other_parameters_ignores_stale_chunks(
+        scan_inputs, fake_foldx, fake_bigwig, fake_sbatch, tmp_path, monkeypatch):
+    """A chunk left by a scan of another region is rewritten, never merged."""
+    import tfbs.mcp.foldx_tools as fx
+
+    _, replies = fake_sbatch
+    replies += [{"job_id": "1"}, {"job_id": "2"}, {"job_id": "3"}, {"job_id": "4"}]
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "0")
+    out = tmp_path / "scan"
+
+    first = _scan(scan_inputs, out, slurm=True, region="chr1:200-230", step=10)
+    fx._scan_chunk_job(first["params_path"])
+    chunk = Path(first["chunks_dir"], "chunk_00000.csv")
+    assert fx._chunk_digest(chunk) == first["params_digest"]
+
+    second = _scan(scan_inputs, out, slurm=True, region="chr1:400-430", step=10)
+    assert second["params_digest"] != first["params_digest"]
+    assert second["params_path"] == first["params_path"]
+
+    fx._merge_chunks_job(second["params_path"])
+    assert fake_bigwig[second["bigwig_path"]].entries == [], "a stale chunk was merged"
+
+    runs = len(fake_foldx)
+    fx._scan_chunk_job(second["params_path"])
+    assert len(fake_foldx) > runs, "a stale chunk must be rescored, not skipped"
+    assert fx._chunk_digest(chunk) == second["params_digest"]
+    fx._merge_chunks_job(second["params_path"])
+    starts = [s for _, s, _, _ in fake_bigwig[second["bigwig_path"]].entries]
+    assert starts == [400, 410, 420]

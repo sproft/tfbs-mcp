@@ -148,7 +148,8 @@ class BaseModel(pl.LightningModule):
 
 class FlexibleMLP(BaseModel):
     """
-    A flexible Multi-Layer Perceptron (MLP) for tabular data, adaptable to any number of input features.
+    A flexible Multi-Layer Perceptron (MLP). The input is flattened, so input_length is the
+    number of flattened values: 4 x L for one-hot (N, 4, L) sequences, F for tabular (N, F) data.
     """
     def __init__(self, hidden_dims: list = [64, 32], output_dim: int = 1, dropout_p: float = 0.5, **kwargs):
         """

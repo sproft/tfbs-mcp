@@ -32,6 +32,10 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import auc, roc_curve
 
+from tfbs.pipelines.checkpoints import (
+    DEFAULT_SCALING, describe_problems, parse_named_paths, resolve_checkpoints,
+)
+
 NUC_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
 IDX_TO_NUC = ["A", "C", "G", "T"]
 COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
@@ -209,6 +213,12 @@ def main(argv=None):
                         default=["all_mean", "core_mean", "flank_mean"])
     parser.add_argument("--models-dir", default="saved_models_final")
     parser.add_argument("--model-type", default="VCNNBpnet")
+    parser.add_argument("--scaling-method", default=DEFAULT_SCALING,
+                        help="Scaling subdirectory of each dataset's checkpoint; "
+                             "when <models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt "
+                             "is missing, a single <dataset>/*/best_<model-type>.ckpt is used")
+    parser.add_argument("--checkpoints", nargs="+", metavar="NAME=PATH",
+                        help="Explicit checkpoints; replace --models-dir and --datasets")
     parser.add_argument("--n-per-tf", type=int, default=500,
                         help="Sequences sampled per TF (FoldX is ~3 min/seq)")
     parser.add_argument("--window", type=int, default=24)
@@ -241,11 +251,13 @@ def main(argv=None):
     import tfbs.nn.models as models_mod
     cls = getattr(models_mod, args.model_type)
     loaded = {}
-    for name in args.datasets:
-        ckpt = Path(args.models_dir) / name / "standardize" / f"best_{args.model_type}.ckpt"
-        if not ckpt.exists():
-            print(f"Skipping NN {name}: checkpoint not found")
-            continue
+    ckpts, problems = resolve_checkpoints(
+        args.models_dir, args.datasets, args.model_type, args.scaling_method,
+        parse_named_paths(args.checkpoints),
+    )
+    if problems:
+        print(f"Skipping NN {describe_problems(problems)}", file=sys.stderr)
+    for name, ckpt in ckpts.items():
         m = cls.load_from_checkpoint(str(ckpt), map_location=args.device)
         m.eval()
         if hasattr(m, "freeze"):

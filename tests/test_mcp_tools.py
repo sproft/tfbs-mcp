@@ -702,8 +702,9 @@ def test_epistasis_is_zero_for_an_additive_model(tmp_path):
     finally:
         server._model_registry.pop("additive", None)
 
-    assert result["num_pairs_analyzed"] == L * (L - 1) // 2
-    assert result["num_double_mutants"] == 9 * L * (L - 1) // 2
+    assert result["num_position_pairs"] == L * (L - 1) // 2
+    assert result["num_pairs_analyzed"] == 9 * L * (L - 1) // 2
+    assert result["num_double_mutants"] == result["num_pairs_analyzed"]
     assert result["top_interactions"] == []
 
     with open(result["files"]["epistasis_matrix"], newline="") as f:
@@ -761,6 +762,12 @@ def _reference_files(tmp_path):
         path = tmp_path / name
         path.write_text("placeholder\n")
         files[name] = str(path)
+    models = tmp_path / "models"
+    for dataset in ("all_mean", "core_mean", "flank_mean"):
+        ckpt = models / dataset / "standardize" / "best_VCNNBpnet.ckpt"
+        ckpt.parent.mkdir(parents=True)
+        ckpt.write_text("x")
+    files["models_dir"] = str(models)
     return files
 
 
@@ -774,7 +781,7 @@ def _remap(tmp_path, files, **kwargs):
     return json.loads(asyncio.run(server.tfbs_remap_validation(
         remap_bed=files["peaks.bed"], output_dir=str(tmp_path / "remap"),
         motif_file=files["motif.meme"], genome_fasta=files["genome.fa"],
-        skip_foldx=True, **kwargs,
+        skip_foldx=True, models_dir=files["models_dir"], **kwargs,
     )))
 
 
@@ -999,6 +1006,7 @@ def test_sweep_agent_runs_the_packaged_pipeline_from_the_project_root(monkeypatc
     cfg.write_text("method: bayes\n")
     fake = FakeSlurm(monkeypatch, available=("sbatch", "wandb"))
     monkeypatch.setitem(server._ENV, "default_partition", "gpu-test")
+    monkeypatch.setattr(server, "_pipeline_requirements_error", lambda *a: None)
 
     result = json.loads(asyncio.run(server.tfbs_sweep(
         sweep_config=str(cfg), project_name="p", model="VCNNBpnet",

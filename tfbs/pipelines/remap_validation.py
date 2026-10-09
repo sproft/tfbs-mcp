@@ -36,6 +36,9 @@ import pyfaidx
 import torch
 from sklearn.metrics import auc, roc_curve
 
+from tfbs.pipelines.checkpoints import (
+    DEFAULT_SCALING, describe_problems, parse_named_paths, resolve_checkpoints,
+)
 from tfbs.pipelines.chipseq_benchmark_with_foldx import (
     NUC_TO_IDX,
     score_nn,
@@ -281,6 +284,12 @@ def main(argv=None):
                         default=["all_mean", "core_mean", "flank_mean"])
     parser.add_argument("--models-dir", default="saved_models_final")
     parser.add_argument("--model-type", default="VCNNBpnet")
+    parser.add_argument("--scaling-method", default=DEFAULT_SCALING,
+                        help="Scaling subdirectory of each dataset's checkpoint; "
+                             "when <models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt "
+                             "is missing, a single <dataset>/*/best_<model-type>.ckpt is used")
+    parser.add_argument("--checkpoints", nargs="+", metavar="NAME=PATH",
+                        help="Explicit checkpoints; replace --models-dir and --datasets")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -301,12 +310,14 @@ def main(argv=None):
 
     # ---------------- Load NN models ----------------
     nn_models = {}
-    for ds in args.datasets:
-        ckpt = Path(args.models_dir) / ds / "standardize" / f"best_{args.model_type}.ckpt"
-        if not ckpt.exists():
-            print(f"[skip] {ckpt} not found")
-            continue
-        print(f"Loading NN model {ds}")
+    ckpts, problems = resolve_checkpoints(
+        args.models_dir, args.datasets, args.model_type, args.scaling_method,
+        parse_named_paths(args.checkpoints),
+    )
+    if problems:
+        print(f"[skip] {describe_problems(problems)}", file=sys.stderr)
+    for ds, ckpt in ckpts.items():
+        print(f"Loading NN model {ds} from {ckpt}")
         nn_models[ds] = load_model(str(ckpt), args.model_type, args.device)
 
     # ---------------- Read ReMap peaks ----------------

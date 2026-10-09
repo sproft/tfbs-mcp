@@ -6,13 +6,14 @@
 # ...or from the repo root:
 #   tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/FlexibleMLP.yaml
 #
-# NOTE: FlexibleMLP is for TABULAR input of shape (batch, input_length) -- it
-# sizes its first layer from input_length directly, so it does not take
-# one-hot (batch, 4, L) sequence. Set input_length to your feature count.
-# Values are the class defaults - tune them for your data.
+# NOTE: FlexibleMLP flattens its input and sizes its first layer from
+# input_length, so input_length is the number of flattened values: 4 x L for
+# one-hot (batch, 4, L) windows (96 here, for 24 bp), or the feature count F
+# for tabular (batch, F) input. tfbs_config sets it to 4 x the window.
+# The other values are the class defaults; tune them for your data.
 class_path: tfbs.nn.models.FlexibleMLP
 init_args:
-  input_length: 24
+  input_length: 96
   hidden_dims: [64, 32]
   output_dim: 1
   dropout_p: 0.5

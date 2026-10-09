@@ -280,7 +280,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None):
-    run_agent(build_parser().parse_args(argv))
+    """Run from a list of command-line arguments, or from parsed arguments.
+
+    ``main(args)`` with an argparse.Namespace is the signature of the
+    former scripts/cli/run_sweep.py and still works.
+    """
+    if isinstance(argv, argparse.Namespace):
+        return run_agent(argv)
+    return run_agent(build_parser().parse_args(argv))
 
 
 if __name__ == '__main__':

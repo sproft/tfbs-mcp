@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import gzip
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -409,25 +410,22 @@ def _ensure_imports():
 
 
 # ---------------------------------------------------------------------------
-# Lazy imports: genomics (pyfaidx, tangermeme.io)
+# Lazy imports: genomics (pyfaidx, pandas)
 # ---------------------------------------------------------------------------
 _pyfaidx = None
-_extract_loci = None
 _pd = None
 _genome_cache: dict[str, Any] = {}
 
 
 def _ensure_genomics_imports():
     """Import genomics dependencies on first use."""
-    global _pyfaidx, _extract_loci, _pd
+    global _pyfaidx, _pd
     if _pyfaidx is not None:
         return
     import pyfaidx
     import pandas as pd
-    from tangermeme.io import extract_loci
 
     _pyfaidx = pyfaidx
-    _extract_loci = extract_loci
     _pd = pd
 
 
@@ -470,7 +468,7 @@ def _sequences_to_tensor(sequences: list[str]):
     )
     ohe = _F.one_hot(indices, num_classes=4).float()  # (N, L, 4)
     # .contiguous() matters: permute() returns a non-contiguous view, and the
-    # models that flatten their input with .view() (MLP, FlexibleMLP) raise
+    # models that flatten their input with .view() (e.g. MLP) raise
     # "view size is not compatible with input tensor's size and stride" on one.
     # Batches from the DataLoader are contiguous via collation, so this path
     # was the only one that hit it.
@@ -483,27 +481,43 @@ def _tensor_to_sequences(tensor) -> list[str]:
     return ["".join(_IDX_TO_NUC[i] for i in row) for row in indices]
 
 
-def _get_model(model_id: str) -> dict[str, Any]:
-    """Retrieve a loaded model or raise a clear error."""
-    if model_id not in _model_registry:
-        available = list(_model_registry.keys()) or ["(none)"]
-        raise ValueError(
-            f"Model '{model_id}' not loaded. "
-            f"Call tfbs_load_model first. Available: {', '.join(available)}"
-        )
-    return _model_registry[model_id]
+def _get_model(model_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    """(registry entry, None), or (None, error JSON) for an unknown model_id."""
+    if model_id in _model_registry:
+        return _model_registry[model_id], None
+    available = list(_model_registry.keys()) or ["(none)"]
+    return None, _error(
+        f"Model '{model_id}' not loaded. Available: {', '.join(available)}.",
+        "Call tfbs_load_model with this model_id first; tfbs_list_models "
+        "lists the loaded models.",
+    )
 
 
-def _validate_dna(sequences: list[str]) -> None:
-    """Check that every sequence contains only valid DNA characters."""
+def _validate_dna(sequences: list[str], what: str = "Sequence {}",
+                  ids: list[str] | None = None) -> str | None:
+    """Error JSON for the first empty or non-ACGT sequence, else None.
+
+    ``what`` names a sequence in the message; ``{}`` becomes its index, or
+    its entry in ``ids`` when given (FASTA record names).
+    """
     valid = set("ACGTacgt")
     for i, seq in enumerate(sequences):
+        if not isinstance(seq, str):
+            return _error(f"{what.format(ids[i] if ids else i)} is not a string.",
+                          "Pass DNA sequences as strings of A, C, G and T.")
         bad = set(seq) - valid
-        if bad:
-            raise ValueError(
-                f"Sequence {i} contains invalid characters: {bad}. "
-                "Only A, C, G, T are allowed."
+        if bad or not seq:
+            return _error(
+                f"{what.format(ids[i] if ids else i)} is empty or contains "
+                f"characters other than A, C, G, T: {sorted(bad)}.",
+                "Remove or replace N and IUPAC codes; tfbs_extract_loci already "
+                "drops windows that contain N.",
             )
+    return None
+
+
+def _no_sequences_error(tool: str, fix: str) -> str:
+    return _error(f"{tool} got no sequences.", fix)
 
 
 def _tail_file(path: str, n: int = 100) -> str:
@@ -531,18 +545,6 @@ def _tail_file(path: str, n: int = 100) -> str:
 # ---------------------------------------------------------------------------
 def _error(error: str, fix: str, **extra: Any) -> str:
     return json.dumps({"error": error, "fix": fix, **extra})
-
-
-def _model_entry(model_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    """(registry entry, None), or (None, error JSON) for an unknown model_id."""
-    try:
-        return _get_model(model_id), None
-    except ValueError as exc:
-        return None, _error(
-            str(exc),
-            "Call tfbs_load_model with this model_id first; tfbs_list_models "
-            "lists the loaded models.",
-        )
 
 
 def _results_root() -> Path:
@@ -721,16 +723,9 @@ def _load_sequence_input(
         where = "Record {} of " + path.name
     if not seqs:
         return None, None, _error("No sequences given.", "Pass at least one DNA sequence.")
-    valid = set("ACGTacgt")
-    for i, seq in enumerate(seqs):
-        bad = set(seq) - valid
-        if bad or not seq:
-            return None, None, _error(
-                f"{where.format(ids[i] if ids else i)} is empty or contains "
-                f"characters other than A, C, G, T: {sorted(bad)}.",
-                "Remove or replace N and IUPAC codes; tfbs_extract_loci already "
-                "drops windows that contain N.",
-            )
+    err = _validate_dna(seqs, where, ids)
+    if err:
+        return None, None, err
     lengths = sorted({len(s) for s in seqs})
     if len(lengths) > 1:
         return None, None, _error(
@@ -739,6 +734,178 @@ def _load_sequence_input(
             "with a fixed in_window.",
         )
     return _one_hot(seqs), ids, None
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint loading helpers
+# ---------------------------------------------------------------------------
+_CLASS_PATH_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+
+
+def _checkpoint_class_path(path: Path) -> str | None:
+    """The model class path a LightningCLI checkpoint records, or None.
+
+    LightningCLI stores it as hyper_parameters["_class_path"], e.g.
+    "classes.nn.models.VCNNBpnet" for the NKX2-1 study's checkpoints.
+    """
+    try:
+        ckpt = _torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return None
+    hparams = ckpt.get("hyper_parameters") if isinstance(ckpt, dict) else None
+    value = hparams.get("_class_path") if isinstance(hparams, dict) else None
+    return value if isinstance(value, str) and "." in value else None
+
+
+def _class_path_in(message: str, model_type: str) -> str | None:
+    """A class path ending in model_type, from a module not yet imported, in a message."""
+    for match in _CLASS_PATH_RE.findall(message):
+        module, _, name = match.rpartition(".")
+        if name == model_type and module not in sys.modules:
+            return match
+    return None
+
+
+def _import_class_module(class_path: str) -> bool:
+    """Import the module that defines class_path; False if it cannot be imported."""
+    module = class_path.rpartition(".")[0]
+    if not module:
+        return False
+    if module in sys.modules:
+        return True
+    try:
+        importlib.import_module(module)
+    except Exception:
+        return False
+    return True
+
+
+def _load_checkpoint(model_cls, path: Path, model_type: str, device: str):
+    """(model, None) or (None, error JSON).
+
+    Lightning resolves the class path stored in a LightningCLI checkpoint
+    and, depending on its version, refuses one whose module is not
+    imported yet.  The module named in the checkpoint is imported first;
+    when loading still fails over a class path whose module was not
+    imported, that module is imported and the load retried once.
+    """
+    class_path = _checkpoint_class_path(path)
+    if class_path:
+        _import_class_module(class_path)
+    try:
+        return model_cls.load_from_checkpoint(str(path), map_location=device), None
+    except Exception as exc:
+        failure = exc
+    failed_path = _class_path_in(str(failure), model_type) or class_path
+    if failed_path and failed_path.rpartition(".")[0] not in sys.modules:
+        if not _import_class_module(failed_path):
+            module = failed_path.rpartition(".")[0]
+            return None, _error(
+                f"The checkpoint was saved with the class {failed_path}, and its "
+                f"module {module} cannot be imported by the server.",
+                f"Put the package that defines {module} on the PYTHONPATH of the "
+                "MCP server (the 'env' block of the client config) and restart it; "
+                "for the NKX2-1 study checkpoints that is the TF-NN workspace, whose "
+                "classes package maps classes.* to tfbs.*. Or re-save the checkpoint "
+                "with hyper_parameters['_class_path'] set to the matching tfbs class, "
+                f"tfbs.nn.models.{model_type}.",
+                class_path=failed_path,
+            )
+        try:
+            return model_cls.load_from_checkpoint(str(path), map_location=device), None
+        except Exception as exc:
+            failure = exc
+    return None, _error(
+        f"Could not load {path} as {model_type}: {type(failure).__name__}: {str(failure)[:1500]}",
+        "Check that model_type is the architecture the checkpoint was trained "
+        "with (its hyper_parameters name the class) and that the file is a "
+        "PyTorch Lightning checkpoint.",
+        class_path=class_path,
+    )
+
+
+_SCALING_FILE = "scaling_params.json"
+
+
+def _scaling_key(ckpt: Path, model_type: str) -> str:
+    """<dataset>_<scaling>_<model_type> for <dataset>/<scaling>/best_<model>.ckpt.
+
+    The NKX2-1 study names its per-model files this way, e.g.
+    all_mean_standardize_VCNNBpnet.json, and uses the same names as keys
+    of its combined file.
+    """
+    return f"{ckpt.parent.parent.name}_{ckpt.parent.name}_{model_type}"
+
+
+def _read_scaling_file(path: Path, key: str) -> tuple[dict | None, str | None]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, _error(f"Could not read scaling parameters from {path}: {exc}",
+                            "Pass the scaling_params.json written next to the training data.")
+    if isinstance(data, dict) and "scaling_method" not in data and isinstance(data.get(key), dict):
+        data = data[key]
+    if not isinstance(data, dict) or "scaling_method" not in data:
+        keys = sorted(data) if isinstance(data, dict) else []
+        return None, _error(
+            f"{path} has no scaling_method" + (f" and no entry {key}" if keys else "") + ".",
+            "Pass a scaling_params.json as written by training "
+            '({"scaling_method": ..., "mean": ..., "std": ...}), or a combined '
+            "file keyed by <dataset>_<scaling>_<model_type>."
+            + (f" Keys in this file: {keys[:20]}." if keys else ""),
+        )
+    needed = {"standardize": ("mean", "std"), "normalize": ("min", "max")}.get(
+        data["scaling_method"], ())
+    missing = [k for k in needed if not isinstance(data.get(k), (int, float))]
+    if missing:
+        return None, _error(
+            f"{path} uses scaling_method {data['scaling_method']} but lacks {missing}.",
+            "Pass the scaling_params.json written by the training run.")
+    return data, None
+
+
+def _find_scaling_params(data_path: str | None, ckpt: Path,
+                         model_type: str) -> tuple[dict | None, str | None, str | None]:
+    """(params, source file, None); (None, None, None) when there are none; or an error.
+
+    data_path is a scaling JSON, or a directory holding scaling_params.json,
+    <dataset>_<scaling>_<model_type>.json or exactly one *scaling*.json.
+    Without data_path, scaling_params.json next to the checkpoint is used
+    when it exists.
+    """
+    key = _scaling_key(ckpt, model_type)
+    if not data_path:
+        candidate = ckpt.parent / _SCALING_FILE
+        if not candidate.is_file():
+            return None, None, None
+    else:
+        p = Path(data_path).expanduser().resolve()
+        if p.is_file():
+            candidate = p
+        elif not p.is_dir():
+            return None, None, _error(
+                f"data_path not found: {data_path}",
+                "Pass the training data directory (with scaling_params.json), "
+                "or the scaling JSON itself.")
+        else:
+            named = [p / n for n in (_SCALING_FILE, f"{key}.json") if (p / n).is_file()]
+            matches = sorted(p.glob("*scaling*.json"))
+            if named:
+                candidate = named[0]
+            elif len(matches) == 1:
+                candidate = matches[0]
+            else:
+                return None, None, _error(
+                    f"No scaling parameters for this checkpoint in {p}: no "
+                    f"{_SCALING_FILE}, no {key}.json, and {len(matches)} files "
+                    "match *scaling*.json.",
+                    "Pass the scaling JSON itself as data_path, or the training "
+                    "data directory whose scaling_params.json the training run wrote.",
+                    json_files=sorted(x.name for x in p.glob("*.json"))[:50],
+                )
+    params, err = _read_scaling_file(candidate, key)
+    return params, (str(candidate) if params else None), err
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +933,17 @@ async def tfbs_load_model(
     The model stays loaded for the lifetime of the server and can be
     referenced by model_id in subsequent predict / analyze calls.
 
+    A checkpoint written by LightningCLI records the class it was trained
+    as (e.g. classes.nn.models.VCNNBpnet for the NKX2-1 study); its module
+    is imported before loading, and a module that cannot be imported is
+    reported with the PYTHONPATH fix instead of a traceback.
+
+    Label scaling: a regression model trained on standardized or
+    normalized labels predicts in that scale.  When scaling parameters
+    are found, tfbs_predict converts its scores back to the original
+    label units by default.  They are looked up in data_path, or without
+    it in scaling_params.json next to the checkpoint.
+
     Args:
         model_id: User-chosen identifier for this model (e.g. "my_vcnn").
         checkpoint_path: Absolute path to a .ckpt file on disk.
@@ -773,37 +951,49 @@ async def tfbs_load_model(
                     (e.g. "VCNNBpnet", "RNN").
         device: "cpu" or "cuda".  Auto-detected if omitted (uses GPU when
                 available on SLURM, CPU otherwise).
-        data_path: Optional path to the training data directory.  If
-                   provided, loads scaling_params.json so predictions
-                   can be inverse-transformed to real-world units.
+        data_path: Where the scaling parameters are: the training data
+                   directory holding scaling_params.json; a directory
+                   holding <dataset>_<scaling>_<model_type>.json (named
+                   after the checkpoint's <dataset>/<scaling>/ folders, as
+                   in the study's saved_models_final/scaling_params/) or
+                   exactly one *scaling*.json; or the JSON file itself (a
+                   combined file keyed by those names works too).
 
     Returns:
-        JSON with model_id, model_type, input_length, classify flag, and device.
+        JSON with model_id, model_type, input_length, classify, device,
+        scaling_params (null when none were found) and scaling_source
+        (the file they came from).
     """
     _ensure_imports()
 
     if device is None:
         device = _ENV["default_device"]
 
-    path = Path(checkpoint_path).resolve()
-    if not path.exists():
-        return json.dumps({"error": f"Checkpoint not found: {checkpoint_path}"})
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not path.is_file():
+        return _error(f"Checkpoint not found: {checkpoint_path}",
+                      "Pass the absolute path of a .ckpt file, e.g. the checkpoint_path "
+                      "that tfbs_config reported.")
 
-    try:
-        model_cls = getattr(_models, model_type)
-    except AttributeError:
-        available = [
+    model_cls = getattr(_models, model_type, None)
+    if not (isinstance(model_cls, type) and issubclass(model_cls, _torch.nn.Module)):
+        available = sorted(
             n for n in dir(_models)
             if isinstance(getattr(_models, n, None), type)
             and issubclass(getattr(_models, n), _torch.nn.Module)
-            and n != "BaseModel"
-        ]
-        return json.dumps({
-            "error": f"Unknown model_type '{model_type}'.",
-            "available": available,
-        })
+            and n != "BaseModel" and not n.startswith("_")
+            and getattr(_models, n).__module__ == _models.__name__
+        )
+        return _error(f"Unknown model_type '{model_type}'.",
+                      f"Use one of: {available}.", available=available)
 
-    model = model_cls.load_from_checkpoint(str(path), map_location=device)
+    scaling_params, scaling_source, err = _find_scaling_params(data_path, path, model_type)
+    if err:
+        return err
+
+    model, err = _load_checkpoint(model_cls, path, model_type, device)
+    if err:
+        return err
     model.eval()
     if hasattr(model, "freeze"):
         model.freeze()
@@ -811,14 +1001,6 @@ async def tfbs_load_model(
 
     input_length = getattr(model, "input_length", None)
     classify = getattr(model, "classify", False)
-
-    # Load scaling parameters if available
-    scaling_params = None
-    if data_path:
-        sp_path = Path(data_path) / "scaling_params.json"
-        if sp_path.exists():
-            with open(sp_path) as f:
-                scaling_params = json.load(f)
 
     _model_registry[model_id] = {
         "model": model,
@@ -836,12 +1018,25 @@ async def tfbs_load_model(
         "classify": classify,
         "device": device,
         "scaling_params": scaling_params,
+        "scaling_source": scaling_source,
     })
 
 
 # ---------------------------------------------------------------------------
 # Tool 2: tfbs_predict
 # ---------------------------------------------------------------------------
+def _inverse_scaling(entry: dict[str, Any], inverse_transform: bool | None):
+    """The function that maps model outputs to label units, or None to leave them."""
+    sp = entry.get("scaling_params")
+    if inverse_transform is False or not sp or entry.get("classify"):
+        return None
+    if sp.get("scaling_method") == "standardize":
+        return lambda v: v * sp["std"] + sp["mean"]
+    if sp.get("scaling_method") == "normalize":
+        return lambda v: v * (sp["max"] - sp["min"]) + sp["min"]
+    return None
+
+
 @mcp.tool(
     name="tfbs_predict",
     annotations={
@@ -858,7 +1053,7 @@ async def tfbs_predict(
     window_mode: bool = False,
     window_size: int = 70,
     batch_size: int | None = None,
-    inverse_transform: bool = False,
+    inverse_transform: bool | None = None,
     sequences_path: str | None = None,
 ) -> str:
     """Score DNA sequences for transcription-factor binding affinity.
@@ -881,25 +1076,27 @@ async def tfbs_predict(
         window_size: Window length for sliding-window mode.
         batch_size: Batch size for processing.  Auto-detected if omitted
                     (512 on GPU, 64 on CPU).
-        inverse_transform: If true, reverse any label scaling that was
-                           applied during training (requires scaling_params
-                           to have been loaded via data_path in
-                           tfbs_load_model).  Only affects regression
-                           models.  Default false, because scores in the
-                           training scale are what tfbs_classify_metrics
-                           and ref/alt differences need; pass true to
-                           report values in the original label units.
+        inverse_transform: Default null, because predictions are meant
+                           to be read in the original label units (e.g.
+                           log2 fold change): the scores of a regression
+                           model are converted back whenever
+                           tfbs_load_model found its scaling parameters,
+                           and stay in the training scale when it found
+                           none.  false is the explicit opt-out that keeps
+                           the training scale (z-scores for standardize);
+                           true is the same as null.  Classifier scores
+                           are never transformed.
         sequences_path: One-hot .pt tensor (N, 4, L) as written by
                         tfbs_extract_loci or tfbs_preprocess, or a FASTA
                         file (.fa/.fasta/.fna/.fas, optionally .gz) of
                         equal-length A/C/G/T records.
 
     Returns:
-        JSON with "scores" (normal) or "best_scores", "best_sequences",
-        and "mean_scores" (window mode), plus "num_sequences"; for a
-        FASTA input also "ids" (record names, in score order).  If
-        inverse_transform is true, scores are in the original label
-        space.
+        JSON with "scores" (normal mode; always a list with one value per
+        sequence) or "best_scores", "best_sequences" and "mean_scores"
+        (window mode), plus "num_sequences" and "inverse_transformed"
+        (true when the scores are in the original label units); for a
+        FASTA input also "ids" (record names, in score order).
     """
     _ensure_imports()
     X, ids, err = _load_sequence_input(sequences, sequences_path)
@@ -909,55 +1106,38 @@ async def tfbs_predict(
     if batch_size is None:
         batch_size = _ENV["default_batch_size"]
 
-    entry, err = _model_entry(model_id)
+    entry, err = _get_model(model_id)
     if err:
         return err
     model = entry["model"]
     device = entry["device"]
+    n = int(X.shape[0])
+    inverse = _inverse_scaling(entry, inverse_transform)
 
-    # Helper: apply inverse scaling to numpy scores
-    def _inverse(scores_np):
-        if not inverse_transform:
-            return scores_np
-        sp = entry.get("scaling_params")
-        if sp is None:
-            return scores_np  # no scaling params available
-        if sp.get("scaling_method") == "standardize":
-            return scores_np * sp["std"] + sp["mean"]
-        if sp.get("scaling_method") == "normalize":
-            return scores_np * (sp["max"] - sp["min"]) + sp["min"]
-        return scores_np
+    def _per_sequence(values) -> list[float]:
+        arr = _np.asarray(values, dtype=float).reshape(n, -1)[:, 0]
+        return (inverse(arr) if inverse else arr).tolist()
 
     if window_mode:
         best_windows, best_scores, _, mean_scores = _find_best_windows_fast(
             X, model, window_size=window_size,
             processing_batch_size=batch_size, device=device,
         )
-        best_seqs = _tensor_to_sequences(_torch.from_numpy(best_windows))
         result = {
-            "best_scores": _inverse(best_scores).tolist(),
-            "best_sequences": best_seqs,
-            "mean_scores": _inverse(mean_scores).tolist(),
-            "num_sequences": int(X.shape[0]),
+            "best_scores": _per_sequence(best_scores),
+            "best_sequences": _tensor_to_sequences(_torch.from_numpy(best_windows)),
+            "mean_scores": _per_sequence(mean_scores),
+            "num_sequences": n,
         }
-        if ids is not None:
-            result["ids"] = ids
-        if inverse_transform and entry.get("scaling_params"):
-            result["inverse_transformed"] = True
-        return json.dumps(result)
-
-    chunks = []
-    with _torch.no_grad():
-        for k in range(0, X.shape[0], batch_size):
-            chunks.append(model(X[k:k + batch_size].to(device)).cpu())
-    scores = _torch.cat(chunks).numpy()
-
-    scores = _inverse(scores)
-    result = {"scores": scores.squeeze().tolist(), "num_sequences": int(X.shape[0])}
+    else:
+        chunks = []
+        with _torch.no_grad():
+            for k in range(0, n, batch_size):
+                chunks.append(model(X[k:k + batch_size].to(device)).cpu())
+        result = {"scores": _per_sequence(_torch.cat(chunks).numpy()), "num_sequences": n}
+    result["inverse_transformed"] = inverse is not None
     if ids is not None:
         result["ids"] = ids
-    if inverse_transform and entry.get("scaling_params"):
-        result["inverse_transformed"] = True
     return json.dumps(result)
 
 
@@ -1004,6 +1184,14 @@ async def tfbs_preprocess(
         and files (seqs and, with labels, labels: the paths written).
     """
     _ensure_imports()
+    if not sequences:
+        return _no_sequences_error(
+            "tfbs_preprocess",
+            "Pass the DNA strings to encode as sequences (A/C/G/T, one length). "
+            "Sequences already in a FASTA or .pt file need no preprocessing: "
+            "tfbs_predict, tfbs_analyze and tfbs_mutagenesis read them through "
+            "sequences_path.",
+        )
     X, _, err = _load_sequence_input(sequences, None)
     if err:
         return err
@@ -1122,7 +1310,7 @@ async def tfbs_analyze(
     X, ids, err = _load_sequence_input(sequences, sequences_path)
     if err:
         return err
-    entry, err = _model_entry(model_id)
+    entry, err = _get_model(model_id)
     if err:
         return err
     model = entry["model"]
@@ -1291,7 +1479,7 @@ async def tfbs_mutagenesis(
     if batch_size is None:
         batch_size = _ENV["default_batch_size"]
 
-    entry, err = _model_entry(model_id)
+    entry, err = _get_model(model_id)
     if err:
         return err
     model = entry["model"]
@@ -1350,7 +1538,7 @@ async def tfbs_mutagenesis(
 )
 async def tfbs_marginalize(
     model_id: str,
-    sequences: list[str],
+    sequences: list[str] | None,
     motif: str,
     start: int | None = None,
     n_background: int | None = None,
@@ -1369,45 +1557,67 @@ async def tfbs_marginalize(
 
     Args:
         model_id: Identifier of a model loaded via tfbs_load_model.
-        sequences: Background DNA sequences (A/C/G/T).
-        motif: DNA motif consensus to insert (e.g. "GATAAG").
+        sequences: Background DNA sequences (A/C/G/T, one length), or
+                   null when n_background is set.
+        motif: DNA motif consensus to insert (e.g. "GATAAG"; A/C/G/T).
         start: Position to insert motif.  None = center of sequence.
         n_background: If set, ignore sequences and generate this many
                       random one-hot backgrounds instead.
 
     Returns:
-        JSON with per-sequence "delta_predictions" (after - before),
-        "mean_delta", "predictions_before", and "predictions_after".
+        JSON with per-sequence lists "delta_predictions" (after - before),
+        "predictions_before" and "predictions_after", plus "mean_delta"
+        and "motif".
     """
     try:
         from tangermeme.marginalize import marginalize
         from tangermeme.utils import one_hot_encode, random_one_hot
     except ImportError:
-        return json.dumps({
-            "error": "tangermeme required. Install with: pip install 'tfbs-mcp[viz]'"
-        })
+        return _error("tangermeme required.", "Install with: pip install 'tfbs-mcp[viz]'")
 
     _ensure_imports()
 
-    entry, err = _model_entry(model_id)
+    entry, err = _get_model(model_id)
     if err:
         return err
     model = entry["model"]
     device = entry["device"]
     input_length = entry["input_length"]
 
-    # Build background tensor
-    if n_background is not None and input_length is not None:
+    err = _validate_dna([motif], "The motif")
+    if err:
+        return err
+
+    if n_background is not None:
+        if n_background < 1:
+            return _error(f"n_background must be at least 1, got {n_background}.",
+                          "Pass the number of random backgrounds, e.g. n_background=100.")
+        if input_length is None:
+            return _error(
+                f"n_background needs the model's input length, which model "
+                f"'{model_id}' does not report.",
+                "Pass background sequences of the model's input length as sequences instead.",
+            )
         X = random_one_hot((n_background, 4, input_length)).float()
+    elif not sequences:
+        return _no_sequences_error(
+            "tfbs_marginalize",
+            "Pass background DNA sequences as sequences (A/C/G/T, one length), "
+            "or set n_background to insert the motif into that many random "
+            "backgrounds of the model's input length.",
+        )
     else:
         X, _, err = _load_sequence_input(sequences, None)
         if err:
             return err
+    if len(motif) > X.shape[2]:
+        return _error(f"The motif ({len(motif)} bp) is longer than the backgrounds "
+                      f"({X.shape[2]} bp).", "Pass a shorter motif or longer backgrounds.")
 
     X = X.to(device)
 
     # One-hot encode the motif string
-    motif_ohe = one_hot_encode(motif).unsqueeze(0).float().to(device)
+    motif_ohe = one_hot_encode(motif.upper()).unsqueeze(0).float().to(device)
 
     y_before, y_after = marginalize(
         model, X, motif_ohe,
@@ -1425,11 +1635,14 @@ async def tfbs_marginalize(
     else:
         y_after = _np.asarray(y_after)
 
-    delta = (y_after - y_before).squeeze()
+    n = int(X.shape[0])
+    before = _np.asarray(y_before, dtype=float).reshape(n, -1)[:, 0]
+    after = _np.asarray(y_after, dtype=float).reshape(n, -1)[:, 0]
+    delta = after - before
 
     return json.dumps({
-        "predictions_before": y_before.squeeze().tolist(),
-        "predictions_after": y_after.squeeze().tolist(),
+        "predictions_before": before.tolist(),
+        "predictions_after": after.tolist(),
         "delta_predictions": delta.tolist(),
         "mean_delta": float(delta.mean()),
         "motif": motif,
@@ -1565,12 +1778,11 @@ async def tfbs_fimo(
     if not motif_path.is_file():
         return json.dumps({"error": f"Not a regular file: {motif_file}"})
 
-    bad = [i for i, s in enumerate(sequences) if not s or set(s) - set("ACGTacgt")]
-    if bad:
-        return _error(
-            f"Sequences {bad[:10]} are empty or contain characters other than A, C, G, T.",
-            "Remove or replace N and IUPAC codes before scanning.",
-        )
+    if not sequences:
+        return _no_sequences_error("tfbs_fimo", "Pass the DNA sequences to scan as sequences.")
+    err = _validate_dna(sequences)
+    if err:
+        return err
 
     if shutil.which("fimo") is None:
         return json.dumps(_FIMO_MISSING)
@@ -2230,9 +2442,10 @@ async def tfbs_train(
     else:
         gres_line = "#SBATCH --gres=gpu:1"
 
-    train_cmd = f"{sys.executable} -m tfbs.cli.train_cli fit --config {config_p}"
-    if extra_args:
-        train_cmd += " " + " ".join(extra_args)
+    train_cmd = shlex.join([
+        sys.executable, "-m", "tfbs.cli.train_cli", "fit", "--config", str(config_p),
+        *(extra_args or []),
+    ])
 
     sbatch_content = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
@@ -2243,10 +2456,12 @@ async def tfbs_train(
 #SBATCH --error={job_name}_%j.err
 #SBATCH --ntasks=1
 
-{train_cmd}
+{_sbatch_pythonpath_line()}{train_cmd}
 """
 
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False, prefix="tfbs_")
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".sh", delete=False, prefix="tfbs_", newline="\n",
+    )
     tmp.write(sbatch_content)
     tmp.close()
     os.chmod(tmp.name, 0o755)
@@ -2294,6 +2509,9 @@ async def tfbs_sweep(
     gpu_type: str | None = None,
 ) -> str:
     """Create a WandB sweep and submit an agent job to SLURM.
+
+    Needs the tracking extra (pip install "tfbs-mcp[tracking]", which
+    installs wandb) and a prior "wandb login".
 
     Steps:
       1. Check that sbatch and wandb exist, so no sweep is created that no
@@ -2351,6 +2569,10 @@ async def tfbs_sweep(
                    "hyperparameters the bundled sweep YAML defines. No sweep "
                    "was created.",
         })
+
+    err = _pipeline_requirements_error("run_sweep", "tfbs_sweep")
+    if err:
+        return err
 
     project_root, err = _work_dir()
     if err:
@@ -2462,8 +2684,11 @@ async def tfbs_validate(
 
     The job runs ``python -m tfbs.pipelines.validate`` (installed with
     the package), which loads the checkpoint, runs trainer.test() on the
-    held-out test split, and appends test_loss to a CSV results file.
-    The job's .o/.e logs are written next to that file.
+    held-out test split, and appends one row per run to a CSV results
+    file: model, scaling and dataset, then every metric the test
+    reports, which is test_loss for a regression model and test_loss,
+    test_acc (accuracy) and test_auc (ROC-AUC) for a classifier.  The
+    job's .o/.e logs are written next to that file.
 
     Args:
         checkpoint_path: Path to the .ckpt model checkpoint.
@@ -2561,8 +2786,8 @@ _SCALING_METHODS = ("standardize", "normalize", "none")
 _ARCH_NOTES = {
     "BPNetReal": "Count head only: predicts one scalar per sequence, no profile track.",
     "EquiNet": "Needs the optional equirc package on the training node (pip install equirc).",
-    "FlexibleMLP": "input_length is set to 4 x window: the MLP sizes its first layer "
-                   "from the flattened one-hot input.",
+    "FlexibleMLP": "input_length is set to 4 x window: the MLP flattens the one-hot "
+                   "(batch, 4, window) input and sizes its first layer from input_length.",
     "MultiCNN": "forward(x, x_num) needs a numerical covariate tensor, which "
                 "TFBSDataModule does not supply; training with this config fails "
                 "until a data module provides covariates.",
@@ -2620,7 +2845,7 @@ def _window_args(model_type: str, window: int) -> dict[str, int]:
 async def tfbs_config(
     model_type: str,
     data_path: str,
-    output_path: str,
+    output_path: str | None = None,
     input_length: int | None = None,
     scaling_method: str | None = None,
     batch_size: int = 64,
@@ -2658,7 +2883,8 @@ async def tfbs_config(
       FlexibleCNN CNN with global max pooling, per-layer channels/kernels.
       my_cnn      small two-layer CNN from early experiments.
       MLP         fully connected baseline on the flattened one-hot input.
-      FlexibleMLP MLP with dropout; input_length is set to 4 x window.
+      FlexibleMLP MLP with dropout on the flattened one-hot input;
+                  input_length is set to 4 x window.
       EquiNet     reverse-complement equivariant network; needs equirc.
       MultiCNN    CNN plus numerical covariates; the default data module
                   does not supply covariates, so it cannot train as is.
@@ -2685,16 +2911,26 @@ async def tfbs_config(
         slow early progress.
       learning_rate 0.001: the Adam default step size, a safe start
         because Adam adapts per-parameter steps from there.
-      checkpoint_dir: saved_models/<data_name>/<scaling_method>, with
-        filename best_<model_type>, because tfbs_remap_validation and
-        tfbs_chipseq_benchmark look for
-        <models_dir>/<dataset>/standardize/best_<model_type>.ckpt.
+      checkpoint_dir: <project root>/saved_models/<data_name>/
+        <scaling_method>, with filename best_<model_type>, because
+        tfbs_chipseq_benchmark, tfbs_chipseq_method_comparison and
+        tfbs_remap_validation look for
+        <models_dir>/<dataset>/<scaling_method>/best_<model_type>.ckpt
+        (and fall back to the one <dataset>/*/best_<model_type>.ckpt).
+        data_name is the dataset directory's name without a trailing
+        _dataset, so tfbs_prepare_dataset's peaks_dataset/ trains to
+        saved_models/peaks/.  The result's checkpoint_path is the file
+        training will write; pass it to tfbs_load_model and
+        tfbs_validate.
+      output_path: <name>_config/<model_type>.yaml next to the dataset
+        directory (<name> as for data_name), like the other data tools'
+        outputs, so configs never land inside the dataset.
 
     Args:
         model_type: Architecture name (see list above).
         data_path: Dataset directory with train/val/test seqs.pt and
                    labels.pt (as written by tfbs_prepare_dataset).
-        output_path: Where to write the YAML config file.
+        output_path: Where to write the YAML config file (default above).
         input_length: Sequence window in bp (default: from the dataset).
         scaling_method: "standardize", "normalize" or "none" (default:
                         standardize for regression, none for classify).
@@ -2714,8 +2950,9 @@ async def tfbs_config(
                       unknown key returns the allowed keys).
 
     Returns:
-        JSON with "output_path", "model_type", "input_length",
-        "input_length_source" ("argument" or "dataset"),
+        JSON with "output_path", "checkpoint_path" (the .ckpt training
+        will write), "files" (config and checkpoint), "model_type",
+        "input_length", "input_length_source" ("argument" or "dataset"),
         "scaling_method", "model_init_args", "config_preview" (first 40
         lines), and "notes"/"warning" when they apply.
     """
@@ -2808,10 +3045,13 @@ async def tfbs_config(
     model_args["classify"] = classify
 
     data_name = data.name
+    if data_name.endswith("_dataset") and len(data_name) > len("_dataset"):
+        data_name = data_name[: -len("_dataset")]
     ckpt_dir = checkpoint_dir or str(
         _project_root() / "saved_models" / data_name / scaling_method
     )
     ckpt_filename = checkpoint_filename or f"best_{model_type}"
+    checkpoint_path = Path(ckpt_dir).expanduser().resolve() / f"{ckpt_filename}.ckpt"
 
     callbacks = [
         {
@@ -2869,9 +3109,12 @@ async def tfbs_config(
         },
     }
 
-    out = Path(output_path).resolve()
+    if output_path:
+        out = Path(output_path).expanduser().resolve()
+    else:
+        out = _sibling_dir(data / "train", "config") / f"{model_type}.yaml"
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w") as f:
+    with open(out, "w", newline="\n") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     with open(out) as f:
@@ -2880,6 +3123,8 @@ async def tfbs_config(
 
     result: dict[str, Any] = {
         "output_path": str(out),
+        "checkpoint_path": str(checkpoint_path),
+        "files": {"config": str(out), "checkpoint": str(checkpoint_path)},
         "model_type": model_type,
         "input_length": input_length,
         "input_length_source": length_source,
@@ -3006,7 +3251,8 @@ async def tfbs_extract_loci(
         JSON with output_dir and files (every path written).  With a
         BED: shape, num_peaks_input, num_peaks_extracted, num_filtered_n
         (windows with a non-ACGT base), num_filtered_bounds (unknown
-        chromosome or window off the end), has_scores and
+        chromosome or window off the end), num_filtered_score (peaks
+        whose score_column value is missing or NaN), has_scores and
         sequences_path.  With negatives: negatives_path and negatives
         (mode, num_negatives, num_positives; for gc_matched also
         gc_bin_width, positive_gc_mean, negative_gc_mean, shortfall,
@@ -3097,6 +3343,7 @@ async def tfbs_extract_loci(
             "num_peaks_extracted": int(X_pos.shape[0]),
             "num_filtered_n": peaks["num_filtered_n"],
             "num_filtered_bounds": peaks["num_filtered_bounds"],
+            "num_filtered_score": peaks["num_filtered_score"],
             "has_scores": has_scores,
             "sequences_path": files["sequences"],
         })
@@ -3196,7 +3443,7 @@ def _extract_bed_windows(bed, genome, chrom_lengths, in_window, max_sequences,
     seqs: list[str] = []
     windows: list[tuple[str, int, int]] = []
     kept_scores: list[float] = []
-    n_bounds = n_bad = 0
+    n_bounds = n_bad = n_nan = 0
     for k in order:
         chrom = chroms[k]
         if chrom not in chrom_lengths:
@@ -3209,7 +3456,7 @@ def _extract_bed_windows(bed, genome, chrom_lengths, in_window, max_sequences,
             n_bounds += 1
             continue
         if scores_raw is not None and _np.isnan(scores_raw[k]):
-            n_bad += 1
+            n_nan += 1
             continue
         seq = genome[chrom][ws:we].seq.upper()
         if seq.strip("ACGT"):
@@ -3228,6 +3475,7 @@ def _extract_bed_windows(bed, genome, chrom_lengths, in_window, max_sequences,
             num_peaks_input=num_input,
             num_filtered_bounds=n_bounds,
             num_filtered_n=n_bad,
+            num_filtered_score=n_nan,
         )
     return {
         "seqs": seqs,
@@ -3236,6 +3484,7 @@ def _extract_bed_windows(bed, genome, chrom_lengths, in_window, max_sequences,
         "num_input": num_input,
         "num_filtered_n": n_bad,
         "num_filtered_bounds": n_bounds,
+        "num_filtered_score": n_nan,
         "bed_intervals": list(zip(chroms.tolist(), starts.tolist(), ends.tolist())),
     }
 
@@ -3457,8 +3706,9 @@ async def tfbs_prepare_dataset(
       output_dir: <name>_dataset/ next to the input's directory, with
         <name> that directory's name minus a _loci, _classification or
         _regression suffix (peaks_classification/sequences.pt ->
-        peaks_dataset/), so tfbs_config names the checkpoint after the
-        peak set.
+        peaks_dataset/).  tfbs_config drops the _dataset suffix again,
+        so the checkpoint is named after the peak set
+        (saved_models/peaks/...).
 
     Args:
         sequences_path: Path to sequences.pt tensor (N, 4, L).
@@ -3850,11 +4100,17 @@ async def tfbs_seqlets(
         return _error("tangermeme required.", "Install with: pip install 'tfbs-mcp[viz]'")
 
     _ensure_imports()
+    if not sequences:
+        return _no_sequences_error(
+            "tfbs_seqlets",
+            "Pass the DNA sequences to call seqlets in as sequences (A/C/G/T, "
+            "one length); this tool takes them inline only.",
+        )
     X, _, err = _load_sequence_input(sequences, None)
     if err:
         return err
 
-    entry, err = _model_entry(model_id)
+    entry, err = _get_model(model_id)
     if err:
         return err
     model = entry["model"]
@@ -4004,25 +4260,31 @@ async def tfbs_epistasis(
                     mutant: position, ref_base, base, prediction, delta)
                     and epistasis_matrix.csv (one row per double mutant:
                     pos_i, ref_i, base_i, pos_j, ref_j, base_j,
-                    prediction, delta_delta).  Default
+                    prediction, delta_delta; earlier versions wrote only
+                    the top interactions, as epistasis_top.csv).  Default
                     <results>/<model_id>/tfbs_epistasis/<digest>/, with
                     <results> the results_dir of tfbs_server_info and
                     <digest> a hash of the sequence and positions.
 
     Returns:
-        JSON with original_prediction, num_positions, num_pairs_analyzed
-        (position pairs), num_double_mutants, top_interactions (double
-        mutants with |delta_delta| > 1e-6, sorted by |delta_delta|,
-        capped at 500, same fields as epistasis_matrix.csv), output_dir
-        and a "files" object holding the paths of single_mutations and
+        JSON with original_prediction, num_positions,
+        num_pairs_analyzed (the number of double mutants scored, 9 per
+        position pair), num_double_mutants (the same number),
+        num_position_pairs, top_interactions (double mutants with
+        |delta_delta| > 1e-6, sorted by |delta_delta|, capped at 500,
+        same fields as epistasis_matrix.csv), output_dir and a "files"
+        object holding the paths of single_mutations and
         epistasis_matrix.
     """
     _ensure_imports()
+    if not sequence:
+        return _error("tfbs_epistasis got no sequence.",
+                      "Pass one DNA sequence (A/C/G/T) as sequence.")
     X, _, err = _load_sequence_input([sequence], None)
     if err:
         return err
 
-    entry, err = _model_entry(model_id)
+    entry, err = _get_model(model_id)
     if err:
         return err
     model = entry["model"]
@@ -4089,8 +4351,9 @@ async def tfbs_epistasis(
     result: dict[str, Any] = {
         "original_prediction": round(y_orig, 6),
         "num_positions": len(pos),
-        "num_pairs_analyzed": len(pos) * (len(pos) - 1) // 2,
+        "num_pairs_analyzed": len(doubles),
         "num_double_mutants": len(doubles),
+        "num_position_pairs": len(pos) * (len(pos) - 1) // 2,
         "top_interactions": [
             {**r, "prediction": round(r["prediction"], 6),
              "delta_delta": round(r["delta_delta"], 6)}
@@ -4156,16 +4419,24 @@ async def tfbs_conv_filters(
     not bases, so they get the activation summary only.  Filters whose
     maximum activation is not positive get no PFM.
 
+    A window that reaches past the ends of the input (padding) contributes
+    only its in-bounds columns, and each PFM column is averaged over the
+    windows that cover it; columns no window covers are dropped, so the
+    PFM can be narrower than the kernel.  When a layer's receptive span
+    (dilation x (kernel_size - 1) + 1) is longer than the input, e.g. a
+    42-wide kernel on 24 bp windows, every window is clipped this way and
+    the result carries a "warning" naming that receptive field.
+
     Writes to output_dir:
       filter_summary.json: one record per analysed filter (layer,
         filter_id, kernel_size, max_activation, num_activating,
-        pfm_sites, in_meme).
+        pfm_sites, pfm_width, in_meme).
       filters.meme: the PFMs in MEME format (one MOTIF <layer>_f<id>
         per filter with a PFM; letter-probability rows, nsites = the
         number of windows averaged), ready for TOMTOM against JASPAR.
       top_subsequences.json: per filter, the top_k_subsequences input
         windows with the highest activation (sequence_index, start,
-        activation, subsequence).
+        activation, subsequence; the in-bounds part of the window).
 
     Args:
         model_id: Identifier of a loaded model.
@@ -4180,15 +4451,22 @@ async def tfbs_conv_filters(
     Returns:
         JSON with output_dir, files (filter_summary, meme,
         top_subsequences), num_layers, num_filters_analyzed,
-        num_pfms (MOTIFs in the MEME file) and filter_summary (first
-        100 records).
+        num_pfms (MOTIFs in the MEME file), filter_summary (first 100
+        records) and, when a layer that reads the input has a receptive
+        span longer than the input, "warning".
     """
     _ensure_imports()
+    if not sequences:
+        return _no_sequences_error(
+            "tfbs_conv_filters",
+            "Pass DNA sequences to summarise the filters on as sequences "
+            "(A/C/G/T, the model's input length), e.g. a few hundred peak windows.",
+        )
     X, _, err = _load_sequence_input(sequences, None)
     if err:
         return err
 
-    entry, err = _model_entry(model_id)
+    entry, err = _get_model(model_id)
     if err:
         return err
     model = entry["model"]
@@ -4237,6 +4515,7 @@ async def tfbs_conv_filters(
     filter_summary = []
     meme_blocks = []
     top_subsequences = []
+    oversized: list[str] = []
     for layer_name, module in conv_layers:
         if layer_name not in activations:
             continue
@@ -4251,12 +4530,18 @@ async def tfbs_conv_filters(
             pad = module.padding[0]
         span = dilation * (kernel_size - 1) + 1
         on_input = reads_input.get(layer_name, False)
+        if on_input and span > L:
+            oversized.append(f"{layer_name} (receptive field {span} bp: kernel "
+                             f"{kernel_size}, dilation {dilation})")
+        offsets = _np.arange(kernel_size) * dilation
 
         def _window(seq_idx: int, out_pos: int):
-            s = out_pos * stride - pad
-            if s < 0 or s + span > L:
+            """(kernel columns inside the input, their input positions), or None."""
+            cols = out_pos * stride - pad + offsets
+            inside = (cols >= 0) & (cols < L)
+            if not inside.any():
                 return None
-            return X_cpu[seq_idx, :, s:s + span:dilation], s
+            return _np.flatnonzero(inside), cols[inside]
 
         for f_idx in range(n_filters):
             f_act = act[:, f_idx, :]  # (N, L_out)
@@ -4266,24 +4551,31 @@ async def tfbs_conv_filters(
             n_activating = int(high_mask.sum())
 
             pfm_sites = 0
+            pfm_width = 0
             in_meme = False
             if on_input and max_act > 0:
-                pfm = _np.zeros((4, kernel_size))
+                counts = _np.zeros((4, kernel_size))
+                coverage = _np.zeros(kernel_size)
                 for seq_idx in range(f_act.shape[0]):
                     for p in _torch.where(high_mask[seq_idx])[0][:10].tolist():
                         w = _window(seq_idx, p)
-                        if w is not None:
-                            pfm += w[0].numpy()
-                            pfm_sites += 1
-                if pfm_sites:
-                    pfm /= pfm_sites
+                        if w is None:
+                            continue
+                        kcols, positions = w
+                        counts[:, kcols] += X_cpu[seq_idx][:, _torch.as_tensor(positions)].numpy()
+                        coverage[kcols] += 1
+                        pfm_sites += 1
+                covered = _np.flatnonzero(coverage)
+                if pfm_sites and covered.size:
+                    pfm = counts[:, covered] / coverage[covered]
+                    pfm_width = int(covered.size)
                     motif = f"{_safe_name(layer_name)}_f{f_idx}"
                     rows = "\n".join(
-                        " " + " ".join(f"{v:.6f}" for v in pfm[:, j]) for j in range(kernel_size)
+                        " " + " ".join(f"{v:.6f}" for v in pfm[:, j]) for j in range(pfm_width)
                     )
                     meme_blocks.append(
                         f"MOTIF {motif}\n"
-                        f"letter-probability matrix: alength= 4 w= {kernel_size} "
+                        f"letter-probability matrix: alength= 4 w= {pfm_width} "
                         f"nsites= {pfm_sites} E= 0\n{rows}\n"
                     )
                     in_meme = True
@@ -4298,11 +4590,13 @@ async def tfbs_conv_filters(
                     w = _window(seq_idx, p)
                     if w is None:
                         continue
+                    positions = w[1]
                     top.append({
                         "sequence_index": seq_idx,
-                        "start": w[1],
+                        "start": int(positions[0]),
                         "activation": round(float(flat[k]), 4),
-                        "subsequence": _tensor_to_sequences(w[0].unsqueeze(0))[0],
+                        "subsequence": _tensor_to_sequences(
+                            X_cpu[seq_idx][:, _torch.as_tensor(positions)].unsqueeze(0))[0],
                     })
                 top_subsequences.append({"layer": layer_name, "filter_id": f_idx, "top": top})
 
@@ -4313,6 +4607,7 @@ async def tfbs_conv_filters(
                 "num_activating": n_activating,
                 "kernel_size": kernel_size,
                 "pfm_sites": pfm_sites,
+                "pfm_width": pfm_width,
                 "in_meme": in_meme,
             })
 
@@ -4332,14 +4627,66 @@ async def tfbs_conv_filters(
     with open(files["top_subsequences"], "w") as f:
         json.dump(top_subsequences, f, indent=2)
 
-    return json.dumps({
+    result: dict[str, Any] = {
         "output_dir": str(out),
         "files": files,
         "num_layers": len(conv_layers),
         "num_filters_analyzed": len(filter_summary),
         "num_pfms": len(meme_blocks),
         "filter_summary": filter_summary[:100],
-    })
+    }
+    if oversized:
+        result["warning"] = (
+            f"The receptive field of {'; '.join(oversized)} is longer than the "
+            f"{L} bp input, so every window is clipped to the input: the PFMs "
+            "hold only the kernel columns that fall on sequence, and each column "
+            "is averaged over the windows that cover it."
+        )
+    return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints of the benchmark and validation tools
+# ---------------------------------------------------------------------------
+def _benchmark_checkpoints(
+    models_dir: str, datasets: list[str], model_type: str, scaling_method: str,
+    checkpoints: dict[str, str] | None, project_root: Path,
+) -> tuple[dict[str, str] | None, str | None]:
+    """({dataset: absolute checkpoint path}, None) or (None, error JSON)."""
+    from tfbs.pipelines.checkpoints import resolve_checkpoints
+
+    if scaling_method not in _SCALING_METHODS:
+        return None, _error(f"Unknown scaling_method '{scaling_method}'.",
+                            f"Use one of: {list(_SCALING_METHODS)}.")
+
+    def _absolute(path: str) -> Path:
+        q = Path(path).expanduser()
+        return q if q.is_absolute() else project_root / q
+
+    explicit = {name: str(_absolute(path)) for name, path in (checkpoints or {}).items()}
+    found, problems = resolve_checkpoints(
+        _absolute(models_dir), datasets, model_type, scaling_method, explicit or None,
+    )
+    if problems:
+        several = [p for p in problems if len(p["candidates"]) > 1]
+        fix = ("Pass checkpoints={dataset: path} to name each checkpoint, "
+               "or point models_dir and datasets at <models_dir>/<dataset>/"
+               "<scaling_method>/best_<model_type>.ckpt (tfbs_config reports "
+               "the checkpoint_path it trains to).")
+        if several:
+            fix = ("Several checkpoints match: pass scaling_method naming the "
+                   "folder to use, or checkpoints={dataset: path}. " + fix)
+        return None, _error(
+            "No single checkpoint for "
+            + ", ".join(p["dataset"] for p in problems) + ".",
+            fix,
+            checkpoint_problems=problems,
+        )
+    return {name: str(path.resolve()) for name, path in found.items()}, None
+
+
+def _checkpoint_args(found: dict[str, str]) -> list[str]:
+    return ["--checkpoints", *[f"{name}={path}" for name, path in found.items()]]
 
 
 # ---------------------------------------------------------------------------
@@ -4370,6 +4717,8 @@ async def tfbs_chipseq_benchmark(
     slurm: bool = False,
     partition: str | None = None,
     max_time: str = "04:00:00",
+    scaling_method: str = "standardize",
+    checkpoints: dict[str, str] | None = None,
 ) -> str:
     """Run ChIP-seq benchmark analysis comparing NN models against ChIP-Atlas data.
 
@@ -4389,7 +4738,16 @@ async def tfbs_chipseq_benchmark(
         model_type: Architecture class name (default VCNNBpnet).
         models_dir: Base checkpoint directory; a relative path resolves
             against the project root (TFBS_PROJECT_ROOT, see
-            tfbs_server_info), where the pipeline runs.
+            tfbs_server_info), where the pipeline runs.  Each dataset's
+            checkpoint is <models_dir>/<dataset>/<scaling_method>/
+            best_<model_type>.ckpt, the layout tfbs_config writes; when
+            that file is missing, the one <dataset>/*/best_<model_type>.ckpt
+            is used if there is exactly one.
+        scaling_method: Folder of the checkpoint under each dataset
+            (default "standardize", the regression models of the NKX2-1
+            study; a classifier from tfbs_config is under "none").
+        checkpoints: Explicit {dataset name: .ckpt path}; replaces the
+            models_dir lookup, and its names replace datasets.
         genome_fasta: Reference genome FASTA path. Falls back to
             $TFBS_GENOME_FASTA.
         max_sequences: Max sequences per TF for speed.
@@ -4404,7 +4762,8 @@ async def tfbs_chipseq_benchmark(
         max_time: SLURM wall time.
 
     Returns:
-        JSON with output_dir and list of generated files, or job_id if SLURM.
+        JSON with output_dir, checkpoints (the file used per dataset) and
+        the list of generated files, or job_id if SLURM.
     """
     if neg_tfs is None:
         neg_tfs = ["GATA1", "MYOD1", "NKX2-5", "RXRA"]
@@ -4427,6 +4786,10 @@ async def tfbs_chipseq_benchmark(
     project_root, err = _work_dir()
     if err:
         return err
+    found, err = _benchmark_checkpoints(
+        models_dir, datasets, model_type, scaling_method, checkpoints, project_root)
+    if err:
+        return err
 
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -4439,10 +4802,9 @@ async def tfbs_chipseq_benchmark(
         "--output-dir", str(out),
         "--pos-tf", pos_tf,
         "--neg-tfs", *neg_tfs,
-        "--datasets", *datasets,
         "--cutoffs", *[str(c) for c in cutoffs],
         "--model-type", model_type,
-        "--models-dir", models_dir,
+        *_checkpoint_args(found),
         "--genome", str(genome_path),
         "--max-sequences", str(max_sequences),
         "--device", device,
@@ -4474,6 +4836,7 @@ async def tfbs_chipseq_benchmark(
         ))
         submit_result["mode"] = "slurm"
         submit_result["command"] = cmd
+        submit_result["checkpoints"] = found
         return json.dumps(submit_result)
 
     result, err = _run_pipeline(cmd_parts, project_root, 3600, "Benchmark")
@@ -4495,6 +4858,7 @@ async def tfbs_chipseq_benchmark(
     return json.dumps({
         "mode": "direct",
         "output_dir": str(out),
+        "checkpoints": found,
         "files": files,
         "stdout": result.stdout[-500:],
     })
@@ -4530,6 +4894,8 @@ async def tfbs_chipseq_method_comparison(
     slurm: bool = True,
     partition: str | None = None,
     max_time: str = "12:00:00",
+    scaling_method: str = "standardize",
+    checkpoints: dict[str, str] | None = None,
 ) -> str:
     """Compare NN, FIMO (JASPAR PWM), and FoldX (TF-DNA crystal) for
     distinguishing positive TF peaks from negative TF peaks.
@@ -4557,7 +4923,16 @@ async def tfbs_chipseq_method_comparison(
         model_type: Model architecture class name.
         models_dir: Base checkpoint directory; a relative path resolves
             against the project root (TFBS_PROJECT_ROOT, see
-            tfbs_server_info), where the pipeline runs.
+            tfbs_server_info), where the pipeline runs.  Each dataset's
+            checkpoint is <models_dir>/<dataset>/<scaling_method>/
+            best_<model_type>.ckpt, the layout tfbs_config writes; when
+            that file is missing, the one <dataset>/*/best_<model_type>.ckpt
+            is used if there is exactly one.
+        scaling_method: Folder of the checkpoint under each dataset
+            (default "standardize", the regression models of the NKX2-1
+            study; a classifier from tfbs_config is under "none").
+        checkpoints: Explicit {dataset name: .ckpt path}; replaces the
+            models_dir lookup, and its names replace datasets.
         genome_fasta: Reference genome FASTA. Falls back to
             $TFBS_GENOME_FASTA.
         n_per_tf: Sequences sampled per TF (FoldX bottleneck).
@@ -4573,7 +4948,8 @@ async def tfbs_chipseq_method_comparison(
         max_time: SLURM wall time.
 
     Returns:
-        JSON with output_dir, file list, and (if slurm) job_id.
+        JSON with output_dir, checkpoints (the file used per dataset),
+        file list, and (if slurm) job_id.
     """
     if neg_tfs is None:
         neg_tfs = ["GATA1", "MYOD1", "NKX2-5", "RXRA"]
@@ -4597,6 +4973,10 @@ async def tfbs_chipseq_method_comparison(
     project_root, err = _work_dir()
     if err:
         return err
+    found, err = _benchmark_checkpoints(
+        models_dir, datasets, model_type, scaling_method, checkpoints, project_root)
+    if err:
+        return err
 
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -4612,8 +4992,7 @@ async def tfbs_chipseq_method_comparison(
         "--foldx-pdb", str(foldx_path),
         "--pos-tf", pos_tf,
         "--neg-tfs", *neg_tfs,
-        "--datasets", *datasets,
-        "--models-dir", models_dir,
+        *_checkpoint_args(found),
         "--model-type", model_type,
         "--n-per-tf", str(n_per_tf),
         "--foldx-workers", str(foldx_workers),
@@ -4647,6 +5026,7 @@ async def tfbs_chipseq_method_comparison(
         submit_result["mode"] = "slurm"
         submit_result["command"] = cmd
         submit_result["output_dir"] = str(out)
+        submit_result["checkpoints"] = found
         return json.dumps(submit_result)
 
     result, err = _run_pipeline(cmd_parts, project_root, 43200, "Method comparison")
@@ -4662,7 +5042,7 @@ async def tfbs_chipseq_method_comparison(
         })
     files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
     return json.dumps({
-        "mode": "direct", "output_dir": str(out),
+        "mode": "direct", "output_dir": str(out), "checkpoints": found,
         "files": files, "stdout": result.stdout[-1000:],
     })
 
@@ -4702,6 +5082,8 @@ async def tfbs_remap_validation(
     slurm: bool = True,
     partition: str | None = None,
     max_time: str = "12:00:00",
+    scaling_method: str = "standardize",
+    checkpoints: dict[str, str] | None = None,
 ) -> str:
     """External validation of a TFBS model against a ReMap peak set.
 
@@ -4739,7 +5121,16 @@ async def tfbs_remap_validation(
         model_type: Model architecture class name.
         models_dir: Base checkpoint directory; a relative path resolves
             against the project root (TFBS_PROJECT_ROOT, see
-            tfbs_server_info), where the pipeline runs.
+            tfbs_server_info), where the pipeline runs.  Each dataset's
+            checkpoint is <models_dir>/<dataset>/<scaling_method>/
+            best_<model_type>.ckpt, the layout tfbs_config writes; when
+            that file is missing, the one <dataset>/*/best_<model_type>.ckpt
+            is used if there is exactly one.
+        scaling_method: Folder of the checkpoint under each dataset
+            (default "standardize", the regression models of the NKX2-1
+            study; a classifier from tfbs_config is under "none").
+        checkpoints: Explicit {dataset name: .ckpt path}; replaces the
+            models_dir lookup, and its names replace datasets.
         genome_fasta: Reference genome FASTA. Falls back to
             $TFBS_GENOME_FASTA.
         foldx_workers: Parallel CPU workers for FoldX.
@@ -4759,8 +5150,8 @@ async def tfbs_remap_validation(
         max_time: SLURM wall time.
 
     Returns:
-        JSON with output_dir, file list, and either job_id (slurm=true)
-        or the parsed AUC summary (slurm=false, summary.csv read back
+        JSON with output_dir, checkpoints (the file used per dataset),
+        file list, and either job_id (slurm=true) or the parsed AUC summary (slurm=false, summary.csv read back
         as a list of {method, auc, n_pos, n_neg} entries).
     """
     if datasets is None:
@@ -4786,6 +5177,10 @@ async def tfbs_remap_validation(
     project_root, err = _work_dir()
     if err:
         return err
+    found, err = _benchmark_checkpoints(
+        models_dir, datasets, model_type, scaling_method, checkpoints, project_root)
+    if err:
+        return err
 
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -4801,8 +5196,7 @@ async def tfbs_remap_validation(
         "--score-min", str(score_min),
         "--max-positives", str(max_positives),
         "--negative-mode", negative_mode,
-        "--datasets", *datasets,
-        "--models-dir", models_dir,
+        *_checkpoint_args(found),
         "--model-type", model_type,
         "--device", device,
         "--seed", str(seed),
@@ -4844,6 +5238,7 @@ async def tfbs_remap_validation(
         submit_result["command"] = cmd
         submit_result["output_dir"] = str(out)
         submit_result["expected_summary"] = str(out / "summary.csv")
+        submit_result["checkpoints"] = found
         return json.dumps(submit_result)
 
     result, err = _run_pipeline(cmd_parts, project_root, 43200, "ReMap validation")
@@ -4882,6 +5277,7 @@ async def tfbs_remap_validation(
     return json.dumps({
         "mode": "direct",
         "output_dir": str(out),
+        "checkpoints": found,
         "files": files,
         "summary": summary,
         "stdout": result.stdout[-1000:],

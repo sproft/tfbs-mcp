@@ -18,6 +18,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import torch
 
 import tfbs.configs
 import tfbs.pipelines
@@ -167,6 +168,7 @@ def test_built_wheel_contains_the_pipelines_and_templates(tmp_path):
     for pipeline in PIPELINES:
         assert f"tfbs/pipelines/{pipeline}.py" in names
     assert "tfbs/pipelines/__init__.py" in names
+    assert "tfbs/pipelines/checkpoints.py" in names
     assert "tfbs/configs/__init__.py" in names
     templates = {n for n in names if n.startswith("tfbs/configs/models/") and n.endswith(".yaml")}
     assert len(templates) == len(list((REPO / "tfbs" / "configs" / "models").glob("*.yaml")))
@@ -215,11 +217,23 @@ def refs(tmp_path, monkeypatch):
         files[name] = str(path)
     (tmp_path / "intersect").mkdir()
     files["intersect"] = str(tmp_path / "intersect")
+    files["models_dir"] = str(_fake_checkpoints(tmp_path / "models"))
     return files
+
+
+def _fake_checkpoints(models, datasets=("all_mean", "core_mean", "flank_mean"),
+                      scaling="standardize", model="VCNNBpnet"):
+    for dataset in datasets:
+        ckpt = models / dataset / scaling / f"best_{model}.ckpt"
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        ckpt.write_text("x")
+    return models
 
 
 def _call(tool, files, tmp_path, **kwargs):
     out = str(tmp_path / f"out_{tool}")
+    if tool != "disease_variant_validation" and "checkpoints" not in kwargs:
+        kwargs.setdefault("models_dir", files["models_dir"])
     if tool == "chipseq_benchmark":
         return run(server.tfbs_chipseq_benchmark(
             intersect_dir=files["intersect"], output_dir=out,
@@ -510,3 +524,112 @@ def test_sweep_agent_uses_the_wandb_entity_from_the_environment(entity, monkeypa
     assert kwargs["entity"] == entity
     assert kwargs["count"] == 3
     assert kwargs["function"].args[0]["data_path"] == "/d"
+
+
+# ---------------------------------------------------------------------------
+# Old call signatures and the validation CSV
+# ---------------------------------------------------------------------------
+
+def _load_shim(name):
+    import importlib.util as iu
+
+    spec = iu.spec_from_file_location(f"shim_{name}", REPO / SHIMS[name])
+    module = iu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("name, runner", [("validate", "run"), ("run_sweep", "run_agent")])
+def test_shim_main_still_accepts_a_namespace(name, runner, monkeypatch):
+    import argparse
+
+    pipeline = importlib.import_module(f"tfbs.pipelines.{name}")
+    seen = []
+    monkeypatch.setattr(pipeline, runner, seen.append)
+    args = argparse.Namespace(anything=1)
+    _load_shim(name).main(args)
+    assert seen == [args]
+
+
+def test_validate_main_still_parses_a_list(monkeypatch, tmp_path):
+    from tfbs.pipelines import validate
+
+    seen = []
+    monkeypatch.setattr(validate, "run", seen.append)
+    validate.main(["--checkpoint_path", "c.ckpt", "--output_file", "o.csv",
+                   "--data_path", str(tmp_path)])
+    assert seen[0].checkpoint_path == "c.ckpt" and seen[0].scaling_method == "standardize"
+
+
+def _args(tmp_path, **kw):
+    import argparse
+
+    base = dict(model_name="VCNNBpnet", scaling_method="none",
+                data_path=str(tmp_path / "peaks_dataset") + os.sep,
+                output_file=str(tmp_path / "results.csv"))
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _csv_rows(path):
+    import csv
+
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def test_validate_appends_every_test_metric_of_a_classifier(tmp_path):
+    from tfbs.pipelines import validate
+
+    validate.save_results(_args(tmp_path), {"test_loss": 0.4, "test_acc": 0.81, "test_auc": 0.9})
+    rows = _csv_rows(tmp_path / "results.csv")
+    assert rows == [{"modeltype": "VCNNBpnet", "scaling_method": "none",
+                     "dataset_path": "peaks_dataset", "test_loss": "0.4",
+                     "test_acc": "0.81", "test_auc": "0.9"}]
+
+
+def test_validate_widens_an_older_csv_and_keeps_its_rows(tmp_path):
+    from tfbs.pipelines import validate
+
+    validate.save_results(_args(tmp_path, scaling_method="standardize"), 1.5)
+    validate.save_results(_args(tmp_path), {"test_loss": 0.4, "test_acc": 0.8, "test_auc": 0.9})
+    rows = _csv_rows(tmp_path / "results.csv")
+    assert [r["test_loss"] for r in rows] == ["1.5", "0.4"]
+    assert rows[0]["test_auc"] == "" and rows[1]["test_auc"] == "0.9"
+    validate.save_results(_args(tmp_path), {"test_loss": 0.3})
+    assert len(_csv_rows(tmp_path / "results.csv")) == 3
+
+
+def test_validate_run_saves_the_metrics_trainer_test_reports(tmp_path, monkeypatch):
+    from tfbs.pipelines import validate
+
+    class DM:
+        def __init__(self, **kw):
+            self.train_dataset = [(torch.zeros(4, 24), torch.zeros(1))]
+
+        def setup(self, stage=None):
+            pass
+
+    class Model:
+        @classmethod
+        def load_from_checkpoint(cls, **kw):
+            return cls()
+
+        def eval(self):
+            return self
+
+    class Trainer:
+        def __init__(self, **kw):
+            pass
+
+        def test(self, model, datamodule=None, verbose=True):
+            return [{"test_loss": 0.2, "test_acc": 0.75, "test_auc": 0.85}]
+
+    monkeypatch.setattr(validate, "TFBSDataModule", DM)
+    monkeypatch.setattr(validate, "get_model_class", lambda name: Model)
+    monkeypatch.setattr(validate.pl, "Trainer", Trainer)
+    args = _args(tmp_path, checkpoint_path="x.ckpt", batch_size=8, num_workers=0,
+                 preprocess=False)
+    validate.run(args)
+    row = _csv_rows(tmp_path / "results.csv")[0]
+    assert (row["test_loss"], row["test_acc"], row["test_auc"]) == ("0.2", "0.75", "0.85")

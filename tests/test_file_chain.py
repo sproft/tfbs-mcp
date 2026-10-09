@@ -534,7 +534,7 @@ def _descriptions():
     ("tfbs_prepare_regression", ["log2", "standardize"]),
     ("tfbs_config", ["scaling_method", "standardize", "because"]),
     ("tfbs_analyze", ["deepliftshap", "default, because"]),
-    ("tfbs_predict", ["Default false, because"]),
+    ("tfbs_predict", ["Default null, because", "original label units", "explicit opt-out"]),
     ("tfbs_fetch_structure", ["co-crystal", "fallback", "because"]),
     ("tfbs_binding_scan", ["scheduler's default", "because FoldX runs on CPUs"]),
     ("tfbs_disease_variant_validation", ["default \"compute\"", "no GPU"]),
