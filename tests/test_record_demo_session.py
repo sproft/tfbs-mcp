@@ -161,3 +161,44 @@ def test_development_docs_say_how_to_find_the_demo_and_what_figure_2_is():
     assert "namespace package" in text and "`__file__` is `None`" in text
     assert "Figure 2 is the session log recorded this way with the released FLANK checkpoint" in text
     assert demo.__file__ is None and (demo_dir() / "demo_peaks.bed").is_file()
+
+
+def _refs(node):
+    if isinstance(node, dict):
+        if set(node) == {"$ref"}:
+            yield node["$ref"]
+        else:
+            for value in node.values():
+                yield from _refs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _refs(value)
+
+
+def test_figure_2_plan_has_twelve_tool_steps_whose_refs_point_back():
+    plan = json.loads((REPO / "docs" / "demo_session_plan.json").read_text(encoding="utf-8"))
+    tool_steps = [i for i, step in enumerate(plan) if step["role"] == "tool"]
+    assert len(tool_steps) == 12
+    refs = [(i, ref) for i in tool_steps for ref in _refs(plan[i]["arguments"])]
+    assert refs
+    for i, ref in refs:
+        target = int(ref.partition(".")[0])
+        assert target < i and target in tool_steps, (i, ref)
+
+
+def test_development_docs_give_the_command_that_records_figure_2():
+    import re
+
+    plan_text = (REPO / "docs" / "demo_session_plan.json").read_text(encoding="utf-8")
+    text = " ".join((REPO / "docs" / "development.md").read_text(encoding="utf-8").split())
+    section = text.split("The plan behind the application note's Figure 2 is")[1]
+    command = section.split("```bash")[1].split("```")[0]
+    assert '--server "$(which tfbs-mcp)"' in command
+    assert "--plan docs/demo_session_plan.json" in command
+    assert sorted(set(re.findall(r"@([A-Z]+)", plan_text))) == ["DEMO", "RELEASE", "WORK"]
+    for key in ("DEMO", "RELEASE", "WORK"):
+        assert f"--set {key}=" in command, key
+    for flag in ("--out", "--commit", "--env TFBS_PROJECT_ROOT=", "--env TFBS_CALL_LOG=",
+                 "--timeout 900"):
+        assert flag in command, flag
+    assert "zenodo.21399578" in text and "nkx2-1-tfbs-variants" in text

@@ -234,13 +234,36 @@ def _run_foldx_energy(
         return None
 
 
+def _repaired_file(work: Path, input_name: str) -> Path | None:
+    """The file FoldX RepairPDB wrote into ``work``, or None."""
+    expected = work / f"{Path(input_name).stem}_Repair.pdb"
+    if expected.is_file():
+        return expected
+    # Some FoldX versions use different naming
+    others = sorted(p for p in work.glob("*Repair*.pdb") if p.name != input_name)
+    return others[0] if others else None
+
+
+def _repaired_dir(pdb: Path, output_dir: str | None) -> Path:
+    """Where tfbs_binding_energy keeps a repaired structure."""
+    if output_dir:
+        return Path(output_dir).expanduser().resolve()
+    structures = (_server._results_root() / "structures").resolve()
+    if pdb.parent.parent == structures:
+        return pdb.parent
+    return structures / _server._safe_name(pdb.stem)
+
+
+_FOLDX_MISSING = "FoldX binary not found on PATH."
+_FOLDX_MISSING_FIX = (
+    "Install FoldX (https://foldxsuite.crg.eu/, free academic licence), put "
+    "'foldx' or 'foldx5' on the PATH of the MCP server process, and restart "
+    "the server."
+)
+
+
 def _foldx_missing_error() -> str:
-    return _error(
-        "FoldX binary not found on PATH.",
-        "Install FoldX (https://foldxsuite.crg.eu/, free academic licence), put "
-        "'foldx' or 'foldx5' on the PATH of the MCP server process, and restart "
-        "the server.",
-    )
+    return _error(_FOLDX_MISSING, _FOLDX_MISSING_FIX)
 
 
 # ---------------------------------------------------------------------------
@@ -582,19 +605,41 @@ async def tfbs_binding_energy(
     repair: bool = True,
     chains_protein: str = "A",
     chains_dna: str = "C,D",
+    output_dir: str | None = None,
 ) -> str:
     """Compute TF-DNA binding energy with FoldX AnalyseComplex.
+
+    With repair=true (the default) FoldX RepairPDB runs first and the
+    repaired complex is kept as <stem>_Repair.pdb, <stem> being the
+    structure file's name without .pdb.  Its path, returned as
+    ``repaired_structure_path``, is the repaired structure that
+    tfbs_binding_scan (structure_path) and the FoldX legs of
+    tfbs_chipseq_method_comparison, tfbs_remap_validation and
+    tfbs_disease_variant_validation (foldx_pdb, or $TFBS_FOLDX_PDB)
+    expect.
 
     Args:
         structure_path: Path to a PDB file.
         sequences:      Optional DNA sequences (placeholder for future
                         mutation support).
-        repair:         Run FoldX RepairPDB first (recommended).
+        repair:         Run FoldX RepairPDB first and keep the repaired
+                        file (recommended).  Pass false only for a
+                        structure FoldX has already repaired.
         chains_protein: Protein chain ID(s), e.g. ``"A"``.
         chains_dna:     DNA chain ID(s), comma-separated, e.g. ``"C,D"``.
+        output_dir:     Directory for the repaired file.  Default: the
+                        structure's own directory when it lies in
+                        <results>/structures/<id>/, where
+                        tfbs_fetch_structure downloads (<results> is the
+                        results_dir of tfbs_server_info), else
+                        <results>/structures/<stem>/.  A repeated call
+                        overwrites the earlier repaired file.
 
     Returns:
-        JSON with energy components parsed from FoldX output.
+        JSON with ``structure_path`` (the input),
+        ``repaired_structure_path`` (null with repair=false, when the
+        input is scored as given) and the energy components parsed from
+        the FoldX output.
     """
     foldx = _find_foldx()
     if foldx is None:
@@ -618,6 +663,7 @@ async def tfbs_binding_energy(
     stem = pdb.stem
 
     stage = "RepairPDB"
+    kept: Path | None = None
     try:
         # --- RepairPDB -------------------------------------------------
         if repair:
@@ -626,16 +672,28 @@ async def tfbs_binding_energy(
                 f"--pdb={pdb_name}",
                 f"--output-dir={tmpdir}",
             ]
-            subprocess.run(cmd_repair, capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL, cwd=tmpdir, timeout=600)
-            repaired = work / f"{stem}_Repair.pdb"
-            if repaired.is_file():
-                pdb_name = repaired.name
-            else:
-                # Some FoldX versions use different naming
-                for candidate in work.glob("*Repair*.pdb"):
-                    pdb_name = candidate.name
-                    break
+            repair_run = subprocess.run(cmd_repair, capture_output=True, text=True,
+                                        stdin=subprocess.DEVNULL, cwd=tmpdir, timeout=600)
+            repaired = _repaired_file(work, pdb.name)
+            if repaired is None:
+                return _error(
+                    "FoldX RepairPDB wrote no repaired structure",
+                    "Read stderr and stdout; check that the file is a PDB-format "
+                    "TF-DNA complex FoldX can read.",
+                    stderr=repair_run.stderr[-2000:] if repair_run.stderr else "",
+                    stdout=repair_run.stdout[-2000:] if repair_run.stdout else "",
+                )
+            pdb_name = repaired.name
+            kept = _repaired_dir(pdb, output_dir) / f"{stem}_Repair.pdb"
+            try:
+                kept.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(repaired, kept)
+            except OSError as exc:
+                return _error(
+                    f"Cannot save the repaired structure to {kept}: {exc}",
+                    "Pass a writable output_dir, or set TFBS_PROJECT_ROOT to a writable "
+                    "directory (tfbs_server_info reports the results_dir in use).",
+                )
 
         # --- AnalyseComplex --------------------------------------------
         stage = "AnalyseComplex"
@@ -715,6 +773,7 @@ async def tfbs_binding_energy(
 
     return json.dumps({
         "structure_path": str(pdb.resolve()),
+        "repaired_structure_path": str(kept) if kept else None,
         "interaction_energy": energy.get("Interaction Energy", None),
         "backbone_hbond": energy.get("Backbone Hbond", None),
         "sidechain_hbond": energy.get("Sidechain Hbond", None),
@@ -1050,8 +1109,12 @@ async def tfbs_binding_scan(
     structure's DNA inside the window.  Produces a bigWig track.
 
     Args:
-        structure_path: Path to a repaired PDB file of a TF-DNA complex; it
-                        must contain DNA chains (AlphaFold DB models do not).
+        structure_path: Path to a PDB file of a TF-DNA complex that FoldX
+                        RepairPDB has repaired: pass the
+                        repaired_structure_path that tfbs_binding_energy
+                        returns with repair=true, not the file
+                        tfbs_fetch_structure downloaded.  It must contain
+                        DNA chains (AlphaFold DB models do not).
         genome_fasta:   Path to a genome FASTA (an .fai index is built if
                         missing).
         region:         Genomic interval, e.g. ``chr1:1000-2000``.

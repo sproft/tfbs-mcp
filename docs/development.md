@@ -72,7 +72,7 @@ npx -y @modelcontextprotocol/inspector "$(which tfbs-mcp)"
 
 The reference-data variables (`TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE`, `TFBS_FOLDX_PDB`, `TFBS_CLINVAR_VCF`, `TFBS_PROJECT_ROOT`) are read from the server's environment, so export them in the shell before starting the Inspector.
 
-The server imports PyTorch, Lightning, scikit-learn, captum, tangermeme and the genomics libraries before it answers the first message, so it takes a few seconds to start (about 8.5 seconds on a Windows 10 workstation with a CPU build of PyTorch) and every tool call answers at once afterwards. This is required on Windows: a native extension imported for the first time after the stdio loop has started never finishes loading there. A tool that adds a function-level import of a library with native code must add it to `_NATIVE_MODULES` in `tfbs/mcp/server.py`; a test checks this.
+The server imports PyTorch, Lightning, scikit-learn, captum, tangermeme and the genomics libraries before it answers the first message, so starting it takes about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one Windows 10 machine with a CPU build of PyTorch) and every tool call answers at once afterwards. This is required on Windows: a native extension imported for the first time after the stdio loop has started never finishes loading there. A tool that adds a function-level import of a library with native code must add it to `_NATIVE_MODULES` in `tfbs/mcp/server.py`; a test checks this.
 
 ## Recording a session
 
@@ -86,6 +86,19 @@ python scripts/record_demo_session.py --server "$(which tfbs-mcp)" --plan plan.j
 ```
 
 The plan is a JSON list of steps: `{"role": "user", "text": ...}`, `{"role": "llm", "text": ...}` or `{"role": "tool", "tool": ..., "arguments": {...}}`. A tool argument `{"$ref": "3.files.sequences"}` takes that value from the result of step 3. `--set KEY=VALUE` (repeatable) replaces `@KEY` by `VALUE` in every string of the plan before the references are resolved, so one plan runs on any machine, e.g. `"@DEMO/demo_peaks.bed"`. `--env KEY=VALUE` sets a variable for the server; with `TFBS_CALL_LOG` the server's own call log is copied into the recording. A step that fails, such as a `$ref` naming a key the earlier result does not have (the log entry then lists the keys it does have) or an MCP protocol error, is logged as an error entry and the run goes on, and the log is written even when the run crashes.
+
+The plan behind the application note's Figure 2 is `docs/demo_session_plan.json`. It needs three `--set` values: `DEMO`, the demo directory; `RELEASE`, the unpacked Zenodo archive (doi:10.5281/zenodo.21399578) or a clone of the nkx2-1-tfbs-variants repository, from which it loads `models/flank/vcnnbpnet.pt`; and `WORK`, a directory for the files the tools write. Its last call fetches PDB entry 9U19 from RCSB, so it needs internet access. Run from the repository root:
+
+```bash
+RUN=/tmp/figure2 && mkdir -p "$RUN/project" "$RUN/work"
+python scripts/record_demo_session.py --server "$(which tfbs-mcp)" \
+    --plan docs/demo_session_plan.json --out "$RUN/session_log.json" \
+    --commit "$(git rev-parse --short HEAD)" \
+    --env TFBS_PROJECT_ROOT="$RUN/project" --env TFBS_CALL_LOG="$RUN/calls.jsonl" \
+    --set DEMO="$(python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())")" \
+    --set RELEASE=/path/to/nkx2-1-tfbs-variants --set WORK="$RUN/work" \
+    --timeout 900
+```
 
 ## Optional extras
 
@@ -165,6 +178,7 @@ scripts/                  Repo-only scripts (not installed by pip)
 
 docs/development.md       This page
 docs/other-clients.md     Setup for AI apps other than Claude
+docs/demo_session_plan.json The plan behind the application note's Figure 2
 tests/                    pytest suite
 ```
 
@@ -175,4 +189,4 @@ pip install ".[dev,mcp,viz,genomics]"
 pytest
 ```
 
-The `dev` extra is only pytest. The suite imports `tfbs.mcp.server`, so it needs `mcp` to collect at all, and the mutagenesis/marginalize tests exercise real tangermeme (from `viz` or `genomics`). Installing `dev` alone is not enough. Continuous integration runs the suite on Python 3.10 to 3.13 with a CPU-only PyTorch build, followed by `tfbs-mcp --check`.
+The `dev` extra is only pytest. The suite imports `tfbs.mcp.server`, so it needs `mcp` to collect at all, and the mutagenesis/marginalize tests exercise real tangermeme (from `viz` or `genomics`). Installing `dev` alone is not enough. Continuous integration runs on Python 3.10 to 3.13 with a CPU-only PyTorch build: first `tfbs-mcp --check`, then the suite.

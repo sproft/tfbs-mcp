@@ -434,6 +434,96 @@ def test_binding_energy_timeout_returns_error(monkeypatch, tmp_path):
     assert result["fix"]
 
 
+_AC_HEADER = "Pdb\tGroup1\tGroup2\tIntraclashesGroup1\tIntraclashesGroup2\tInteraction Energy\n"
+
+
+@pytest.fixture
+def foldx_cli(fake_foldx, monkeypatch):
+    """subprocess.run stand-in for the FoldX commands tfbs_binding_energy runs.
+
+    RepairPDB writes <stem>_Repair.pdb unless ``state["repair_writes"]`` is
+    False; AnalyseComplex writes an Interaction_*_AC.fxout of -12.5 kcal/mol.
+    """
+    state = {"repair_writes": True, "commands": []}
+
+    def run(cmd, cwd=None, **kwargs):
+        wd = Path(cwd)
+        pdb = next(a.split("=", 1)[1] for a in cmd if a.startswith("--pdb="))
+        command = next(a.split("=", 1)[1] for a in cmd if a.startswith("--command="))
+        state["commands"].append((command, pdb))
+        if command == "RepairPDB" and state["repair_writes"]:
+            (wd / f"{Path(pdb).stem}_Repair.pdb").write_text(
+                (wd / pdb).read_text() + "REMARK repaired\n", newline="\n")
+        elif command == "AnalyseComplex":
+            (wd / f"Interaction_{Path(pdb).stem}_AC.fxout").write_text(
+                _AC_HEADER + f"{pdb}\tA\tC,D\t0\t0\t-12.5\n", newline="\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="no ATOM records")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return state
+
+
+def test_binding_energy_keeps_the_repaired_structure(foldx_cli, tmp_path, monkeypatch):
+    from tfbs.mcp.foldx_tools import tfbs_binding_energy
+
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    local = tmp_path / "inputs"
+    local.mkdir()
+    fetched = tmp_path / "results" / "structures" / "NKX2-1"
+    fetched.mkdir(parents=True)
+    shutil.copy(_make_dna_pdb(str(local)), fetched / "9U19.pdb")
+    for structure, expected in (
+            (local / "complex.pdb", tmp_path / "results" / "structures" / "complex"),
+            (fetched / "9U19.pdb", fetched)):
+        result = _run(tfbs_binding_energy(structure_path=str(structure)))
+        repaired = Path(result["repaired_structure_path"])
+        assert repaired == expected / f"{structure.stem}_Repair.pdb"
+        assert repaired.is_file() and "REMARK repaired" in repaired.read_text()
+        assert result["structure_path"] == str(structure.resolve())
+        assert result["interaction_energy"] == -12.5
+        assert foldx_cli["commands"][-1] == ("AnalyseComplex", repaired.name)
+
+    out = tmp_path / "chosen"
+    result = _run(tfbs_binding_energy(structure_path=str(local / "complex.pdb"),
+                                      output_dir=str(out)))
+    assert result["repaired_structure_path"] == str(out.resolve() / "complex_Repair.pdb")
+    assert Path(result["repaired_structure_path"]).is_file()
+
+
+def test_binding_energy_without_repair_names_no_repaired_file(foldx_cli, tmp_path, monkeypatch):
+    from tfbs.mcp.foldx_tools import tfbs_binding_energy
+
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    result = _run(tfbs_binding_energy(structure_path=_make_dna_pdb(str(tmp_path)), repair=False))
+    assert result["repaired_structure_path"] is None
+    assert [c for c, _ in foldx_cli["commands"]] == ["AnalyseComplex"]
+    assert not (tmp_path / "results").exists()
+
+
+def test_binding_energy_reports_a_repair_that_wrote_nothing(foldx_cli, tmp_path, monkeypatch):
+    from tfbs.mcp.foldx_tools import tfbs_binding_energy
+
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    foldx_cli["repair_writes"] = False
+    result = _run(tfbs_binding_energy(structure_path=_make_dna_pdb(str(tmp_path))))
+    assert result["error"] == "FoldX RepairPDB wrote no repaired structure"
+    assert result["fix"] and result["stderr"] == "no ATOM records"
+    assert [c for c, _ in foldx_cli["commands"]] == ["RepairPDB"]
+
+
+def test_foldx_descriptions_hand_the_repaired_structure_on():
+    from tfbs.mcp.foldx_tools import tfbs_binding_energy, tfbs_binding_scan
+
+    energy = " ".join(tfbs_binding_energy.__doc__.split())
+    assert "repaired_structure_path" in energy and "<results>/structures/<id>/" in energy
+    for consumer in ("tfbs_binding_scan", "tfbs_chipseq_method_comparison",
+                     "tfbs_remap_validation", "tfbs_disease_variant_validation",
+                     "$TFBS_FOLDX_PDB"):
+        assert consumer in energy, consumer
+    scan = " ".join(tfbs_binding_scan.__doc__.split())
+    assert "repaired_structure_path that tfbs_binding_energy returns with repair=true" in scan
+
+
 # ---------------------------------------------------------------------------
 # tfbs_binding_scan
 # ---------------------------------------------------------------------------

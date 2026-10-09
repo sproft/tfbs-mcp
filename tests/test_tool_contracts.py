@@ -340,6 +340,27 @@ def test_docs_do_not_say_a_clone_is_needed_for_the_validation_tools():
         assert "clone the repository" not in text and "git clone" not in text, name
 
 
+def test_docs_say_where_fetched_structures_go_and_how_long_startup_takes():
+    readme = _doc("README.md")
+    assert "tfbs_struct_" not in readme and "temporary folder" not in readme
+    assert "into `<results>/structures/3RKQ/`" in readme
+    assert "are in `<results>/structures/<id>/`" in readme
+    startup = ("about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one "
+               "Windows 10 machine with a CPU build of PyTorch)")
+    assert readme.count(startup) == 2
+    for name in ("README.md", "docs/development.md", "docs/other-clients.md"):
+        text = _doc(name)
+        assert startup in text and "8.5 seconds" not in text, name
+
+
+def test_developer_guide_orders_the_ci_steps_as_the_workflow_does():
+    workflow = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+    assert workflow.index("run: tfbs-mcp --check") < workflow.index("run: python -m pytest")
+    guide = _doc("docs/development.md")
+    assert "first `tfbs-mcp --check`, then the suite" in guide
+    assert "followed by `tfbs-mcp --check`" not in guide
+
+
 def test_no_dashes_in_changed_text():
     for name in ("README.md", "docs/development.md", "tfbs/mcp/server.py",
                  "tfbs/mcp/foldx_tools.py", "tfbs/pipelines/checkpoints.py",

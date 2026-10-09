@@ -24,6 +24,7 @@ Outputs:
 
 import argparse
 import os
+import shutil
 import sys
 import tempfile
 import subprocess
@@ -55,6 +56,12 @@ def load_model(checkpoint_path, model_type, device="cuda"):
     if hasattr(model, "freeze"):
         model.freeze()
     return model.to(device)
+
+
+def find_foldx(explicit=None):
+    """The FoldX binary: --foldx-bin, else $TFBS_FOLDX_BIN, else foldx or foldx5 on PATH."""
+    return (explicit or os.environ.get("TFBS_FOLDX_BIN", "").strip()
+            or shutil.which("foldx") or shutil.which("foldx5"))
 
 
 def gc_content(seq):
@@ -278,8 +285,9 @@ def main(argv=None):
                         default=os.environ.get("TFBS_MOTIF_FILE", ""))
     parser.add_argument("--foldx-pdb",
                         default=os.environ.get("TFBS_FOLDX_PDB", ""))
-    parser.add_argument("--foldx-bin",
-                        default=os.environ.get("TFBS_FOLDX_BIN", "foldx"))
+    parser.add_argument("--foldx-bin", default=None,
+                        help="FoldX binary (default: $TFBS_FOLDX_BIN, else foldx "
+                             "or foldx5 on PATH)")
     parser.add_argument("--datasets", nargs="+",
                         default=["all_mean", "core_mean", "flank_mean"])
     parser.add_argument("--models-dir", default="saved_models_final")
@@ -307,6 +315,12 @@ def main(argv=None):
                              "shuffle = dinucleotide-shuffled positives")
     parser.add_argument("--skip-foldx", action="store_true")
     args = parser.parse_args(argv)
+
+    if not args.skip_foldx:
+        args.foldx_bin = find_foldx(args.foldx_bin)
+        if not args.foldx_bin:
+            from tfbs.mcp.foldx_tools import _FOLDX_MISSING, _FOLDX_MISSING_FIX
+            sys.exit(f"{_FOLDX_MISSING} {_FOLDX_MISSING_FIX}")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

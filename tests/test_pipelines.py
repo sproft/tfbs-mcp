@@ -95,6 +95,35 @@ def test_remap_validation_imports_its_helpers_from_the_package():
     assert "from tfbs.pipelines.chipseq_benchmark_with_foldx import" in source
 
 
+def test_remap_validation_finds_foldx_like_the_structure_tools(monkeypatch):
+    from tfbs.pipelines import remap_validation as rv
+
+    on_path = {}
+    monkeypatch.setattr(rv.shutil, "which", on_path.get)
+    monkeypatch.delenv("TFBS_FOLDX_BIN", raising=False)
+    assert rv.find_foldx() is None
+    on_path["foldx5"] = "/opt/foldx/foldx5"
+    assert rv.find_foldx() == "/opt/foldx/foldx5"
+    on_path["foldx"] = "/opt/foldx/foldx"
+    assert rv.find_foldx() == "/opt/foldx/foldx"
+    monkeypatch.setenv("TFBS_FOLDX_BIN", "/env/foldx")
+    assert rv.find_foldx() == "/env/foldx"
+    assert rv.find_foldx("/flag/foldx") == "/flag/foldx"
+
+
+def test_remap_validation_without_foldx_stops_with_the_tools_error(monkeypatch, tmp_path):
+    from tfbs.mcp.foldx_tools import _foldx_missing_error
+    from tfbs.pipelines import remap_validation as rv
+
+    monkeypatch.setattr(rv.shutil, "which", lambda name: None)
+    monkeypatch.delenv("TFBS_FOLDX_BIN", raising=False)
+    with pytest.raises(SystemExit) as stop:
+        rv.main(["--remap-bed", str(tmp_path / "peaks.bed"), "--output-dir", str(tmp_path / "out")])
+    tool_error = json.loads(_foldx_missing_error())
+    assert stop.value.code == f"{tool_error['error']} {tool_error['fix']}"
+    assert not (tmp_path / "out").exists()
+
+
 @pytest.mark.parametrize("name", PIPELINES)
 def test_repository_script_is_a_shim_for_the_packaged_module(name):
     text = (REPO / SHIMS[name]).read_text(encoding="utf-8")
