@@ -774,9 +774,15 @@ def test_plddt_summary_reads_the_b_factor_column(tmp_path):
     pdb.write_text(_af_text())
     summary = _plddt_summary(str(pdb))
     assert summary == {"fraction_confident": 0.4, "fraction_low": 0.6,
-                       "low_confidence_segments": [[3, 5], [7, 7], [9, 10]]}
+                       "low_confidence_segments": [
+                           {"chain": "A", "start": 3, "end": 5},
+                           {"chain": "A", "start": 7, "end": 7},
+                           {"chain": "A", "start": 9, "end": 10}],
+                       "low_confidence_segments_total": 3}
     pdb.write_text(_af_text([10, 90] * 30))
-    assert len(_plddt_summary(str(pdb))["low_confidence_segments"]) == 20
+    many = _plddt_summary(str(pdb))
+    assert len(many["low_confidence_segments"]) == 20
+    assert many["low_confidence_segments_total"] == 30
     pdb.write_text("HEADER only\nEND\n")
     assert _plddt_summary(str(pdb)) is None
 
@@ -788,7 +794,7 @@ def test_fetch_structure_reports_plddt_for_alphafold_only(fake_web, tmp_path):
               _rcsb("3RKQ"): _pdb_text("ACGTA").encode()})
     af = _run(tfbs_fetch_structure(uniprot_id="P43699", output_dir=str(tmp_path / "af")))
     assert af["plddt_summary"]["fraction_low"] == 0.6
-    assert af["plddt_summary"]["low_confidence_segments"][0] == [3, 5]
+    assert af["plddt_summary"]["low_confidence_segments"][0] == {"chain": "A", "start": 3, "end": 5}
     pdb = _run(tfbs_fetch_structure(pdb_id="3RKQ", output_dir=str(tmp_path / "pdb")))
     assert pdb["source"] == "pdb" and "plddt_summary" not in pdb
 
@@ -798,3 +804,67 @@ def test_fetch_structure_description_explains_plddt_summary():
 
     doc = " ".join(tfbs_fetch_structure.__doc__.split())
     assert "plddt_summary" in doc and "flag low-confidence regions" in doc
+
+
+def test_plddt_segments_do_not_run_across_chains(tmp_path):
+    from tfbs.mcp.foldx_tools import _plddt_summary
+
+    pdb = tmp_path / "af.pdb"
+    two = _af_text([90, 30, 40], chain="A").replace("END\n", "") + _af_text([20, 95], chain="B")
+    pdb.write_text(two)
+    summary = _plddt_summary(str(pdb))
+    assert summary["low_confidence_segments"] == [
+        {"chain": "A", "start": 2, "end": 3}, {"chain": "B", "start": 1, "end": 1}]
+    assert summary["low_confidence_segments_total"] == 2
+
+
+def test_fetch_structure_downloads_into_the_results_dir_by_default(fake_web, tmp_path, monkeypatch):
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    fake_web({
+        _rcsb("9ZZZ"): _http_error(_rcsb("9ZZZ"), 404),
+        _AF_API: json.dumps(_AF_ENTRIES).encode(), _AF_MODEL: _af_text().encode(),
+    })
+    result = _run(tfbs_fetch_structure(pdb_id="9ZZZ", uniprot_id="P43699"))
+    path = Path(result["structure_path"])
+    assert path.parent == tmp_path / "results" / "structures" / "P43699"
+    assert path.is_file()
+    doc = " ".join(tfbs_fetch_structure.__doc__.split())
+    assert "<results>/structures/<id>/" in doc and "temporary" not in doc
+
+
+def test_fetch_structure_ids_share_a_directory_whatever_their_case(fake_web, tmp_path, monkeypatch):
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    fake_web({_rcsb("3RKQ"): _pdb_text("ACGTA").encode()})
+    lower = _run(tfbs_fetch_structure(pdb_id="3rkq"))
+    upper = _run(tfbs_fetch_structure(pdb_id="3RKQ"))
+    assert Path(lower["structure_path"]).parent == tmp_path / "results" / "structures" / "3RKQ"
+    assert lower["structure_path"] == upper["structure_path"]
+    assert sorted(p.name for p in (tmp_path / "results" / "structures").iterdir()) == ["3RKQ"]
+
+    fake_web({_AF_API: json.dumps(_AF_ENTRIES).encode(), _AF_MODEL: _af_text().encode()})
+    result = _run(tfbs_fetch_structure(uniprot_id="P43699"))
+    assert Path(result["structure_path"]).parent.name == "P43699"
+    doc = " ".join(tfbs_fetch_structure.__doc__.split())
+    assert "PDB and UniProt IDs uppercased, so 3rkq and 3RKQ share a directory" in doc
+
+
+def test_binding_scan_writes_to_the_results_dir_by_default(scan_inputs, fake_foldx, fake_bigwig,
+                                                           tmp_path, monkeypatch):
+    from tfbs.mcp.foldx_tools import tfbs_binding_scan
+
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    pdb, fasta, _ = scan_inputs
+    args = {"structure_path": pdb, "genome_fasta": fasta, "region": "chr1:100-1100"}
+    first = _run(tfbs_binding_scan(**args))
+    out = Path(first["output_dir"])
+    assert out.parent == tmp_path / "results" / "binding_scan"
+    assert Path(first["bigwig_path"]).parent == out
+    assert _run(tfbs_binding_scan(**args))["output_dir"] == first["output_dir"]
+    for change in ({"step": 25}, {"window": 7}, {"region": "chr1:100-1200"}):
+        assert _run(tfbs_binding_scan(**{**args, **change}))["output_dir"] != str(out), change
+    doc = " ".join(tfbs_binding_scan.__doc__.split())
+    assert "<results>/binding_scan/<digest>/" in doc and "temp" not in doc

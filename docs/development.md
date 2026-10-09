@@ -42,7 +42,7 @@ The MCP tools resolve data, checkpoints and results against `TFBS_PROJECT_ROOT`,
 export TFBS_PROJECT_ROOT=/mnt/lab/tfbs
 ```
 
-The `tfbs_train` tool submits the training to SLURM by default. With `local=true` it runs `python -m tfbs.cli.train_cli fit --config <config> --data.num_workers 0` on the server's machine instead, from the config's directory, and blocks until training ends (at most `local_timeout` seconds, default 3600), so it is meant for small datasets and laptops. Its output goes to `<config stem>_train.log` next to the config, and the result reports the checkpoint and the last validation metrics from the CSVLogger's `metrics.csv` that every `tfbs_config` config without `wandb_project` writes under the checkpoint directory. Retraining into the same folder overwrites `best_<model_type>.ckpt`.
+The `tfbs_train` tool submits the training to SLURM by default. With `local=true` it runs `python -m tfbs.cli.train_cli fit --config <config> --data.num_workers 0` on the server's machine instead, from the config's directory, and blocks until training ends (at most `local_timeout` seconds, default 3600), so it is meant for small datasets and laptops. Its output goes to `<config stem>_train.log` next to the config. The trainer runs in a process group of its own, and the whole group is killed when `local_timeout` runs out or the MCP call is cancelled. The result reports the checkpoint and, from the `metrics.csv` this run's CSVLogger wrote (every `tfbs_config` config without `wandb_project` has one, under the checkpoint directory), the validation metrics of the best epoch of this run, the one with the lowest `val_loss` that ModelCheckpoint keeps, with `best_epoch` and `epochs_run`. `metrics` is null, with a `note` saying why, when the config has no CSVLogger or the run wrote no fresh `metrics.csv`; `val_auc` is null, with a note, when the validation split holds a single class. Retraining into the same folder overwrites `best_<model_type>.ckpt`.
 
 ## Training and validation pipelines
 
@@ -76,14 +76,16 @@ The server imports PyTorch, Lightning, scikit-learn, captum, tangermeme and the 
 
 ## Recording a session
 
-`scripts/record_demo_session.py` (in a clone; it is not installed) starts `tfbs-mcp` over the stdio protocol as an AI app does, runs a plan of user messages, the assistant's stated plan and tool calls, and writes every call's arguments, full result and wall time to a JSON log, together with the seconds from launch to the server's first answer. The application note's Figure 2 is produced from such a log, so no part of it is typed in by hand.
+`scripts/record_demo_session.py` (in a clone; it is not installed) starts `tfbs-mcp` over the stdio protocol as an AI app does, runs a plan of user messages, the assistant's stated plan and tool calls, and writes every call's arguments, full result and wall time to a JSON log, together with the seconds from launch to the server's first answer. The application note's Figure 2 is the session log recorded this way with the released FLANK checkpoint (doi:10.5281/zenodo.21399578) and the bundled demo data, so no part of it is typed in by hand.
+
+The demo directory is found with `python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())"`. Asking `tfbs.data.demo` itself does not work: it is a namespace package (it has no `__init__.py`), so its `__file__` is `None`.
 
 ```bash
 python scripts/record_demo_session.py --server "$(which tfbs-mcp)" --plan plan.json --out session_log.json \
-    --env TFBS_CALL_LOG=calls.jsonl --set DEMO="$(python -c 'import tfbs.mcp.cli as c; print(c.demo_dir())')"
+    --env TFBS_CALL_LOG=calls.jsonl --set DEMO="$(python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())")"
 ```
 
-The plan is a JSON list of steps: `{"role": "user", "text": ...}`, `{"role": "llm", "text": ...}` or `{"role": "tool", "tool": ..., "arguments": {...}}`. A tool argument `{"$ref": "3.files.sequences"}` takes that value from the result of step 3. `--set KEY=VALUE` (repeatable) replaces `@KEY` by `VALUE` in every string of the plan before the references are resolved, so one plan runs on any machine, e.g. `"@DEMO/demo_peaks.bed"`. `--env KEY=VALUE` sets a variable for the server; with `TFBS_CALL_LOG` the server's own call log is copied into the recording.
+The plan is a JSON list of steps: `{"role": "user", "text": ...}`, `{"role": "llm", "text": ...}` or `{"role": "tool", "tool": ..., "arguments": {...}}`. A tool argument `{"$ref": "3.files.sequences"}` takes that value from the result of step 3. `--set KEY=VALUE` (repeatable) replaces `@KEY` by `VALUE` in every string of the plan before the references are resolved, so one plan runs on any machine, e.g. `"@DEMO/demo_peaks.bed"`. `--env KEY=VALUE` sets a variable for the server; with `TFBS_CALL_LOG` the server's own call log is copied into the recording. A step that fails, such as a `$ref` naming a key the earlier result does not have (the log entry then lists the keys it does have) or an MCP protocol error, is logged as an error entry and the run goes on, and the log is written even when the run crashes.
 
 ## Optional extras
 
@@ -93,7 +95,7 @@ The install command in the README already includes everything the server needs. 
 |---|---|---|
 | `mcp` | the MCP protocol library | the server itself |
 | `genomics` | pyfaidx, tangermeme, pysam (Linux and macOS; Windows has no pysam wheel) | reading a genome FASTA (`tfbs_extract_loci`, the benchmark and validation tools); pysam reads the ClinVar VCF in `tfbs_disease_variant_validation`, which therefore needs Linux, macOS or WSL |
-| `viz` | captum, tangermeme, logomaker, seaborn | attribution, mutagenesis, seqlets; tangermeme also brings the pure-PyTorch FIMO that `tfbs_fimo` uses when the MEME Suite's `fimo` binary is not on PATH (its result says `"backend": "tangermeme"` or `"meme"`) |
+| `viz` | captum, tangermeme, logomaker, seaborn | attribution, mutagenesis, seqlets; tangermeme also brings its FIMO reimplementation (memelite, numba-based, shipped with tangermeme 1.x) that `tfbs_fimo` uses when the MEME Suite's `fimo` binary is not on PATH (its result says `"backend": "memelite"`, `"tangermeme"` for the `tangermeme.tools.fimo` of older releases, or `"meme"`) |
 | `tracking` | wandb | `tfbs_sweep`, and Weights & Biases logging during training |
 | `foldx` | pyBigWig | the bigWig track of `tfbs_binding_scan`; not FoldX itself, see [Adding your data](../README.md#adding-your-data) in the README |
 | `equinet` | equirc | the `EquiNet` architecture only |

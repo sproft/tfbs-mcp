@@ -439,3 +439,236 @@ def test_a_checkpoint_saved_under_a_shim_package_on_disk_loads_with_lightning(tm
     finally:
         for key in ("diskshim_w", "diskshim_w.nn", "diskshim_w.nn.models"):
             sys.modules.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Inference checkpoints (the NKX2-1 study's released vcnnbpnet.pt format)
+# ---------------------------------------------------------------------------
+
+def _tiny_vcnn() -> models.VCNNBpnet:
+    torch.manual_seed(0)
+    return models.VCNNBpnet(num_channels=4, kernel_size=3, dilations=[1, 2],
+                            pool_output_size=5, dense_sizes=[8], input_length=10).eval()
+
+
+def _save_inference(path: Path, model=None, scaling=STD, **extra) -> Path:
+    model = model or _tiny_vcnn()
+    payload = {"arch": type(model).__name__, "library": "demo",
+               "hyper_parameters": dict(model.hparams), "state_dict": model.state_dict(),
+               "metadata": {"study": "test", "epoch": 3}, **extra}
+    if scaling is not None:
+        payload["scaling"] = scaling
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    return path
+
+
+def _load_vcnn(path, data_path=None, model_id="lm_inf"):
+    return run(server.tfbs_load_model(model_id, str(path), "VCNNBpnet", device="cpu",
+                                      data_path=data_path))
+
+
+def test_inference_checkpoint_loads_with_its_own_scaling(tmp_path):
+    model = _tiny_vcnn()
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt", model)
+    result = _load_vcnn(path)
+    assert "error" not in result, result
+    assert result["checkpoint_format"] == "inference"
+    assert result["input_length"] == 10 and result["classify"] is False
+    assert result["scaling_params"] == STD and result["scaling_source"] == str(path.resolve())
+    assert result["checkpoint_scaling_method"] == "standardize"
+    assert result["library"] == "demo" and result["metadata"] == {"study": "test", "epoch": 3}
+    assert "warning" not in result
+
+    scores = run(server.tfbs_predict("lm_inf", sequences=[SEQ]))
+    x = server._sequences_to_tensor([SEQ])
+    with torch.no_grad():
+        expected = float(model(x).flatten()[0]) * 2.0 + 5.0
+    assert scores["scores"][0] == pytest.approx(expected, rel=1e-5)
+    assert scores["inverse_transformed"] is True and scores["units"] == "label"
+
+
+def test_inference_checkpoint_takes_an_agreeing_data_path_only(tmp_path):
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt")
+    same = _write(tmp_path / "same.json", STD)
+    assert _load_vcnn(path, str(same))["scaling_params"] == STD
+    other = _write(tmp_path / "other.json", {**STD, "mean": 1.0})
+    result = _load_vcnn(path, str(other))
+    assert "disagrees" in result["error"] and "Omit data_path" in result["fix"]
+    method = _write(tmp_path / "method.json", {"scaling_method": "normalize", "min": 0.0, "max": 1.0})
+    assert "'standardize'" in _load_vcnn(path, str(method))["error"]
+
+
+def test_inference_checkpoint_without_scaling_uses_the_lookup(tmp_path):
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt", scaling=None)
+    assert _load_vcnn(path)["scaling_params"] is None
+    _write(path.parent / "scaling_params.json", STD)
+    assert _load_vcnn(path)["scaling_params"] == STD
+
+
+def test_inference_checkpoint_errors_are_json(tmp_path):
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt")
+    wrong = run(server.tfbs_load_model("lm_inf", str(path), "SimpleCNN", device="cpu"))
+    assert "VCNNBpnet" in wrong["error"] and "model_type='VCNNBpnet'" in wrong["fix"]
+    model = _tiny_vcnn()
+    state = model.state_dict()
+    state.pop(next(iter(state)))
+    broken = _save_inference(tmp_path / "broken.pt", model, state_dict=state)
+    result = _load_vcnn(broken)
+    assert "Could not build VCNNBpnet" in result["error"] and result["fix"]
+    partial = _save_inference(tmp_path / "partial.pt", scaling={"scaling_method": "standardize"})
+    assert "lacks" in _load_vcnn(partial)["error"]
+    assert "lm_inf" not in server._model_registry
+
+
+def test_lightning_checkpoints_report_their_format(tmp_path):
+    ckpt = _save_ckpt(tmp_path / "best.ckpt")
+    assert _load(ckpt)["checkpoint_format"] == "lightning"
+
+
+def test_load_model_description_names_both_formats():
+    doc = " ".join(server.tfbs_load_model.__doc__.split())
+    assert "Two checkpoint formats are accepted" in doc
+    assert "doi:10.5281/zenodo.21399578" in doc and "Lightning checkpoint" in doc
+
+
+RELEASED_FLANK = Path("D:/claude_code/nkx2-1-tfbs-variants/models/flank/vcnnbpnet.pt")
+
+
+@pytest.mark.skipif(not RELEASED_FLANK.is_file(), reason="the released NKX2-1 checkpoints are not on this machine")
+def test_released_flank_checkpoint_scores_in_log2_fold_change():
+    result = _load_vcnn(RELEASED_FLANK, model_id="lm_flank")
+    assert "error" not in result, result
+    assert result["checkpoint_format"] == "inference" and result["library"] == "flank"
+    assert result["input_length"] == 24
+    assert result["scaling_params"]["mean"] == pytest.approx(-0.2345, abs=1e-4)
+    assert result["scaling_params"]["std"] == pytest.approx(1.3395, abs=1e-4)
+    scores = run(server.tfbs_predict("lm_flank", sequences=["GGGCTCCTCACTTGACCTTTGCTG"]))
+    assert scores["scores"][0] == pytest.approx(1.3907, abs=1e-3)
+    assert scores["units"] == "label"
+
+
+# ---------------------------------------------------------------------------
+# units and inverse_transformed in predict, mutagenesis, marginalize, epistasis
+# ---------------------------------------------------------------------------
+
+def _units_of_every_tool(model_id: str) -> list[tuple[bool, str]]:
+    calls = [
+        server.tfbs_predict(model_id, sequences=[SEQ]),
+        server.tfbs_mutagenesis(model_id, sequences=[SEQ]),
+        server.tfbs_marginalize(model_id, sequences=[SEQ], motif="ACG"),
+        server.tfbs_epistasis(model_id, sequence=SEQ, positions=[0, 1]),
+    ]
+    results = [run(c) for c in calls]
+    for r in results:
+        assert "error" not in r, r
+    return [(r["inverse_transformed"], r["units"]) for r in results]
+
+
+def test_unscaled_model_is_in_label_units_without_an_inverse(tmp_path):
+    ckpt = _save_ckpt(tmp_path / "ds" / "none" / "best_SimpleCNN.ckpt")
+    _write(ckpt.parent / "scaling_params.json", {"scaling_method": "none"})
+    assert _load(ckpt, model_id="lm_none")["scaling_params"] == {"scaling_method": "none"}
+    assert _units_of_every_tool("lm_none") == [(False, "label")] * 4
+    insisted = run(server.tfbs_predict("lm_none", sequences=[SEQ], inverse_transform=True))
+    assert insisted["inverse_transformed"] is False and insisted["units"] == "label"
+
+
+def test_scaled_model_reports_label_or_training_scale(study, tmp_path):
+    root, ckpt = study
+    _load(ckpt, str(root / "scaling_params"), model_id="lm_std")
+    assert _units_of_every_tool("lm_std") == [(True, "label")] * 4
+    raw = run(server.tfbs_predict("lm_std", sequences=[SEQ], inverse_transform=False))
+    assert raw["inverse_transformed"] is False and raw["units"] == "training_scale"
+
+    missing = _save_ckpt(tmp_path / "x" / "standardize" / "best_SimpleCNN.ckpt",
+                         datamodule={"data_path": str(tmp_path / "gone"),
+                                     "scaling_method": "standardize"})
+    _load(missing, model_id="lm_missing")
+    assert _units_of_every_tool("lm_missing") == [(False, "training_scale")] * 4
+
+
+def test_units_are_described_in_every_tool():
+    for tool in (server.tfbs_predict, server.tfbs_mutagenesis, server.tfbs_marginalize,
+                 server.tfbs_epistasis):
+        doc = " ".join(tool.__doc__.split())
+        assert '"units"' in doc or "units," in doc, tool.__name__
+    doc = " ".join(server.tfbs_predict.__doc__.split())
+    assert '"training_scale"' in doc and 'scaling_method "none"' in doc
+
+
+def test_readme_says_the_released_checkpoints_load_directly():
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    text = " ".join(readme.split())
+    assert "released checkpoints" in text and "load directly with `tfbs_load_model`" in text
+    assert "doi:10.5281/zenodo.21399578" in text
+
+
+def test_inference_metadata_with_tensors_is_reported_as_json(tmp_path):
+    metadata = {"epoch": torch.tensor(3), "curve": torch.tensor([0.5, 0.25]),
+                "nested": {"ids": (torch.tensor(1), 2)}}
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt", metadata=metadata,
+                           library=torch.tensor([1, 2]))
+    result = _load_vcnn(path)
+    assert "error" not in result, result
+    assert result["metadata"] == {"epoch": 3, "curve": [0.5, 0.25], "nested": {"ids": [1, 2]}}
+    assert result["library"] == [1, 2]
+    assert "lm_inf" in server._model_registry
+
+
+def test_unreportable_metadata_leaves_no_model_registered(tmp_path):
+    loop: dict = {"name": "loop"}
+    loop["self"] = loop
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt", metadata=loop)
+    result = _load_vcnn(path, model_id="lm_loop")
+    assert "metadata" in result["error"] and result["fix"]
+    assert "lm_loop" not in server._model_registry
+
+
+@pytest.mark.parametrize("scaling, expected", [
+    ({**STD, "std": float("nan")}, "not a finite number"),
+    ({**STD, "mean": float("inf")}, "not a finite number"),
+    ({**STD, "mean": True}, "not a finite number"),
+    ({**STD, "std": "2"}, "not a finite number"),
+    ({**STD, "std": 0.0}, "std 0"),
+    ({"scaling_method": "normalize", "min": 1.0, "max": 1.0}, "max equal to min"),
+])
+def test_unusable_scaling_values_are_json_errors(tmp_path, scaling, expected):
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt", scaling=scaling)
+    result = _load_vcnn(path)
+    assert expected in result["error"] and result["fix"], result
+    assert "lm_inf" not in server._model_registry
+    as_file = tmp_path / "scaling_params.json"
+    as_file.write_text(json.dumps(scaling))
+    plain = _save_inference(tmp_path / "plain" / "vcnnbpnet.pt", scaling=None)
+    result = _load_vcnn(plain, str(as_file))
+    assert expected in result["error"], result
+
+
+def test_inference_regressor_without_any_scaling_has_unknown_units(tmp_path):
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt", scaling=None)
+    result = _load_vcnn(path)
+    assert result["scaling_params"] is None and result["units"] == "unknown"
+    assert "data_path" in result["warning"]
+    assert _units_of_every_tool("lm_inf") == [(False, "unknown")] * 4
+
+    _write(path.parent / "scaling_params.json", STD)
+    found = _load_vcnn(path)
+    assert "warning" not in found and "units" not in found
+    assert _units_of_every_tool("lm_inf") == [(True, "label")] * 4
+
+
+def test_load_model_description_states_unknown_units_and_the_label_assumption():
+    doc = " ".join(server.tfbs_load_model.__doc__.split())
+    assert 'units "unknown"' in doc and "assume it was trained on unscaled labels" in doc
+    doc = " ".join(server.tfbs_predict.__doc__.split())
+    assert '"unknown"' in doc and "assumes it was trained on unscaled labels" in doc
+
+
+@pytest.mark.parametrize("scaling_params, classify", [
+    (STD, False), ({"scaling_method": "normalize", "min": 0.0, "max": 4.0}, False),
+    ({"scaling_method": "none"}, False), (None, False), (STD, True),
+])
+def test_delta_scale_exists_exactly_when_the_inverse_does(scaling_params, classify):
+    entry = {"scaling_params": scaling_params, "classify": classify}
+    assert (server._delta_scale(entry) is None) == (server._inverse_scaling(entry, None) is None)

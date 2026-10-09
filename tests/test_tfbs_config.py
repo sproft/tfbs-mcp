@@ -110,7 +110,7 @@ def test_application_note_example_trains_through_lightningcli(tmp_path, monkeypa
         TFBSDataModule,
         subclass_mode_model=True,
         save_config_callback=None,
-        args=["fit", "--config", str(out), "--data.num_workers=1",
+        args=["fit", "--config", str(out), "--data.num_workers=0",
               "--trainer.fast_dev_run=true", "--trainer.accelerator=cpu",
               "--trainer.enable_progress_bar=false"],
     )

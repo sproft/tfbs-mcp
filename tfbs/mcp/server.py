@@ -15,13 +15,16 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 from collections import deque
 from datetime import datetime, timezone
@@ -427,7 +430,69 @@ def _preload_native_modules() -> dict[str, str]:
             importlib.import_module(name)
         except Exception as exc:
             missing[name] = f"{type(exc).__name__}: {exc}"
+    try:
+        _warm_up_python_fimo()
+    except Exception as exc:
+        logger.info("FIMO reimplementation warm-up failed: %s: %s", type(exc).__name__, exc)
     return missing
+
+
+_WARMUP_MOTIF = """MEME version 4
+
+ALPHABET= ACGT
+
+strands: + -
+
+Background letter frequencies
+A 0.25 C 0.25 G 0.25 T 0.25
+
+MOTIF warmup
+letter-probability matrix: alength= 4 w= 8 nsites= 1 E= 0
+ 0.97 0.01 0.01 0.01
+ 0.01 0.97 0.01 0.01
+ 0.01 0.01 0.97 0.01
+ 0.01 0.01 0.01 0.97
+ 0.97 0.01 0.01 0.01
+ 0.01 0.97 0.01 0.01
+ 0.01 0.01 0.97 0.01
+ 0.01 0.01 0.01 0.97
+
+"""
+
+
+def _warm_up_python_fimo() -> None:
+    """Scan one sequence with the FIMO reimplementation, if installed.
+
+    The first scan compiles memelite's numba functions and loads numba's
+    threading layer (numba.np.ufunc.omppool or another native extension),
+    which must happen before the stdio loop starts.
+    """
+    fimo, _ = _python_fimo()
+    if fimo is None:
+        return
+    with tempfile.TemporaryDirectory(prefix="tfbs_fimo_warmup_", ignore_cleanup_errors=True) as tmp:
+        work = Path(tmp)
+        motif = work / "warmup.meme"
+        with open(motif, "w", encoding="utf-8", newline="\n") as f:
+            f.write(_WARMUP_MOTIF)
+        _python_fimo_hits(fimo, motif, work / "warmup.fasta", work / "fimo_out", 1e-3,
+                          ["TTACGTACGTTT"])
+
+
+_MODULE_ALTERNATIVES = (
+    ("tangermeme.ism", "tangermeme.saturation_mutagenesis"),
+    ("tangermeme.tools.fimo", "memelite.fimo"),
+)
+
+
+def _unavailable_modules(missing: dict[str, str]) -> list[str]:
+    """The modules of missing that no loaded alternative stands in for, sorted."""
+    unavailable = []
+    for name in sorted(missing):
+        group = next((g for g in _MODULE_ALTERNATIVES if name in g), (name,))
+        if all(member in missing for member in group):
+            unavailable.append(name)
+    return unavailable
 
 
 def _detach_child_stdin() -> None:
@@ -578,16 +643,21 @@ def _validate_dna(sequences: list[str], what: str = "Sequence {}",
     return None
 
 
-def _warning_messages(caught: list, limit: int = 10, width: int = 300) -> list[str]:
-    """Distinct messages of recorded warnings, each cut to width characters."""
-    messages: list[str] = []
+def _warning_messages(caught: list, limit: int = 10, width: int = 300) -> list[dict[str, Any]]:
+    """Distinct recorded warnings as [{"message", "count"}], in first-seen order.
+
+    A warning is identified by its category and the text of its message
+    before the first ": " (colon and space), so tangermeme's "Convergence
+    deltas too high: tensor([...])" counts as one message whatever the
+    tensor holds, while a path such as C:/data/x.pt stays whole.
+    """
+    counts: dict[str, int] = {}
     for w in caught:
-        text = f"{w.category.__name__}: {w.message}"
-        text = " ".join(text.split())
+        head = " ".join(str(w.message).split(": ", 1)[0].split())
+        text = f"{w.category.__name__}: {head}"
         text = text if len(text) <= width else text[: width - 3] + "..."
-        if text not in messages:
-            messages.append(text)
-    return messages[:limit]
+        counts[text] = counts.get(text, 0) + 1
+    return [{"message": m, "count": c} for m, c in counts.items()][:limit]
 
 
 def _no_sequences_error(tool: str, fix: str) -> str:
@@ -597,7 +667,7 @@ def _no_sequences_error(tool: str, fix: str) -> str:
 def _tail_file(path: str, n: int = 100) -> str:
     """Read the last *n* lines of a file efficiently."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             return "\n".join(deque(f, maxlen=n))
     except FileNotFoundError:
         return f"[File not found: {path}]"
@@ -611,7 +681,8 @@ def _tail_file(path: str, n: int = 100) -> str:
 # Output locations follow from the inputs, so a chain of calls needs no
 # filenames from the user:
 #   data tools     <dir>_<kind>/ next to the input, e.g. peaks.bed ->
-#                  peaks_loci/ -> peaks_classification/ -> peaks_dataset/
+#                  peaks_loci_24bp_gc/ -> peaks_24bp_gc_classification/ ->
+#                  peaks_24bp_gc_dataset/
 #   model analyses <results>/<model_id>/<tool>/<digest>/, where <results>
 #                  is tfbs_server_info's results_dir and <digest> hashes
 #                  the call's inputs, so a repeated call reuses its
@@ -667,12 +738,21 @@ def _input_key(sequences: list[str] | None, sequences_path: str | None) -> Any:
 
 
 _DERIVED_SUFFIXES = ("_loci", "_classification", "_regression", "_dataset")
+_NEGATIVES_SUFFIX = {"gc_matched": "_gc", "shuffled": "_shuffled"}
+_LOCI_DIR_RE = re.compile(r"^(.+)_loci(_\d+bp(?:_gc|_shuffled)?)$")
 
 
 def _sibling_dir(input_file: str | Path, kind: str) -> Path:
-    """<parent>/<name>_<kind> for an input file in <parent>/<name>[_<suffix>]/."""
+    """<parent>/<name>_<kind> for an input file in <parent>/<name>[_<suffix>]/.
+
+    A tfbs_extract_loci directory <stem>_loci_<n>bp[_gc|_shuffled] keeps
+    its window and negatives mode: <stem>_<n>bp[_gc|_shuffled]_<kind>.
+    """
     d = Path(input_file).expanduser().resolve().parent
     name = d.name
+    loci = _LOCI_DIR_RE.match(name)
+    if loci:
+        return d.parent / f"{loci.group(1)}{loci.group(2)}_{kind}"
     for suffix in _DERIVED_SUFFIXES:
         if name.endswith(suffix) and len(name) > len(suffix):
             name = name[: -len(suffix)]
@@ -816,16 +896,21 @@ def _load_sequence_input(
 _CLASS_PATH_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
 
 
-def _checkpoint_meta(path: Path) -> dict[str, dict]:
-    """hyper_parameters and datamodule_hyper_parameters of a checkpoint ({} each if absent)."""
+def _load_weights_only(path: Path) -> Any:
+    """The object torch.load(weights_only=True) reads from path, or None."""
     _ensure_imports()
-    ckpt = None
     for kwargs in ({"mmap": True}, {}):
         try:
-            ckpt = _torch.load(path, map_location="cpu", weights_only=True, **kwargs)
-            break
+            return _torch.load(path, map_location="cpu", weights_only=True, **kwargs)
         except Exception:
-            ckpt = None
+            continue
+    return None
+
+
+def _checkpoint_meta(path: Path, ckpt: Any = None) -> dict[str, dict]:
+    """hyper_parameters and datamodule_hyper_parameters of a checkpoint ({} each if absent)."""
+    if ckpt is None:
+        ckpt = _load_weights_only(path)
     meta: dict[str, dict] = {}
     for key in ("hyper_parameters", "datamodule_hyper_parameters"):
         value = ckpt.get(key) if isinstance(ckpt, dict) else None
@@ -956,14 +1041,41 @@ def _read_scaling_file(path: Path, key: str) -> tuple[dict | None, str | None]:
             "file keyed by <dataset>_<scaling>_<model_type>."
             + (f" Keys in this file: {keys[:20]}." if keys else ""),
         )
-    needed = {"standardize": ("mean", "std"), "normalize": ("min", "max")}.get(
-        data["scaling_method"], ())
-    missing = [k for k in needed if not isinstance(data.get(k), (int, float))]
+    err = _incomplete_scaling(data, path)
+    return (None, err) if err else (data, None)
+
+
+_SCALING_VALUES = {"standardize": ("mean", "std"), "normalize": ("min", "max")}
+
+
+def _incomplete_scaling(data: dict, source: Path) -> str | None:
+    """Error JSON unless the values its scaling_method needs are usable, else None.
+
+    mean and std (standardize) or min and max (normalize) must be finite
+    numbers other than bool, with std != 0 and max != min, because the
+    inverse transform multiplies by std (or max - min).
+    """
+    method = data["scaling_method"]
+    needed = _SCALING_VALUES.get(method, ()) if isinstance(method, str) else ()
+    fix = "Pass the scaling_params.json written by the training run."
+    missing = [k for k in needed if data.get(k) is None]
     if missing:
-        return None, _error(
-            f"{path} uses scaling_method {data['scaling_method']} but lacks {missing}.",
-            "Pass the scaling_params.json written by the training run.")
-    return data, None
+        return _error(f"{source} uses scaling_method {method} but lacks {missing}.", fix)
+    bad = [k for k in needed
+           if isinstance(data[k], bool) or not isinstance(data[k], (int, float))
+           or not math.isfinite(data[k])]
+    if bad:
+        shown = ", ".join(f"{k}={data[k]!r}" for k in bad)
+        return _error(
+            f"{source} uses scaling_method {method}, but {shown} is not a finite number.",
+            fix)
+    if method == "standardize" and data["std"] == 0:
+        return _error(f"{source} has std 0, so its scores cannot be converted to label units.",
+                      fix)
+    if method == "normalize" and data["max"] == data["min"]:
+        return _error(f"{source} has max equal to min ({data['min']!r}), so its scores "
+                      "cannot be converted to label units.", fix)
+    return None
 
 
 def _training_data_dir(ckpt: Path, meta: dict) -> Path | None:
@@ -1055,6 +1167,92 @@ def _find_scaling_params(data_path: str | None, ckpt: Path, model_type: str,
     return params, str(candidate), None
 
 
+def _json_safe(value: Any) -> Any:
+    """value with tensors and numpy arrays or scalars turned into lists and numbers.
+
+    Other objects are left as they are; json.dumps(default=str) renders them.
+    """
+    if isinstance(value, dict):
+        return {k if isinstance(k, (str, int, float, bool)) or k is None else str(k): _json_safe(v)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    for convert in ("tolist", "item"):
+        method = getattr(value, convert, None)
+        if callable(method):
+            try:
+                converted = method()
+            except Exception:
+                continue
+            if converted is not value:
+                return _json_safe(converted)
+    return value
+
+
+def _is_inference_payload(ckpt: Any) -> bool:
+    """A released inference checkpoint: {arch, hyper_parameters, state_dict, ...}."""
+    return (isinstance(ckpt, dict) and isinstance(ckpt.get("arch"), str)
+            and isinstance(ckpt.get("hyper_parameters"), dict)
+            and isinstance(ckpt.get("state_dict"), dict))
+
+
+def _build_inference_model(payload: dict, path: Path, model_type: str, model_cls):
+    """(model, None) or (None, error JSON) for an inference checkpoint."""
+    arch = payload["arch"]
+    if arch != model_type:
+        return None, _error(
+            f"{path} holds a {arch} model, but model_type is {model_type}.",
+            f"Pass model_type='{arch}', the architecture the file records.", arch=arch)
+    try:
+        model = model_cls(**payload["hyper_parameters"])
+        model.load_state_dict(payload["state_dict"], strict=True)
+    except Exception as exc:
+        return None, _error(
+            f"Could not build {arch} from {path}: {type(exc).__name__}: {str(exc)[:1500]}",
+            f"The file's hyper_parameters and state_dict must fit tfbs.nn.models.{arch} "
+            "of the installed tfbs-mcp; update tfbs-mcp, or check that the file is an "
+            "unmodified release.", arch=arch)
+    return model, None
+
+
+def _inference_scaling(payload: dict, path: Path, model_type: str, data_path: str | None
+                       ) -> tuple[dict | None, str | None, str | None]:
+    """(params, source, None) or an error, for an inference checkpoint.
+
+    The file's own scaling block is used; data_path is then optional and,
+    if given, must hold the same values.  A file without a scaling block
+    falls back to the lookup of _find_scaling_params.
+    """
+    own = _json_safe(payload.get("scaling"))
+    if not (isinstance(own, dict) and isinstance(own.get("scaling_method"), str)):
+        return _find_scaling_params(data_path, path, model_type,
+                                    {"hyper_parameters": {}, "datamodule_hyper_parameters": {}})
+    err = _incomplete_scaling(own, path)
+    if err:
+        return None, None, err
+    own = {k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
+           for k, v in own.items()}
+    if data_path:
+        meta = {"hyper_parameters": {},
+                "datamodule_hyper_parameters": {"scaling_method": own["scaling_method"]}}
+        given, source, err = _find_scaling_params(data_path, path, model_type, meta)
+        if err:
+            return None, None, err
+        if given is not None:
+            differ = [k for k in _SCALING_VALUES.get(own["scaling_method"], ())
+                      if abs(float(given[k]) - own[k]) > 1e-6 * max(1.0, abs(own[k]))]
+            if differ:
+                got = {k: given[k] for k in differ}
+                stored = {k: own[k] for k in differ}
+                return None, None, _error(
+                    f"{source} disagrees with the scaling stored in {path}: {got} vs {stored}.",
+                    "Omit data_path: the released checkpoint carries its own scaling.",
+                    scaling_source=source, checkpoint_scaling=own)
+    return own, str(path), None
+
+
 # ---------------------------------------------------------------------------
 # Tool 1: tfbs_load_model
 # ---------------------------------------------------------------------------
@@ -1080,6 +1278,17 @@ async def tfbs_load_model(
     The model stays loaded for the lifetime of the server and can be
     referenced by model_id in subsequent predict / analyze calls.
 
+    Two checkpoint formats are accepted.  An inference checkpoint is a
+    dict saved with torch.save that holds arch (the tfbs.nn.models class
+    name), hyper_parameters (its constructor arguments), state_dict,
+    scaling ({scaling_method, mean, std}) and optionally library and
+    metadata, such as the NKX2-1 study's released vcnnbpnet.pt files
+    (Zenodo, doi:10.5281/zenodo.21399578; one each for the core, flank
+    and all libraries).  It is read with weights_only=True, rebuilt from
+    its hyper_parameters and loaded strictly; its scaling comes from the
+    file, so data_path is optional and, when given, must hold the same
+    values.  Any other file is loaded as a PyTorch Lightning checkpoint.
+
     A checkpoint written by LightningCLI records the class it was trained
     as (e.g. classes.nn.models.VCNNBpnet for the NKX2-1 study); its module
     is imported before loading, and a module that cannot be imported is
@@ -1101,12 +1310,23 @@ async def tfbs_load_model(
     (recorded by LightningCLI, else the checkpoint's folder name), or the
     call returns an error naming both.  A regression checkpoint trained
     on scaled labels for which none are found loads with a "warning".
+    A scaling block or file must hold finite numbers (mean and std, or
+    min and max) with std != 0 (max != min), else the call returns an
+    error.  A regression inference checkpoint with no scaling block and
+    no scaling file loads with units "unknown" and a "warning" naming
+    data_path, because nothing says whether it was trained on scaled
+    labels; the analysis tools then report units "unknown" too.  Units
+    "label" for a model with no recorded scaling assume it was trained
+    on unscaled labels.
 
     Args:
         model_id: User-chosen identifier for this model (e.g. "my_vcnn").
-        checkpoint_path: Absolute path to a .ckpt file on disk.
+        checkpoint_path: Absolute path to a Lightning .ckpt file or an
+                         inference checkpoint (e.g. a released
+                         vcnnbpnet.pt).
         model_type: Architecture class name from tfbs.nn.models
-                    (e.g. "VCNNBpnet", "RNN").
+                    (e.g. "VCNNBpnet", "RNN"); for an inference
+                    checkpoint it must equal the file's arch.
         device: "cpu" or "cuda".  Auto-detected if omitted (uses GPU when
                 available on SLURM, CPU otherwise).
         data_path: Where the scaling parameters are: the training data
@@ -1118,11 +1338,17 @@ async def tfbs_load_model(
                    combined file keyed by those names works too).
 
     Returns:
-        JSON with model_id, model_type, input_length, classify, device,
-        scaling_params (null when none were found), scaling_source (the
-        file they came from), checkpoint_scaling_method (the scaling the
-        checkpoint was trained with, null if unknown) and "warning" when
-        a regression model's scaling parameters are missing.
+        JSON with model_id, model_type, checkpoint_format ("inference" or
+        "lightning"), input_length, classify, device, scaling_params
+        (null when none were found), scaling_source (the file they came
+        from: the checkpoint itself for an inference checkpoint),
+        checkpoint_scaling_method (the scaling the checkpoint was trained
+        with, null if unknown), library and metadata when an inference
+        checkpoint has them (tensors and numpy values converted to lists
+        and numbers), and "warning" when a regression model's scaling
+        parameters are missing, with "units": "unknown" for an inference
+        checkpoint.  The model is registered only once this result is
+        built.
     """
     _ensure_imports()
 
@@ -1147,44 +1373,57 @@ async def tfbs_load_model(
         return _error(f"Unknown model_type '{model_type}'.",
                       f"Use one of: {available}.", available=available)
 
-    meta = _checkpoint_meta(path)
-    scaling_params, scaling_source, err = _find_scaling_params(
-        data_path, path, model_type, meta)
-    if err:
-        return err
-
-    model, err = _load_checkpoint(model_cls, path, model_type, device, meta)
-    if err:
-        return err
+    ckpt = _load_weights_only(path)
+    extra: dict[str, Any] = {}
+    if _is_inference_payload(ckpt):
+        checkpoint_format = "inference"
+        scaling_params, scaling_source, err = _inference_scaling(ckpt, path, model_type, data_path)
+        if err:
+            return err
+        model, err = _build_inference_model(ckpt, path, model_type, model_cls)
+        if err:
+            return err
+        hparams = ckpt["hyper_parameters"]
+        input_length = hparams.get("input_length", getattr(model, "input_length", None))
+        classify = bool(hparams.get("classify", getattr(model, "classify", False)))
+        recorded = (scaling_params or {}).get("scaling_method")
+        for key in ("library", "metadata"):
+            if ckpt.get(key) is not None:
+                extra[key] = ckpt[key]
+        meta = None
+    else:
+        checkpoint_format = "lightning"
+        meta = _checkpoint_meta(path, ckpt)
+        scaling_params, scaling_source, err = _find_scaling_params(
+            data_path, path, model_type, meta)
+        if err:
+            return err
+        model, err = _load_checkpoint(model_cls, path, model_type, device, meta)
+        if err:
+            return err
+        input_length = getattr(model, "input_length", None)
+        classify = getattr(model, "classify", False)
+        recorded = _recorded_scaling(path, meta)
+    del ckpt
     model.eval()
     if hasattr(model, "freeze"):
         model.freeze()
     model = model.to(device)
+    units_unknown = checkpoint_format == "inference" and not classify and scaling_params is None
 
-    input_length = getattr(model, "input_length", None)
-    classify = getattr(model, "classify", False)
-
-    _model_registry[model_id] = {
-        "model": model,
-        "model_type": model_type,
-        "device": device,
-        "input_length": input_length,
-        "classify": classify,
-        "scaling_params": scaling_params,
-    }
-
-    recorded = _recorded_scaling(path, meta)
     result = {
         "model_id": model_id,
         "model_type": model_type,
+        "checkpoint_format": checkpoint_format,
         "input_length": input_length,
         "classify": classify,
         "device": device,
         "scaling_params": scaling_params,
         "scaling_source": scaling_source,
         "checkpoint_scaling_method": recorded,
+        **extra,
     }
-    if not classify and scaling_params is None and recorded not in (None, "none"):
+    if not classify and scaling_params is None and recorded not in (None, "none") and meta:
         data_dir = _training_data_dir(path, meta)
         result["warning"] = (
             f"This regression model was trained on '{recorded}'-scaled labels, but no "
@@ -1194,7 +1433,34 @@ async def tfbs_load_model(
             + (f" (the checkpoint records {data_dir}, which has none)" if data_dir else "")
             + ", or to that JSON file."
         )
-    return json.dumps(result)
+    if units_unknown:
+        result["units"] = "unknown"
+        result["warning"] = (
+            "This inference checkpoint of a regression model carries no scaling block "
+            "and no scaling parameters were found, so it is unknown whether its scores "
+            "are in label units or in a training scale; the analysis tools report units "
+            "\"unknown\". If it was trained on scaled labels, load it again with "
+            "data_path set to the scaling_params.json of its training run (or the "
+            "directory holding it)."
+        )
+    try:
+        result.update({key: _json_safe(value) for key, value in extra.items()})
+        text = json.dumps(result, default=str)
+    except (TypeError, ValueError, RecursionError) as exc:
+        return _error(f"The checkpoint's library or metadata cannot be reported as JSON: {exc}",
+                      "Save library and metadata as plain strings, numbers, lists and dicts.")
+    _model_registry[model_id] = {
+        "model": model,
+        "model_type": model_type,
+        "device": device,
+        "input_length": input_length,
+        "classify": classify,
+        "scaling_params": scaling_params,
+        "checkpoint_scaling_method": recorded,
+        "checkpoint_format": checkpoint_format,
+        "units_unknown": units_unknown,
+    }
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1209,13 +1475,33 @@ def _inverse_scaling(entry: dict[str, Any], inverse_transform: bool | None):
         return lambda v: v * sp["std"] + sp["mean"]
     if sp.get("scaling_method") == "normalize":
         return lambda v: v * (sp["max"] - sp["min"]) + sp["min"]
-    if sp.get("scaling_method") == "none":
-        return lambda v: v
     return None
 
 
+def _units(entry: dict[str, Any], inverse) -> str:
+    """The units of a model's scores: label units, the training scale, or unknown.
+
+    "label" when the model has no label scaling (classifiers, scaling_method
+    "none", or none recorded, which assumes it was trained on unscaled
+    labels) or the scaling was undone; "training_scale" for a scaled
+    regression model whose scores were left as the model returns them;
+    "unknown" for a regression inference checkpoint that carries no
+    scaling block and for which no scaling file was found.
+    """
+    if inverse is not None or entry.get("classify"):
+        return "label"
+    if entry.get("units_unknown"):
+        return "unknown"
+    method = ((entry.get("scaling_params") or {}).get("scaling_method")
+              or entry.get("checkpoint_scaling_method"))
+    return "label" if method in (None, "none") else "training_scale"
+
+
 def _delta_scale(entry: dict[str, Any]) -> float | None:
-    """Factor that turns a difference of model outputs into label units."""
+    """Factor that turns a difference of model outputs into label units.
+
+    None exactly when _inverse_scaling(entry, None) is None.
+    """
     sp = entry.get("scaling_params")
     if not sp or entry.get("classify"):
         return None
@@ -1223,8 +1509,6 @@ def _delta_scale(entry: dict[str, Any]) -> float | None:
         return float(sp["std"])
     if sp.get("scaling_method") == "normalize":
         return float(sp["max"] - sp["min"])
-    if sp.get("scaling_method") == "none":
-        return 1.0
     return None
 
 
@@ -1321,9 +1605,16 @@ async def tfbs_predict(
     Returns:
         JSON with "scores" (normal mode; always a list with one value per
         sequence) or "best_scores", "best_sequences" and "mean_scores"
-        (window mode), plus "num_sequences" and "inverse_transformed"
-        (true when the scores are in the original label units); for a
-        FASTA input also "ids" (record names, in score order).
+        (window mode), plus "num_sequences", "inverse_transformed" (true
+        when a label scaling was undone; false for a model trained with
+        scaling_method "none" or without scaling parameters) and "units"
+        ("label" when the scores are in label units, because the model
+        has no label scaling or it was undone, which for a model with no
+        recorded scaling assumes it was trained on unscaled labels;
+        "training_scale" when a label scaling was left in place; "unknown"
+        for a regression inference checkpoint loaded without any scaling
+        block or file);
+        for a FASTA input also "ids" (record names, in score order).
     """
     _ensure_imports()
     X, ids, err = _load_sequence_input(sequences, sequences_path)
@@ -1399,6 +1690,7 @@ async def tfbs_predict(
                 chunks.append(model(X[k:k + batch_size].to(device)).cpu())
         result = {"scores": _per_sequence(_torch.cat(chunks).numpy()), "num_sequences": n}
     result["inverse_transformed"] = inverse is not None
+    result["units"] = _units(entry, inverse)
     if ids is not None:
         result["ids"] = ids
     return json.dumps(result)
@@ -1555,7 +1847,10 @@ async def tfbs_analyze(
         path) and, for inline sequences, "attributions" (N x 4 x L);
         for a sequences_path input "attribution_sums" (one total per
         sequence) and, for FASTA, "ids"; "warnings" lists the distinct
-        warnings captum or tangermeme raised during the attribution.
+        warnings captum or tangermeme raised during the attribution,
+        each once as {message, count}, with message the warning's
+        category and its text before the first ":" (so tensor values do
+        not split one warning into many).
     """
     try:
         from captum.attr import DeepLiftShap, InputXGradient
@@ -1710,7 +2005,8 @@ async def tfbs_mutagenesis(
     scaling parameters, predictions are converted to the original label
     units (standardize: x * std + mean; normalize: x * (max - min) +
     min) and prediction changes are multiplied by std (or max - min);
-    "inverse_transformed" says whether that happened.  Classifier
+    "inverse_transformed" says whether that happened, and "units" is
+    "label", "training_scale" or "unknown" as in tfbs_predict.  Classifier
     outputs and models without scaling parameters stay as the model
     returns them.
 
@@ -1736,7 +2032,8 @@ async def tfbs_mutagenesis(
         prediction change of each substitution, mean-centred across the
         four bases at each position) and "shape", or with
         raw_outputs=true: "original_scores" and "mutant_scores"; always
-        "files" with the paths written and "inverse_transformed".  For a
+        "files" with the paths written, "inverse_transformed" and
+        "units".  For a
         sequences_path input the arrays are only in the files, and FASTA
         record names are in "ids".
     """
@@ -1804,6 +2101,7 @@ async def tfbs_mutagenesis(
         if inline:
             payload["scores"] = attr.numpy().tolist()
     payload["inverse_transformed"] = inverse is not None
+    payload["units"] = _units(entry, inverse)
     if ids is not None:
         payload["ids"] = ids
     return json.dumps(payload)
@@ -1846,7 +2144,8 @@ async def tfbs_marginalize(
     the original label units (standardize: x * std + mean; normalize:
     x * (max - min) + min), and the deltas are their difference, i.e.
     the model-scale delta times std (or max - min);
-    "inverse_transformed" says whether that happened.
+    "inverse_transformed" says whether that happened, and "units" is
+    "label", "training_scale" or "unknown" as in tfbs_predict.
 
     Args:
         model_id: Identifier of a model loaded via tfbs_load_model.
@@ -1861,7 +2160,7 @@ async def tfbs_marginalize(
     Returns:
         JSON with per-sequence lists "delta_predictions" (after - before),
         "predictions_before" and "predictions_after", plus "mean_delta",
-        "motif" and "inverse_transformed".
+        "motif", "inverse_transformed" and "units".
     """
     try:
         from tangermeme.marginalize import marginalize
@@ -1950,6 +2249,7 @@ async def tfbs_marginalize(
         "mean_delta": float(delta.mean()),
         "motif": motif,
         "inverse_transformed": inverse is not None,
+        "units": _units(entry, inverse),
     })
 
 
@@ -2031,9 +2331,10 @@ async def tfbs_classify_metrics(
 # Tool 8: tfbs_fimo
 # ---------------------------------------------------------------------------
 _FIMO_MISSING = {
-    "error": "fimo not found on PATH, and no PyTorch FIMO (tangermeme) to fall back on",
-    "fix": "Install tangermeme (pip install 'tfbs-mcp[viz]'; tangermeme 1.x brings its "
-           "pure-PyTorch FIMO), or install the MEME Suite "
+    "error": "fimo not found on PATH, and no FIMO reimplementation (tangermeme or "
+             "memelite) to fall back on",
+    "fix": "Install tangermeme (pip install 'tfbs-mcp[viz]'; tangermeme 1.x brings "
+           "memelite, its numba-based FIMO reimplementation), or install the MEME Suite "
            "(https://meme-suite.org/meme/doc/download.html) and put its bin directory "
            "on the PATH of the MCP server; then restart the MCP client.",
 }
@@ -2042,9 +2343,16 @@ _FIMO_COLUMNS = ["motif", "sequence", "start", "end", "strand", "score", "p_valu
                  "matched_sequence"]
 
 
+_PYTHON_FIMO_BACKENDS = {"tangermeme.tools.fimo": "tangermeme", "memelite.fimo": "memelite"}
+
+
 def _python_fimo():
-    """(fimo function, module name) of the pure-PyTorch FIMO, or (None, None)."""
-    for module in ("tangermeme.tools.fimo", "memelite.fimo"):
+    """(fimo function, module name) of tangermeme's FIMO reimplementation, or (None, None).
+
+    That is memelite (numba-based, shipped with tangermeme 1.x) as
+    memelite.fimo, or tangermeme.tools.fimo in older tangermeme releases.
+    """
+    for module in _PYTHON_FIMO_BACKENDS:
         try:
             return importlib.import_module(module).fimo, module
         except (ImportError, AttributeError):
@@ -2103,12 +2411,36 @@ def _meme_fimo_hits(motif_path: Path, fasta_path: Path, fimo_out: Path, threshol
     return hits, None
 
 
+def _terminated_motif_copy(motif_path: Path, work_dir: Path) -> Path:
+    """A copy of motif_path in work_dir that ends with a blank line.
+
+    memelite's read_meme stores a motif only when a line follows its
+    last matrix row, so a file that ends right after that row would lose
+    its last motif.
+    """
+    with open(motif_path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    copy = work_dir / "motifs.meme"
+    with open(copy, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+        f.write("\n")
+    return copy
+
+
 def _python_fimo_hits(fimo, motif_path: Path, fasta_path: Path, fimo_out: Path,
                       threshold: float, sequences: list[str]) -> list[dict]:
-    """Hits of the pure-PyTorch FIMO, in the MEME columns, written to fimo_out/fimo.tsv."""
+    """Hits of tangermeme's FIMO reimplementation, in the MEME columns, written to fimo_out/fimo.tsv."""
     import csv
 
-    frames = fimo(str(motif_path), str(fasta_path), threshold=threshold,
+    motif_path = _terminated_motif_copy(motif_path, fasta_path.parent)
+    # memelite's scan loop stops one window short of the end of every
+    # sequence; one trailing N (scored as no base) brings the last window in.
+    padded = fasta_path.with_name(fasta_path.stem + "_padded.fasta")
+    with open(padded, "w", encoding="utf-8", newline="\n") as f:
+        for i, seq in enumerate(sequences):
+            f.write(f">seq{i}\n{seq}N\n")
+    padded.with_name(padded.name + ".fai").unlink(missing_ok=True)
+    frames = fimo(str(motif_path), str(padded), threshold=threshold,
                   reverse_complement=True)
     by_name = {f"seq{i}": seq.upper() for i, seq in enumerate(sequences)}
     hits = []
@@ -2116,7 +2448,9 @@ def _python_fimo_hits(fimo, motif_path: Path, fasta_path: Path, fimo_out: Path,
         for row in frame.to_dict(orient="records"):
             name = str(row["sequence_name"])
             start, end = int(row["start"]), int(row["end"])
-            site = by_name.get(name, "")[start:end]
+            if name not in by_name or end > len(by_name[name]):
+                continue
+            site = by_name[name][start:end]
             strand = str(row["strand"])
             hits.append({
                 "motif": str(row["motif_name"]).split()[0],
@@ -2141,7 +2475,7 @@ def _python_fimo_hits(fimo, motif_path: Path, fasta_path: Path, fimo_out: Path,
     name="tfbs_fimo",
     annotations={
         "title": "FIMO Motif Scan",
-        "readOnlyHint": True,
+        "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
@@ -2156,31 +2490,39 @@ async def tfbs_fimo(
     """Run FIMO motif scanning on DNA sequences.
 
     Writes the sequences to a FASTA file and scans them with FIMO: the
-    MEME Suite's ``fimo`` binary when it is on PATH, otherwise the
-    pure-PyTorch reimplementation of FIMO that ships with tangermeme
-    (tangermeme.tools.fimo, or memelite.fimo, which tangermeme 1.x
-    depends on), so the tool works without the MEME Suite, e.g. on
-    Windows.  Both use the same p-value threshold and scan both strands;
-    the binary keeps only the better strand at each position
-    (--max-strand), the PyTorch FIMO reports a hit on each strand.
-    Without either, the tool returns an error with the install hint.
+    MEME Suite's ``fimo`` binary when it is on PATH, otherwise
+    tangermeme's FIMO reimplementation (memelite, numba-based, shipped
+    with tangermeme 1.x; tangermeme.tools.fimo in older tangermeme), so
+    the tool works without the MEME Suite, e.g. on Windows.  Both use
+    the same p-value threshold and scan every window of both strands, up
+    to and including the one that ends on the last base; the binary
+    keeps only the better strand at each position (--max-strand), the
+    reimplementation reports a hit on each strand.  The reimplementation
+    reads a copy of motif_file, motifs.meme in the output directory,
+    ending in a blank line, because memelite drops a last motif that
+    ends the file.  Without either, the tool returns an error with the
+    install hint.
 
     Args:
         sequences: DNA sequences to scan (A/C/G/T).
         motif_file: Absolute path to a MEME-format motif file.
         threshold: FIMO p-value threshold (default 1e-4).
-        output_dir: Directory for the FASTA and the hit table.  Uses a
-                    temp dir if omitted.
+        output_dir: Directory for the FASTA and the hit table.  Default
+                    <results>/fimo/<digest>/, with <results> the
+                    results_dir of tfbs_server_info and <digest> a hash
+                    of the sequences, motif file and threshold.
 
     Returns:
         JSON with "hits" (up to 500, lowest p-value first; each with
         motif (the motif ID), sequence (seq0, seq1, ... in input order),
         start and end (1-based, inclusive, as FIMO reports them), strand,
         score, p_value and matched_sequence (read on the hit's strand)),
-        "total_hits", "backend" ("meme" or "tangermeme"), "output_dir"
-        and "files" (sequences_fasta: the FASTA that was scanned;
-        fimo_tsv: all hits, MEME's own fimo.tsv for the binary and a TSV
-        with the columns above for the PyTorch FIMO).
+        "total_hits", "backend" ("meme" for the binary, "memelite" when
+        memelite.fimo ran, "tangermeme" when tangermeme.tools.fimo ran),
+        "backend_module" (the module, for the last two), "output_dir"
+        and "files" (sequences_fasta: the sequences scanned; fimo_tsv:
+        all hits, MEME's own fimo.tsv for the binary and a TSV with the
+        columns above for the reimplementation).
     """
     motif_path, err = _resolve_reference(motif_file, "motif_file")
     if err:
@@ -2203,7 +2545,9 @@ async def tfbs_fimo(
             return json.dumps(_FIMO_MISSING)
 
     work_dir = (Path(output_dir).expanduser().resolve() if output_dir
-                else Path(tempfile.mkdtemp(prefix="tfbs_fimo_")))
+                else _results_root() / "fimo" / _digest(
+                    [s.upper() for s in sequences], _file_identity(str(motif_path)),
+                    float(threshold)))
     work_dir.mkdir(parents=True, exist_ok=True)
     fasta_path = work_dir / "input.fasta"
     with open(fasta_path, "w", newline="\n") as f:
@@ -2226,9 +2570,10 @@ async def tfbs_fimo(
             hits = _python_fimo_hits(python_fimo, motif_path, fasta_path, fimo_out,
                                      threshold, sequences)
         except (ValueError, KeyError, IndexError, OSError) as exc:
-            return _error(f"The PyTorch FIMO ({module}) failed: {type(exc).__name__}: {exc}",
+            return _error(f"The FIMO reimplementation ({module}) failed: "
+                          f"{type(exc).__name__}: {exc}",
                           "Check that motif_file is a MEME-format motif file.")
-        backend = "tangermeme"
+        backend = _PYTHON_FIMO_BACKENDS.get(module, module)
 
     hits.sort(key=lambda h: h["p_value"])
     result: dict[str, Any] = {
@@ -2238,7 +2583,7 @@ async def tfbs_fimo(
         "output_dir": str(fimo_out),
         "files": {"sequences_fasta": str(fasta_path), "fimo_tsv": str(fimo_out / "fimo.tsv")},
     }
-    if backend == "tangermeme":
+    if backend != "meme":
         result["backend_module"] = module
     return json.dumps(result)
 
@@ -2825,26 +3170,44 @@ async def tfbs_train(
         job_name: SLURM job name.  Auto-generated if omitted.
         extra_args: Additional CLI arguments appended to the training
                     command (config and local mode).  Each element is one
-                    or more argv tokens: an element with spaces or quotes
-                    is split like a shell would split it (e.g.
-                    "--trainer.max_epochs 3"), any other element is one
-                    token as given.
+                    or more argv tokens: an element with whitespace or
+                    quotes is split like a shell would split it (e.g.
+                    "--trainer.max_epochs 3"; quotes are removed once, as
+                    a POSIX shell removes them, on every platform, and on
+                    Windows backslashes are not escapes), any other
+                    element is one token as given, so a Windows path keeps its
+                    backslashes.  The same tokenization applies in SLURM
+                    config mode.  An element with unbalanced quotes
+                    returns an error naming it.
         local: Train on this machine instead of submitting to SLURM
                (needs config_path; default false).
-        local_timeout: Seconds local mode may run (default 3600); the
-                       training process is killed after that.
+        local_timeout: Seconds local mode may run (default 3600, at
+                       least 1); the trainer runs in a process group of
+                       its own, and that whole group (the process tree,
+                       on Windows) is killed after that, and also when
+                       the MCP call is cancelled.
 
     Returns:
         JSON with mode, job_id, submit_command, and (for config mode)
         the generated sbatch script content.  Local mode returns mode
         "local", command (the argv list), exit_code, log_path, log_tail
         (last 20 lines), checkpoint_path and checkpoint_exists (from the
-        config's ModelCheckpoint dirpath and filename), and "metrics":
-        the last row of the CSVLogger metrics.csv under the checkpoint
-        directory that has val_loss ({val_loss, and for classifiers
-        val_acc and val_auc, as floats, plus epoch}) when there is one,
-        with its file as metrics_path.  A failed run returns error, fix,
-        exit_code, log_path and log_tail; a run killed after
+        config's ModelCheckpoint dirpath and filename; true only for a
+        file written by this run), and "metrics" from the metrics.csv
+        this run's CSVLogger wrote (<save_dir>/<name>/version_<n>/ of the
+        config's trainer.logger): the row of the best epoch, the one
+        with the lowest val_loss that ModelCheckpoint keeps ({val_loss,
+        and for classifiers val_acc and val_auc, as floats}), plus
+        best_epoch and epochs_run (last epoch + 1), with the file as
+        metrics_path.  A CSVLogger with a fixed version reuses its
+        metrics.csv, and some Lightning releases append to it, so only
+        the rows this run added are read: rows the file held when the
+        run started are skipped.  metrics is null, with a "note" saying
+        why, when the config has no CSVLogger or this run wrote no
+        metrics.csv;
+        val_auc is null, with a note, when the validation split holds a
+        single class (AUROC is undefined there).  A failed run returns
+        error, fix, exit_code, log_path and log_tail; a run killed after
         local_timeout returns error, fix and log_path.
     """
     if script and config_path:
@@ -2859,7 +3222,12 @@ async def tfbs_train(
         return _error("local=true trains from a config, not from an sbatch script.",
                       "Pass config_path with local=true, or submit the script "
                       "with local=false.")
-    tokens = [tok for arg in (extra_args or []) for tok in _argv_tokens(arg)]
+    tokens: list[str] = []
+    for arg in extra_args or []:
+        split, err = _argv_tokens(arg)
+        if err:
+            return err
+        tokens += split
 
     if script:
         script_p = Path(script).resolve()
@@ -2879,6 +3247,9 @@ async def tfbs_train(
                       "Pass the output_path that tfbs_config reported.")
 
     if local:
+        if local_timeout < 1:
+            return _error(f"local_timeout must be at least 1 second, got {local_timeout}.",
+                          "Pass the seconds local training may run, e.g. local_timeout=3600.")
         return await _train_locally(config_p, tokens, local_timeout)
     if shutil.which("sbatch") is None:
         return _no_sbatch_for_training()
@@ -2924,15 +3295,34 @@ async def tfbs_train(
     return json.dumps(result_dict)
 
 
-def _argv_tokens(arg: str) -> list[str]:
-    """One extra_args element as argv tokens.
+def _argv_tokens(arg: str, posix: bool | None = None) -> tuple[list[str], str | None]:
+    """(argv tokens, None) for one extra_args element, or ([], error JSON).
 
-    Only an element with whitespace or quotes is split: shlex would also
-    drop the backslashes of a Windows path given as a single token.
+    Only an element with whitespace or quotes is split: posix shlex would
+    also drop the backslashes of a Windows path given as a single token.
+    posix defaults to os.name != "nt".  posix=False (Windows) splits with
+    shell quoting but without backslash escapes, because shlex's own
+    non-posix mode leaves a quote inside a token (--x='a b') unsplit;
+    quotes are removed once on both platforms.
     """
-    if any(c in arg for c in " \t\n'\""):
-        return shlex.split(arg)
-    return [arg]
+    if not any(c.isspace() or c in "'\"" for c in arg):
+        return [arg], None
+    posix = os.name != "nt" if posix is None else posix
+    try:
+        if posix:
+            tokens = shlex.split(arg, posix=True)
+        else:
+            lexer = shlex.shlex(arg, posix=True)
+            lexer.whitespace_split = True
+            lexer.escape = ""
+            lexer.commenters = ""
+            tokens = list(lexer)
+    except ValueError as exc:
+        return [], _error(
+            f"extra_args element {arg!r} cannot be split into arguments: {exc}.",
+            "Balance the quotes in that element, or pass each argument as its own "
+            "element, e.g. ['--trainer.max_epochs', '3'].")
+    return tokens, None
 
 
 def _no_sbatch_for_training() -> str:
@@ -2962,31 +3352,165 @@ def _checkpoint_target(config: dict, base: Path) -> Path | None:
     return None
 
 
-def _last_validation_metrics(ckpt_dir: Path) -> tuple[dict | None, Path | None]:
-    """Last row with val_loss of the newest metrics.csv under ckpt_dir."""
+def _csv_logger_dir(config: dict, base: Path) -> Path | None:
+    """<save_dir>/<name> of the config's CSVLogger (relative save_dir against base), or None."""
+    loggers = (config.get("trainer") or {}).get("logger")
+    for lg in loggers if isinstance(loggers, list) else [loggers]:
+        if not isinstance(lg, dict) or not str(lg.get("class_path", "")).endswith("CSVLogger"):
+            continue
+        args = lg.get("init_args") or {}
+        if not args.get("save_dir"):
+            return None
+        save_dir = Path(str(args["save_dir"])).expanduser()
+        if not save_dir.is_absolute():
+            save_dir = base / save_dir
+        name = args.get("name", "lightning_logs")
+        return (save_dir / str(name) if name else save_dir).resolve()
+    return None
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_metrics_rows(path: Path) -> list[dict[str, str]]:
     import csv
 
-    if not ckpt_dir.is_dir():
-        return None, None
-    csvs = sorted(ckpt_dir.rglob("metrics.csv"), key=lambda p: p.stat().st_mtime)
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _metrics_snapshot(log_dir: Path | None) -> dict[Path, list[dict[str, str]]]:
+    """The rows of every metrics.csv under log_dir before a run starts."""
+    if log_dir is None or not log_dir.is_dir():
+        return {}
+    snapshot = {}
+    for path in log_dir.glob("*/metrics.csv"):
+        try:
+            snapshot[path] = _read_metrics_rows(path)
+        except (OSError, UnicodeDecodeError):
+            continue
+    return snapshot
+
+
+def _rows_of_this_run(rows: list[dict[str, str]], before: list[dict[str, str]] | None
+                      ) -> list[dict[str, str]]:
+    """rows without the leading rows the file already held when the run started.
+
+    A CSVLogger with a fixed version reuses its metrics.csv: Lightning
+    releases that append to it (and rewrite it with a wider header when
+    new metrics appear) keep the earlier run's rows first, and the
+    appended rows restart at a lower (epoch, step).  Lightning 2.6
+    deletes the file instead, so a rerun that logs the same rows again
+    continues past them, or matches them exactly, and is read whole.
+    """
+    if not before or len(rows) <= len(before):
+        return rows
+    for row, old in zip(rows, before):
+        if any(row.get(k, "") != v for k, v in old.items() if k is not None):
+            return rows
+
+    def position(row: dict[str, str]) -> tuple[float, float]:
+        return (_as_float(row.get("epoch")) or 0.0, _as_float(row.get("step")) or 0.0)
+
+    if position(rows[len(before)]) > position(rows[len(before) - 1]):
+        return rows
+    return rows[len(before):]
+
+
+def _best_epoch_metrics(log_dir: Path, since: float,
+                        before: dict[Path, list[dict[str, str]]] | None = None,
+                        ) -> tuple[dict | None, Path | None, str | None]:
+    """(metrics, metrics.csv, None) for the best epoch of the run, or (None, path or None, note).
+
+    Only a metrics.csv under log_dir modified at or after since (a
+    time.time() stamp) counts, and only the rows it gained during the
+    run: rows it held already (before, from _metrics_snapshot) are
+    skipped, so an earlier run's log is never reported.
+    """
+    csvs = [p for p in log_dir.glob("*/metrics.csv") if p.stat().st_mtime >= since] \
+        if log_dir.is_dir() else []
     if not csvs:
-        return None, None
-    with open(csvs[-1], newline="", encoding="utf-8") as f:
-        rows = [r for r in csv.DictReader(f) if (r.get("val_loss") or "").strip()]
-    if not rows:
-        return None, csvs[-1]
-    last = rows[-1]
+        return None, None, (f"This run wrote no metrics.csv under {log_dir} (the config's "
+                            "CSVLogger directory), so no validation metrics are reported.")
+    path = max(csvs, key=lambda p: p.stat().st_mtime)
+    rows = _rows_of_this_run(_read_metrics_rows(path), (before or {}).get(path))
+    epochs = [int(e) for e in (_as_float(r.get("epoch")) for r in rows) if e is not None]
+    scored = [r for r in rows if _as_float(r.get("val_loss")) is not None]
+    if not scored:
+        return None, path, f"{path} has no val_loss row, so no validation metrics are reported."
+    best = min(scored, key=lambda r: _as_float(r["val_loss"]))
     metrics: dict[str, Any] = {}
     for key in ("val_loss", "val_acc", "val_auc"):
-        try:
-            metrics[key] = float(last[key])
-        except (KeyError, TypeError, ValueError):
-            pass
+        value = _as_float(best.get(key))
+        if value is not None:
+            metrics[key] = value
+    best_epoch = _as_float(best.get("epoch"))
+    metrics["best_epoch"] = int(best_epoch) if best_epoch is not None else None
+    metrics["epochs_run"] = max(epochs) + 1 if epochs else None
+    return metrics, path, None
+
+
+def _single_class_validation(config: dict, base: Path) -> bool:
+    """Whether val/labels.pt of the config's dataset holds one class only."""
+    raw = (config.get("data") or {}).get("data_path")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    data = Path(raw).expanduser()
+    labels_path = (data if data.is_absolute() else base / data) / "val" / "labels.pt"
     try:
-        metrics["epoch"] = int(float(last["epoch"]))
-    except (KeyError, TypeError, ValueError):
+        _ensure_imports()
+        labels = _torch.load(labels_path, map_location="cpu", weights_only=True)
+        return int(_torch.unique(_torch.as_tensor(labels)).numel()) == 1
+    except Exception:
+        return False
+
+
+def _new_process_group(posix: bool | None = None) -> dict[str, Any]:
+    """Popen arguments that start the child in a process group of its own."""
+    posix = os.name != "nt" if posix is None else posix
+    if posix:
+        return {"start_new_session": True}
+    return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)}
+
+
+def _kill_process_group(proc, posix: bool | None = None) -> None:
+    """Kill proc and every process it started, falling back to proc.kill().
+
+    POSIX kills the process group that _new_process_group started;
+    Windows has no group kill, so taskkill /T walks the process tree.
+    """
+    posix = os.name != "nt" if posix is None else posix
+    try:
+        if posix:
+            os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            return
+        done = subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        if done.returncode == 0:
+            return
+    except Exception:
         pass
-    return metrics, csvs[-1]
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _wait_polling(proc, timeout: float, poll: float = 0.5) -> int:
+    """proc's exit code; kills its process group and raises TimeoutExpired after timeout seconds."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return proc.wait(timeout=max(0.0, min(poll, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                _kill_process_group(proc)
+                proc.wait()
+                raise
 
 
 async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str:
@@ -2998,20 +3522,33 @@ async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str
     except (OSError, yaml.YAMLError) as exc:
         return _error(f"Could not read the config {config_p}: {exc}",
                       "Pass a Lightning CLI YAML config, e.g. from tfbs_config.")
-    target = _checkpoint_target(config if isinstance(config, dict) else {}, config_p.parent)
+
+    config = config if isinstance(config, dict) else {}
+    target = _checkpoint_target(config, config_p.parent)
+    log_dir = _csv_logger_dir(config, config_p.parent)
     cmd = [sys.executable, "-m", "tfbs.cli.train_cli", "fit", "--config", str(config_p),
            "--data.num_workers", "0", *tokens]
     log_path = config_p.parent / f"{config_p.stem}_train.log"
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    env = {**_pipeline_env(), "PYTHONIOENCODING": "utf-8"}
+    # Whole seconds: some filesystems store mtimes no finer than that.
+    started = float(int(time.time()))
+    before = _metrics_snapshot(log_dir)
     try:
         with open(log_path, "a", encoding="utf-8", newline="\n") as log:
             log.write(f"\n# {stamp} {shlex.join(cmd)}\n")
             log.flush()
-            proc = await asyncio.to_thread(
-                subprocess.run, cmd, cwd=str(config_p.parent), env=_pipeline_env(),
+            proc = subprocess.Popen(
+                cmd, cwd=str(config_p.parent), env=env,
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                timeout=timeout,
+                **_new_process_group(),
             )
+            try:
+                returncode = await asyncio.to_thread(_wait_polling, proc, timeout)
+            except asyncio.CancelledError:
+                _kill_process_group(proc)
+                proc.wait()
+                raise
     except subprocess.TimeoutExpired:
         return _error(
             f"Local training did not finish within local_timeout={timeout} s; "
@@ -3026,28 +3563,44 @@ async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str
                       "Check that the config directory is writable and the server's "
                       "Python interpreter still exists.", log_path=str(log_path))
     tail = _tail_file(str(log_path), 20)
-    if proc.returncode != 0:
+    if returncode != 0:
         return _error(
-            f"Local training failed (exit {proc.returncode}).",
+            f"Local training failed (exit {returncode}).",
             "Read log_tail for the cause; a data_path that does not exist or an "
             "out-of-memory error (lower batch_size in tfbs_config) are the usual ones.",
-            exit_code=proc.returncode, log_path=str(log_path), log_tail=tail,
+            exit_code=returncode, log_path=str(log_path), log_tail=tail,
         )
+    notes: list[str] = []
+    fresh = bool(target and target.is_file() and target.stat().st_mtime >= started)
+    if target and target.is_file() and not fresh:
+        notes.append(f"{target} predates this run, so it is not reported as written by it.")
     result: dict[str, Any] = {
         "mode": "local",
         "command": cmd,
-        "exit_code": proc.returncode,
+        "exit_code": returncode,
         "log_path": str(log_path),
         "log_tail": tail,
         "checkpoint_path": str(target) if target else None,
-        "checkpoint_exists": bool(target and target.is_file()),
+        "checkpoint_exists": fresh,
         "metrics": None,
     }
-    if target:
-        metrics, metrics_path = _last_validation_metrics(target.parent)
+    if log_dir is None:
+        notes.append("The config has no CSVLogger with a save_dir (trainer.logger), so no "
+                     "validation metrics are reported; tfbs_config adds one.")
+    else:
+        metrics, metrics_path, note = _best_epoch_metrics(log_dir, started, before)
+        if note:
+            notes.append(note)
+        if metrics is not None and "val_auc" in metrics \
+                and _single_class_validation(config, config_p.parent):
+            metrics["val_auc"] = None
+            notes.append("validation split contains one class, so AUROC is undefined "
+                         "and val_auc is null (torchmetrics logs 0.0 for it).")
         result["metrics"] = metrics
         if metrics_path:
             result["metrics_path"] = str(metrics_path)
+    if notes:
+        result["note"] = " ".join(notes)
     return json.dumps(result)
 
 
@@ -3874,12 +4427,16 @@ async def tfbs_extract_loci(
         keeps the classifier from separating the classes by base
         composition, and it avoids the cross-TF contamination that
         other TFs' peaks would bring.
-      output_dir: <bed_dir>/<bed_name>_loci/ (bed_name without .bed or
-        .gz), so the data tools downstream derive their own outputs
-        from it; for a BED inside the installed package (the bundled
-        demo, tfbs/data/demo/demo_peaks.bed), <results>/<bed_name>_loci/
-        instead, so nothing is written into the package; with variants
-        and no BED,
+      output_dir: <bed_dir>/<bed_name>_loci_<in_window>bp[_gc|_shuffled]/
+        (bed_name without .bed or .gz; _gc for negatives="gc_matched",
+        _shuffled for "shuffled"), e.g. demo_peaks_loci_51bp_gc, so
+        extracting the same BED at another window or with negatives
+        never overwrites or mixes files, and the data tools downstream
+        derive their own outputs from it (demo_peaks_51bp_gc_classification/,
+        demo_peaks_51bp_gc_dataset/); for a BED inside the installed
+        package (the bundled demo, tfbs/data/demo/demo_peaks.bed), the
+        same name under <results>/ instead, so nothing is written into
+        the package; with variants and no BED,
         <results>/variants/<digest>/ (results_dir of tfbs_server_info,
         digest of the variants, window and genome).
 
@@ -3965,7 +4522,8 @@ async def tfbs_extract_loci(
                 stem = stem[: -len(suffix)]
         package_dir = Path(__file__).resolve().parents[1]
         base = _results_root() if bed.is_relative_to(package_dir) else bed.parent
-        out = base / f"{stem}_loci"
+        mode = _NEGATIVES_SUFFIX.get(negatives, "")
+        out = base / f"{stem}_loci_{in_window}bp{mode}"
     else:
         out = _results_root() / "variants" / _digest(sorted(variants), in_window, str(genome_path))
 
@@ -4493,8 +5051,9 @@ async def tfbs_prepare_classification(
       balance true: equal class sizes keep the 0.5 decision threshold
         and the PR-AUC baseline meaningful.
       output_dir: <name>_classification/ next to the positives'
-        directory, with <name> that directory's name minus a _loci
-        suffix (peaks_loci/sequences.pt -> peaks_classification/).
+        directory, with <name> that directory's name minus its _loci
+        part (peaks_loci_24bp_gc/sequences.pt ->
+        peaks_24bp_gc_classification/).
 
     Args:
         positive_path: Path to positive sequences.pt (N_pos, 4, L).
@@ -4600,8 +5159,8 @@ async def tfbs_prepare_regression(
         the MSE loss.  The training-time label scaling (tfbs_config
         scaling_method, "standardize" for regression) is applied on top.
       output_dir: <name>_regression/ next to the sequences' directory,
-        with <name> that directory's name minus a _loci suffix
-        (peaks_loci/sequences.pt -> peaks_regression/).
+        with <name> that directory's name minus its _loci part
+        (peaks_loci_200bp/sequences.pt -> peaks_200bp_regression/).
 
     Args:
         sequences_path: Path to sequences.pt (N, 4, L).
@@ -4748,7 +5307,8 @@ async def tfbs_seqlets(
         attribution = summed attribution over the span, and p-value),
         truncated, and files (seqlets: the TSV of all seqlets, with
         motif and motif_p_value columns when annotated).  "warnings"
-        lists the distinct warnings raised during the attribution; when
+        lists the distinct warnings raised during the attribution, each
+        once as {message, count} as in tfbs_analyze; when
         no seqlet is called, "note" says why (the caller found no
         significant span, or raised on flat attributions).  With
         motif_file, each returned seqlet also carries
@@ -4932,7 +5492,8 @@ async def tfbs_epistasis(
     scaling parameters, every prediction is converted to the original
     label units (standardize: x * std + mean; normalize: x * (max - min)
     + min) and delta and delta_delta are multiplied by std (or max -
-    min); "inverse_transformed" says whether that happened.
+    min); "inverse_transformed" says whether that happened, and "units"
+    is "label", "training_scale" or "unknown" as in tfbs_predict.
 
     Args:
         model_id: Identifier of a loaded model.
@@ -4958,7 +5519,7 @@ async def tfbs_epistasis(
         (the double mutants scored, 9 per position pair),
         top_interactions (double mutants with |delta_delta| > 1e-6,
         sorted by |delta_delta|, capped at 500, same fields as
-        epistasis_matrix.csv), inverse_transformed, output_dir and a
+        epistasis_matrix.csv), inverse_transformed, units, output_dir and a
         "files" object holding the paths of single_mutations and
         epistasis_matrix.
     """
@@ -5047,6 +5608,7 @@ async def tfbs_epistasis(
             for r in interactions
         ],
         "inverse_transformed": inverse is not None,
+        "units": _units(entry, inverse),
     }
 
     import csv as _csv
@@ -5357,33 +5919,79 @@ async def tfbs_conv_filters(
 # ---------------------------------------------------------------------------
 # Checkpoints of the benchmark and validation tools
 # ---------------------------------------------------------------------------
-def _module_importable(module: str, project_root: Path) -> bool:
-    """Whether a pipeline started from project_root can import module."""
-    import importlib.util
-
-    if module in sys.modules:
-        return True
-    added = str(project_root) not in sys.path
-    if added:
-        sys.path.insert(0, str(project_root))
-    try:
-        return importlib.util.find_spec(module) is not None
-    except (ImportError, ValueError):
+def _loaded_from(module: str, root: Path) -> bool:
+    """Whether the server itself imported module from a file under root."""
+    loaded = sys.modules.get(module)
+    if loaded is None:
         return False
-    finally:
-        if added:
-            sys.path.remove(str(project_root))
+    files = [getattr(loaded, "__file__", None), *list(getattr(loaded, "__path__", None) or [])]
+    root = root.resolve()
+    for f in files:
+        if f:
+            try:
+                if Path(f).resolve().is_relative_to(root):
+                    return True
+            except (OSError, ValueError):
+                continue
+    return False
+
+
+_IMPORT_PROBE_TIMEOUT = 120
+
+
+def _module_importable(module: str, project_root: Path,
+                       timeout: int = _IMPORT_PROBE_TIMEOUT) -> bool | None:
+    """Whether a pipeline started from project_root can import module; None if the check timed out.
+
+    Checked in a child interpreter with the pipelines' environment and
+    working directory, so the server never imports a checkpoint's
+    package itself; a module the server already imported from under
+    project_root counts without one.  The probe blocks, so async tools
+    call it through asyncio.to_thread.
+    """
+    if _loaded_from(module, project_root):
+        return True
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-c", "import importlib, sys; importlib.import_module(sys.argv[1])",
+             module],
+            cwd=str(project_root), env=_pipeline_env(), stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError:
+        return False
+    return probe.returncode == 0
 
 
 def _unimportable_checkpoint_class(found: dict[str, str], project_root: Path) -> str | None:
-    """Error JSON for the first checkpoint whose recorded class module the pipeline cannot import."""
+    """Error JSON for the first checkpoint whose recorded class module the pipeline cannot import.
+
+    Each module is probed once per call, however many checkpoints name it.
+    """
+    verdicts: dict[str, bool | None] = {}
     for name, path in found.items():
         class_path = _checkpoint_class_path(Path(path))
         if not class_path:
             continue
         module = class_path.rpartition(".")[0]
-        if _module_importable(module, project_root):
+        if module not in verdicts:
+            verdicts[module] = _module_importable(module, project_root)
+        if verdicts[module]:
             continue
+        if verdicts[module] is None:
+            return _error(
+                f"The checkpoint for {name} ({path}) was saved with the class {class_path}, "
+                f"and whether the pipeline, which runs from the project root {project_root}, "
+                f"can import its module {module} could not be checked within "
+                f"{_IMPORT_PROBE_TIMEOUT} s.",
+                "Retry the call (the first import of a large package can be slow, e.g. "
+                "on a busy login node); if it times out again, check that "
+                f"'python -c \"import {module}\"' finishes when run from {project_root}. "
+                "Nothing was run or submitted.",
+                class_path=class_path, checkpoint=path,
+            )
         return _error(
             f"The checkpoint for {name} ({path}) was saved with the class {class_path}, "
             f"and its module {module} cannot be imported by the pipeline, which runs "
@@ -5570,7 +6178,8 @@ async def tfbs_chipseq_benchmark(
     project_root, err = _work_dir()
     if err:
         return err
-    found, ckpt_warning, err = _benchmark_checkpoints(
+    found, ckpt_warning, err = await asyncio.to_thread(
+        _benchmark_checkpoints,
         models_dir, datasets, model_type, scaling_method, checkpoints, project_root)
     if err:
         return err
@@ -5769,7 +6378,8 @@ async def tfbs_chipseq_method_comparison(
     project_root, err = _work_dir()
     if err:
         return err
-    found, ckpt_warning, err = _benchmark_checkpoints(
+    found, ckpt_warning, err = await asyncio.to_thread(
+        _benchmark_checkpoints,
         models_dir, datasets, model_type, scaling_method, checkpoints, project_root)
     if err:
         return err
@@ -5985,7 +6595,8 @@ async def tfbs_remap_validation(
     project_root, err = _work_dir()
     if err:
         return err
-    found, ckpt_warning, err = _benchmark_checkpoints(
+    found, ckpt_warning, err = await asyncio.to_thread(
+        _benchmark_checkpoints,
         models_dir, datasets, model_type, scaling_method, checkpoints, project_root)
     if err:
         return err
@@ -6276,9 +6887,9 @@ def main():
     # Register FoldX tools on the shared mcp instance
     import tfbs.mcp.foldx_tools  # noqa: F401
 
-    missing = _preload_native_modules()
-    if missing:
-        logger.info("Optional modules not available: %s", ", ".join(sorted(missing)))
+    unavailable = _unavailable_modules(_preload_native_modules())
+    if unavailable:
+        logger.info("Optional modules not available: %s", ", ".join(unavailable))
     _detach_child_stdin()
     mcp.run()
 

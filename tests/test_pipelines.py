@@ -682,3 +682,25 @@ def test_validate_run_saves_the_metrics_trainer_test_reports(tmp_path, monkeypat
     validate.run(args)
     row = _csv_rows(tmp_path / "results.csv")[0]
     assert (row["test_loss"], row["test_acc"], row["test_auc"]) == ("0.2", "0.75", "0.85")
+
+
+def test_validate_writes_lf_line_endings_on_append_and_rewrite(tmp_path):
+    from tfbs.pipelines import validate
+
+    validate.save_results(_args(tmp_path), 0.5)
+    validate.save_results(_args(tmp_path), 0.6)
+    validate.save_results(_args(tmp_path), {"test_loss": 0.4, "test_auc": 0.9})
+    data = (tmp_path / "results.csv").read_bytes()
+    assert b"\r" not in data and data.count(b"\n") == 4
+
+
+@pytest.mark.parametrize("module", ["chipseq_benchmark", "chipseq_benchmark_with_foldx",
+                                    "remap_validation"])
+def test_scaling_method_help_says_the_fallback_needs_the_flag_omitted(module, capsys):
+    pipeline = importlib.import_module(f"tfbs.pipelines.{module}")
+    with pytest.raises(SystemExit):
+        pipeline.main(["--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "Only when this flag is omitted and that file is missing" in text
+    assert "an explicit value never falls back to another folder" in text
+    assert "(default: the standardize folder)" in text

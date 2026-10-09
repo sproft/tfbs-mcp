@@ -275,9 +275,11 @@ def main(argv=None):
                         help="Dataset names (subdirectories of models-dir)")
     parser.add_argument("--scaling-method", type=str, default=DEFAULT_SCALING,
                         help="Scaling subdirectory of each dataset's checkpoint: "
-                             "<models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt; "
-                             "when that file is missing, a single "
-                             "<dataset>/*/best_<model-type>.ckpt is used")
+                             "<models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt "
+                             "(default: the standardize folder). "
+                             "Only when this flag is omitted and that file is missing "
+                             "is a single <dataset>/*/best_<model-type>.ckpt used; an "
+                             "explicit value never falls back to another folder")
     parser.add_argument("--checkpoints", type=str, nargs="+", metavar="NAME=PATH",
                         help="Explicit checkpoints; replace --models-dir and --datasets")
     parser.add_argument("--cutoffs", type=int, nargs="+", default=[1, 3, 5, 8],

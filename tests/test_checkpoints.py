@@ -174,8 +174,11 @@ def bench(tmp_path, monkeypatch):
              ("genome.fa", "motif.meme", "peaks.bed", "complex.pdb")}
     (tmp_path / "intersect").mkdir()
     calls = []
+    real_run = subprocess.run
 
     def fake_run(cmd, *a, **k):
+        if list(cmd[1:2]) == ["-c"]:
+            return real_run(cmd, *a, **k)
         calls.append(list(cmd))
         if cmd[0] == "sbatch":
             return subprocess.CompletedProcess(cmd, 0, "Submitted batch job 5\n", "")
@@ -329,6 +332,7 @@ def test_a_class_module_under_the_project_root_is_importable(bench):
     try:
         result = _tool("tfbs_chipseq_benchmark", tmp_path, files, datasets=["ds"],
                        models_dir=str(tmp_path / "m"))
+        assert not [k for k in sys.modules if k.startswith("rootshim_q")]
     finally:
         for key in [k for k in sys.modules if k.startswith("rootshim_q")]:
             sys.modules.pop(key)
@@ -336,7 +340,88 @@ def test_a_class_module_under_the_project_root_is_importable(bench):
     assert str(tmp_path) not in sys.path
 
 
+def test_importability_is_probed_in_a_child_with_the_pipeline_cwd(tmp_path, monkeypatch):
+    import types
+
+    pkg = tmp_path / "probeshim_k"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    assert server._module_importable("probeshim_k", tmp_path)
+    assert "probeshim_k" not in sys.modules
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    assert not server._module_importable("probeshim_k", elsewhere)
+
+    # Imported by the server, but not from the project root: probed, not trusted.
+    monkeypatch.setitem(sys.modules, "ghostshim_z", types.ModuleType("ghostshim_z"))
+    assert not server._module_importable("ghostshim_z", tmp_path)
+
+
+def test_a_module_the_server_imported_from_the_project_root_needs_no_probe(monkeypatch):
+    import tfbs
+
+    def no_probe(*a, **k):
+        raise AssertionError("no child process expected")
+
+    monkeypatch.setattr(server.subprocess, "run", no_probe)
+    assert server._module_importable("tfbs.nn.models", Path(tfbs.__file__).resolve().parent.parent)
+
+
 def test_tool_descriptions_say_the_lookup_is_all_or_nothing():
     for name in TOOLS:
         doc = " ".join(getattr(server, name).__doc__.split())
         assert "all-or-nothing" in doc and "never falls back" in doc, name
+
+
+def _two_checkpoints_of_one_class(tmp_path: Path) -> Path:
+    models = tmp_path / "m"
+    for ds in ("a", "b"):
+        _class_path_ckpt(models / ds / "standardize" / "best_VCNNBpnet.ckpt",
+                         "sharedshim_p.nn.models.VCNNBpnet")
+    return models
+
+
+def test_a_module_is_probed_once_per_call_and_off_the_event_loop(bench, monkeypatch):
+    import threading
+
+    tmp_path, files, calls = bench
+    models = _two_checkpoints_of_one_class(tmp_path)
+    probes = []
+
+    def fake_probe(module, project_root, timeout=120):
+        probes.append((module, threading.current_thread() is threading.main_thread()))
+        return True
+
+    monkeypatch.setattr(server, "_module_importable", fake_probe)
+    result = _tool("tfbs_chipseq_benchmark", tmp_path, files, datasets=["a", "b"],
+                   models_dir=str(models))
+    assert set(result["checkpoints"]) == {"a", "b"}, result
+    assert probes == [("sharedshim_p.nn.models", False)]
+    _tool("tfbs_chipseq_benchmark", tmp_path, files, datasets=["a", "b"], models_dir=str(models))
+    assert len(probes) == 2
+
+
+def test_a_probe_timeout_is_not_reported_as_an_import_failure(bench, monkeypatch):
+    tmp_path, files, calls = bench
+    models = _two_checkpoints_of_one_class(tmp_path)
+    monkeypatch.setattr(server, "_module_importable", lambda *a, **k: None)
+    result = _tool("tfbs_chipseq_benchmark", tmp_path, files, datasets=["a", "b"],
+                   models_dir=str(models))
+    assert "could not be checked within 120 s" in result["error"]
+    assert "cannot be imported" not in result["error"]
+    assert "Retry" in result["fix"] and result["class_path"] == "sharedshim_p.nn.models.VCNNBpnet"
+    assert calls == []
+
+
+def test_the_probe_reports_a_timeout_as_none(monkeypatch, tmp_path):
+    def slow(cmd, *a, **k):
+        raise subprocess.TimeoutExpired(cmd, k.get("timeout"))
+
+    monkeypatch.setattr(server.subprocess, "run", slow)
+    assert server._module_importable("anything_x", tmp_path) is None
+
+    def missing(cmd, *a, **k):
+        return subprocess.CompletedProcess(cmd, 1, b"", b"ModuleNotFoundError")
+
+    monkeypatch.setattr(server.subprocess, "run", missing)
+    assert server._module_importable("anything_x", tmp_path) is False

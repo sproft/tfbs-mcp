@@ -35,6 +35,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import tfbs.mcp.server as _server
 from tfbs.mcp.server import mcp
 
 logger = logging.getLogger(__name__)
@@ -123,20 +124,22 @@ def _plddt_summary(pdb_path: str) -> dict | None:
     if not residues:
         return None
     n = len(residues)
-    segments: list[list[int]] = []
+    segments: list[dict[str, Any]] = []
     previous: tuple[str, int] | None = None
     for chain, resnum, plddt in residues:
         if plddt < _PLDDT_LOW:
             if (segments and previous is not None and previous[0] == chain
-                    and resnum == previous[1] + 1 and segments[-1][1] == previous[1]):
-                segments[-1][1] = resnum
+                    and resnum == previous[1] + 1 and segments[-1]["end"] == previous[1]
+                    and segments[-1]["chain"] == chain.strip()):
+                segments[-1]["end"] = resnum
             else:
-                segments.append([resnum, resnum])
+                segments.append({"chain": chain.strip(), "start": resnum, "end": resnum})
         previous = (chain, resnum)
     return {
         "fraction_confident": round(sum(p >= _PLDDT_CONFIDENT for *_, p in residues) / n, 4),
         "fraction_low": round(sum(p < _PLDDT_LOW for *_, p in residues) / n, 4),
         "low_confidence_segments": segments[:_MAX_LOW_SEGMENTS],
+        "low_confidence_segments_total": len(segments),
     }
 
 
@@ -468,8 +471,13 @@ async def tfbs_fetch_structure(
         pdb_id:      4-character PDB accession (e.g. ``3RKQ``).
         gene_name:   Gene name to search RCSB for (e.g. ``NKX2-1``).
         uniprot_id:  UniProt accession for AlphaFold DB (e.g. ``P43699``).
-        output_dir:  Directory to save downloaded files.  Defaults to a
-                     temporary directory.
+        output_dir:  Directory to save downloaded files.  Default
+                     <results>/structures/<id>/, with <results> the
+                     results_dir of tfbs_server_info and <id> the value of
+                     the source argument being tried (e.g. 3RKQ, NKX2-1 or
+                     P43699; PDB and UniProt IDs uppercased, so 3rkq and
+                     3RKQ share a directory), so a repeated call reuses
+                     its download.
 
     Returns:
         JSON with ``source`` (``local``, ``pdb`` or ``alphafold``),
@@ -480,9 +488,12 @@ async def tfbs_fetch_structure(
         AlphaFold DB it also has ``mean_plddt``, ``latest_version``,
         ``entry_id`` and the model ``url``.  An AlphaFold DB model also
         gets ``plddt_summary``: ``fraction_confident`` (share of residues
-        with pLDDT >= 70), ``fraction_low`` (share below 50) and
-        ``low_confidence_segments`` (up to 20 [start_residue,
-        end_residue] runs with pLDDT below 50); PDB entries have none.
+        with pLDDT >= 70), ``fraction_low`` (share below 50),
+        ``low_confidence_segments`` (up to 20 runs of consecutive
+        residues with pLDDT below 50, each as {chain, start, end} with
+        residue numbers) and ``low_confidence_segments_total`` (the
+        number of such runs, also beyond the first 20); PDB entries have
+        none.
         If every source fails, JSON with ``error``, ``fix`` and
         ``attempted``.
     """
@@ -499,19 +510,24 @@ async def tfbs_fetch_structure(
             "Pass at least one of local_path, pdb_id, gene_name or uniprot_id.",
         )
 
-    out: Path | None = None
-    if any(arg != "local_path" for arg, _, _ in candidates):
-        try:
-            out = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="tfbs_struct_"))
-            out.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return _error(
-                f"Cannot create output directory {output_dir}: {exc}",
-                "Pass a writable output_dir, or omit it to use a temporary directory.",
-            )
-
     attempted: list[dict] = []
     for arg, value, leg in candidates:
+        out: Path | None = None
+        if arg != "local_path":
+            key = str(value).strip()
+            if arg in ("pdb_id", "uniprot_id"):
+                key = key.upper()
+            out = (Path(output_dir) if output_dir
+                   else _server._results_root() / "structures" / _server._safe_name(key))
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return _error(
+                    f"Cannot create output directory {out}: {exc}",
+                    "Pass a writable output_dir, or set TFBS_PROJECT_ROOT to a writable "
+                    "directory (tfbs_server_info reports the results_dir in use).",
+                    attempted=attempted,
+                )
         try:
             result = leg(value, out)
         except _SourceError as exc:
@@ -1038,7 +1054,11 @@ async def tfbs_binding_scan(
         genome_fasta:   Path to a genome FASTA (an .fai index is built if
                         missing).
         region:         Genomic interval, e.g. ``chr1:1000-2000``.
-        output_dir:     Where to write the bigWig; defaults to a temp dir.
+        output_dir:     Where to write the bigWig.  Default
+                        <results>/binding_scan/<digest>/, with <results>
+                        the results_dir of tfbs_server_info and <digest> a
+                        hash of the region, window, step and structure
+                        path, so a repeated call writes to the same place.
         window:         Window size in bp.  Default None means the DNA
                         length of the structure (e.g. 11 bp), one FoldX run
                         per window.  An explicit value is used as given,
@@ -1165,13 +1185,16 @@ async def tfbs_binding_scan(
                       "Use a chromosome name exactly as it appears in the FASTA headers.")
     chrom_length = len(genome[chrom])
 
+    out = (Path(output_dir).expanduser() if output_dir
+           else _server._results_root() / "binding_scan"
+           / _server._digest(region, window, step, str(pdb)))
     try:
-        out = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="tfbs_scan_"))
         out.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         genome.close()
-        return _error(f"Cannot create output directory {output_dir}: {exc}",
-                      "Pass a writable output_dir, or omit it to use a temporary directory.")
+        return _error(f"Cannot create output directory {out}: {exc}",
+                      "Pass a writable output_dir, or set TFBS_PROJECT_ROOT to a writable "
+                      "directory (tfbs_server_info reports the results_dir in use).")
     bw_path = out.resolve() / "foldx_binding_scan.bw"
     used = {
         "region": region,

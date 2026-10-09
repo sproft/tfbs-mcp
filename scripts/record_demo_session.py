@@ -15,7 +15,9 @@ Usage::
 The plan is a JSON list of steps: {"role": "user", "text": ...},
 {"role": "llm", "text": ...}, or {"role": "tool", "tool": ..., "arguments": {...},
 "phase": ..., "kind": ...}. A tool step may reference an earlier result with
-"$ref": "<step index>.<json path>" inside its arguments.
+"$ref": "<step index>.<json path>" inside its arguments. A step that fails (a
+$ref that names a missing key, or an MCP protocol error) is logged as an error
+entry and the run goes on; the log is written even when the run crashes.
 
 --set KEY=VALUE (repeatable) replaces "@KEY" by VALUE in every string of the
 plan before any $ref is resolved, so one plan serves several machines, e.g.
@@ -52,14 +54,37 @@ def _substitute(value, variables: dict[str, str]):
     return value
 
 
+class RefError(LookupError):
+    """A $ref names a step or key that the recorded results do not have."""
+
+    def __init__(self, ref: str, missing, available: list):
+        super().__init__(f"$ref {ref!r}: no {missing!r}; available: {available}")
+        self.ref, self.missing, self.available = ref, missing, available
+
+
+def _keys(node) -> list:
+    if isinstance(node, dict):
+        return list(node)
+    if isinstance(node, list):
+        return list(range(len(node)))
+    return []
+
+
 def _resolve_refs(value, results):
     """Replace {"$ref": "3.files.sequences"} with the value from step 3's result."""
     if isinstance(value, dict):
         if set(value) == {"$ref"}:
-            idx, _, path = value["$ref"].partition(".")
-            node = results[int(idx)]
+            ref = value["$ref"]
+            idx, _, path = ref.partition(".")
+            try:
+                node = results[int(idx)]
+            except (KeyError, ValueError):
+                raise RefError(ref, idx, sorted(results)) from None
             for key in path.split(".") if path else []:
-                node = node[int(key)] if isinstance(node, list) else node[key]
+                try:
+                    node = node[int(key)] if isinstance(node, list) else node[key]
+                except (KeyError, IndexError, ValueError, TypeError):
+                    raise RefError(ref, key, _keys(node)) from None
             return node
         return {k: _resolve_refs(v, results) for k, v in value.items()}
     if isinstance(value, list):
@@ -80,6 +105,39 @@ def _write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, indent=1), encoding="utf-8", newline="\n")
 
 
+async def _play_step(session, i: int, step: dict, results: dict, timeout: float,
+                     t_launch: float) -> dict:
+    """The log entry of one plan step; a tool step that fails becomes an error entry."""
+    entry = dict(step)
+    if step["role"] != "tool":
+        return entry
+    t0 = time.perf_counter()
+    try:
+        arguments = _resolve_refs(step.get("arguments", {}), results)
+        entry["arguments"] = arguments
+        try:
+            result = await asyncio.wait_for(session.call_tool(step["tool"], arguments), timeout)
+            parsed, raw = _parse_result(result)
+            is_error = bool(getattr(result, "isError", False))
+        except asyncio.TimeoutError:
+            parsed, raw, is_error = {"error": f"no reply within {timeout:.0f} s"}, "", True
+    except RefError as exc:
+        parsed, raw, is_error = {"error": str(exc), "ref": exc.ref, "missing_key": exc.missing,
+                                 "available_keys": exc.available}, "", True
+    except Exception as exc:
+        parsed, raw, is_error = {"error": f"{type(exc).__name__}: {exc}"}, "", True
+    entry["seconds"] = round(time.perf_counter() - t0, 3)
+    entry["seconds_since_launch"] = round(time.perf_counter() - t_launch, 3)
+    entry["result"] = parsed
+    if parsed is None:
+        entry["result_text"] = raw
+    entry["is_error"] = is_error or (isinstance(parsed, dict) and "error" in parsed)
+    results[i] = parsed
+    status = "error" if entry["is_error"] else "ok"
+    print(f"[{i:02d}] {step['tool']} -> {status} ({entry['seconds']}s)", file=sys.stderr)
+    return entry
+
+
 async def run(server: str, plan: list, env: dict, out: Path, timeout: float = 600.0,
               server_args: list | None = None) -> None:
     # The SDK's default environment is the safe minimum a server needs; the
@@ -95,42 +153,37 @@ async def run(server: str, plan: list, env: dict, out: Path, timeout: float = 60
     }
     results: dict[int, object] = {}
     t_launch = time.perf_counter()
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            init = await asyncio.wait_for(session.initialize(), 600)
-            log["seconds_to_initialize"] = round(time.perf_counter() - t_launch, 3)
-            tools = await asyncio.wait_for(session.list_tools(), 60)
-            log["server_name"] = init.serverInfo.name
-            log["tools_listed"] = len(tools.tools)
-            for i, step in enumerate(plan):
-                entry = dict(step)
-                if step["role"] == "tool":
-                    arguments = _resolve_refs(step.get("arguments", {}), results)
-                    entry["arguments"] = arguments
-                    t0 = time.perf_counter()
-                    try:
-                        result = await asyncio.wait_for(session.call_tool(step["tool"], arguments), timeout)
-                        parsed, raw = _parse_result(result)
-                        is_error = bool(getattr(result, "isError", False))
-                    except asyncio.TimeoutError:
-                        parsed, raw, is_error = {"error": f"no reply within {timeout:.0f} s"}, "", True
-                    entry["seconds"] = round(time.perf_counter() - t0, 3)
-                    entry["seconds_since_launch"] = round(time.perf_counter() - t_launch, 3)
-                    entry["result"] = parsed
-                    if parsed is None:
-                        entry["result_text"] = raw
-                    entry["is_error"] = is_error or (isinstance(parsed, dict) and "error" in parsed)
-                    results[i] = parsed
-                    status = "error" if entry["is_error"] else "ok"
-                    print(f"[{i:02d}] {step['tool']} -> {status} ({entry['seconds']}s)", file=sys.stderr)
-                log["steps"].append(entry)
-            # Written here, before the session closes: a server that hangs on
-            # shutdown must not cost the recording.
-            call_log = env.get("TFBS_CALL_LOG")
-            if call_log and Path(call_log).is_file():
-                log["server_call_log"] = [json.loads(l) for l in Path(call_log).read_text().splitlines() if l.strip()]
-            _write_json(out, log)
-            print(f"wrote {out} with {len(log['steps'])} steps", file=sys.stderr)
+    written = False
+
+    def write_log() -> None:
+        call_log = env.get("TFBS_CALL_LOG")
+        if call_log and Path(call_log).is_file():
+            try:
+                with open(call_log, encoding="utf-8") as f:
+                    log["server_call_log"] = [json.loads(line) for line in f if line.strip()]
+            except (OSError, ValueError) as exc:
+                log["server_call_log_error"] = f"{type(exc).__name__}: {exc}"
+        _write_json(out, log)
+        print(f"wrote {out} with {len(log['steps'])} steps", file=sys.stderr)
+
+    try:
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                init = await asyncio.wait_for(session.initialize(), 600)
+                log["seconds_to_initialize"] = round(time.perf_counter() - t_launch, 3)
+                tools = await asyncio.wait_for(session.list_tools(), 60)
+                log["server_name"] = init.serverInfo.name
+                log["tools_listed"] = len(tools.tools)
+                for i, step in enumerate(plan):
+                    log["steps"].append(
+                        await _play_step(session, i, step, results, timeout, t_launch))
+                # Written before the session closes: a server that hangs on
+                # shutdown must not cost the recording.
+                write_log()
+                written = True
+    finally:
+        if not written:
+            write_log()
 
 
 def _pairs(items: list[str], flag: str) -> dict[str, str]:

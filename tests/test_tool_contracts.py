@@ -539,8 +539,10 @@ def test_analyze_returns_the_warnings_raised_during_attribution(method):
                                          "model": WarningConv().eval()}
     result = run(server.tfbs_analyze(model_id="tc_wide", sequences=[SEQ], method=method,
                                      n_shuffles=2))
-    assert "RuntimeWarning: attribution looks unstable" in result["warnings"]
-    assert len(result["warnings"]) == len(set(result["warnings"]))
+    messages = [w["message"] for w in result["warnings"]]
+    assert "RuntimeWarning: attribution looks unstable" in messages
+    assert len(messages) == len(set(messages))
+    assert all(w["count"] >= 1 for w in result["warnings"])
     assert "warnings" not in run(server.tfbs_analyze(model_id="tc", sequences=[SEQ],
                                                      method="input_x_gradient"))
 
@@ -548,3 +550,55 @@ def test_analyze_returns_the_warnings_raised_during_attribution(method):
 def test_validate_description_says_concurrent_jobs_need_separate_files():
     doc = " ".join(server.tfbs_validate.__doc__.split())
     assert "at the same time should each get their own output_file" in doc
+
+
+def test_warning_messages_are_counted_once_per_text_before_the_colon():
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for value in ("0.5", "0.6", "0.9"):
+            warnings.warn(f"Convergence deltas too high: tensor([{value}])", RuntimeWarning)
+        warnings.warn("plain message", UserWarning)
+        warnings.warn("Convergence deltas too high: other", UserWarning)
+    assert server._warning_messages(caught) == [
+        {"message": "RuntimeWarning: Convergence deltas too high", "count": 3},
+        {"message": "UserWarning: plain message", "count": 1},
+        {"message": "UserWarning: Convergence deltas too high", "count": 1},
+    ]
+    assert len(server._warning_messages(caught, limit=1)) == 1
+
+
+def test_lightning_pin_covers_the_checkpoint_options_tfbs_config_writes():
+    import inspect
+
+    from pytorch_lightning.callbacks import ModelCheckpoint
+
+    assert "enable_version_counter" in inspect.signature(ModelCheckpoint).parameters
+    assert '"pytorch-lightning>=2.1"' in (REPO / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_warning_messages_keep_drive_letters_and_merge_on_colon_space():
+    import warnings
+
+    path = "C:" + chr(92) + "data" + chr(92) + "x.pt"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        warnings.warn(f"Could not read {path}: missing", UserWarning)
+        warnings.warn(f"Could not read {path}: locked", UserWarning)
+        warnings.warn("Convergence deltas too high: tensor([0.7])", RuntimeWarning)
+        warnings.warn("Convergence deltas too high: tensor([0.8])", RuntimeWarning)
+    assert server._warning_messages(caught) == [
+        {"message": f"UserWarning: Could not read {path}", "count": 2},
+        {"message": "RuntimeWarning: Convergence deltas too high", "count": 2},
+    ]
+
+
+def test_developer_guide_describes_local_training_as_the_tool_does():
+    guide = _doc("docs/development.md")
+    assert "best epoch of this run" in guide
+    assert "`best_epoch` and `epochs_run`" in guide
+    assert "no CSVLogger or the run wrote no fresh `metrics.csv`" in guide
+    assert "`val_auc` is null, with a note, when the validation split holds a single class" in guide
+    assert "the whole group is killed when `local_timeout` runs out or the MCP call is cancelled" in guide
+    assert "last validation metrics" not in guide

@@ -75,7 +75,7 @@ def save_results(args, metrics):
             _rewrite_atomically(args.output_file, fieldnames, existing_rows + [row])
         else:
             with open(args.output_file, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, restval='')
+                writer = csv.DictWriter(f, fieldnames=fieldnames, restval='', lineterminator='\n')
                 if not existing_fields:
                     writer.writeheader()
                 writer.writerow(row)
@@ -91,7 +91,7 @@ def _rewrite_atomically(path, fieldnames, rows):
                                dir=directory)
     try:
         with os.fdopen(fd, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, restval='')
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval='', lineterminator='\n')
             writer.writeheader()
             writer.writerows(rows)
         try:

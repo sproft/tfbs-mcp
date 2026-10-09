@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -30,6 +31,10 @@ async def _call_over_stdio(calls: list[tuple[str, dict]], project_root: Path) ->
         "PYTHONPATH": os.pathsep.join(filter(None, [str(REPO), os.environ.get("PYTHONPATH")])),
         "TFBS_PROJECT_ROOT": str(project_root),
     }
+    # tfbs_fimo must take its fallback: no MEME Suite fimo on the server's PATH.
+    path = env.get("PATH", os.environ.get("PATH", ""))
+    env["PATH"] = os.pathsep.join(d for d in path.split(os.pathsep)
+                                  if d and shutil.which("fimo", path=d) is None)
     params = StdioServerParameters(
         command=sys.executable, args=["-m", "tfbs.mcp.cli"], env=env, cwd=str(REPO))
     results = []
@@ -59,7 +64,7 @@ def _lightningcli_checkpoint(path: Path) -> Path:
 
 
 def test_native_extension_tools_answer_over_stdio(tmp_path):
-    """scikit-learn, torch, pyfaidx and Lightning checkpoint loading after the loop started."""
+    """scikit-learn, torch, pyfaidx, Lightning checkpoint loading and the numba FIMO after the loop started."""
     ckpt = _lightningcli_checkpoint(tmp_path / "best_SimpleCNN.ckpt")
     out = asyncio.run(_call_over_stdio([
         ("tfbs_classify_metrics", {"positive_scores": [0.9, 0.8], "negative_scores": [0.2, 0.1]}),
@@ -72,8 +77,10 @@ def test_native_extension_tools_answer_over_stdio(tmp_path):
         ("tfbs_load_model", {"model_id": "m", "checkpoint_path": str(ckpt),
                              "model_type": "SimpleCNN", "device": "cpu"}),
         ("tfbs_predict", {"model_id": "m", "sequences": ["ACGTACGTACGTACGTACGTACGT"]}),
+        ("tfbs_fimo", {"sequences": ["CTCACTTGACCTT"], "motif_file": str(DEMO / "MA1994.1.meme"),
+                       "output_dir": str(tmp_path / "fimo")}),
     ], tmp_path))
-    metrics, pre, loci, info, loaded, scores = out
+    metrics, pre, loci, info, loaded, scores, fimo = out
     assert metrics["roc_auc"] == 1.0
     assert pre["shape"] == [1, 4, 16]
     assert "error" not in loci, loci
@@ -83,3 +90,5 @@ def test_native_extension_tools_answer_over_stdio(tmp_path):
     assert "torch_loaded" not in info
     assert loaded["input_length"] == 24, loaded
     assert len(scores["scores"]) == 1
+    assert fimo["backend"] in ("memelite", "tangermeme"), fimo
+    assert fimo["total_hits"] == 1 and fimo["hits"][0]["matched_sequence"] == "CTCACTTGACCTT"

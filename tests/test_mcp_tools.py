@@ -602,8 +602,8 @@ def test_seqlets_return_tangermeme_warnings_and_pass_the_seed(monkeypatch, tiny_
 
     def warning_dls(model, X, **kw):
         seen.update(kw)
-        for _ in range(3):
-            _warnings.warn("Convergence deltas too high: tensor([0.5, 0.7])", RuntimeWarning)
+        for k in range(3):
+            _warnings.warn(f"Convergence deltas too high: tensor([0.{k}, 0.7])", RuntimeWarning)
         return torch.zeros_like(X)
 
     _patch_seqlet_caller(monkeypatch, _seqlet_frame(2))
@@ -611,7 +611,8 @@ def test_seqlets_return_tangermeme_warnings_and_pass_the_seed(monkeypatch, tiny_
     result = json.loads(asyncio.run(server.tfbs_seqlets(
         model_id=tiny_conv, sequences=SEQS_30, seed=7)))
     assert seen["random_state"] == 7
-    assert result["warnings"] == ["RuntimeWarning: Convergence deltas too high: tensor([0.5, 0.7])"]
+    assert result["warnings"] == [
+        {"message": "RuntimeWarning: Convergence deltas too high", "count": 3}]
     assert "note" not in result
 
 
@@ -1113,8 +1114,15 @@ def test_sweep_agent_runs_the_packaged_pipeline_from_the_project_root(monkeypatc
 # tfbs_fimo and tfbs_server_info
 # ---------------------------------------------------------------------------
 
+REPO = Path(__file__).resolve().parent.parent
 NKX_MOTIF = Path(__file__).resolve().parent.parent / "tfbs" / "data" / "demo" / "MA1994.1.meme"
 TG_24MER = "GGGCTCCTCACTTGACCTTTGCTG"
+
+
+def _expected_backend() -> str:
+    from tfbs.mcp import server
+
+    return server._PYTHON_FIMO_BACKENDS[server._python_fimo()[1]]
 
 
 def test_fimo_without_binary_or_python_fimo_returns_an_error(monkeypatch, tmp_path):
@@ -1137,7 +1145,8 @@ def test_fimo_falls_back_to_the_pytorch_fimo(monkeypatch, tmp_path):
     result = json.loads(asyncio.run(server.tfbs_fimo(
         sequences=[TG_24MER, rc, "ACGTACGTACGTAC"], motif_file=str(NKX_MOTIF),
         output_dir=str(tmp_path / "fimo"))))
-    assert result["backend"] == "tangermeme", result
+    assert result["backend"] == _expected_backend(), result
+    assert result["backend_module"] == server._python_fimo()[1]
     hits = {(h["sequence"], h["strand"]): h for h in result["hits"]}
     plus = hits[("seq0", "+")]
     assert plus["motif"] == "MA1994.1" and plus["matched_sequence"] == "CTCACTTGACCTT"
@@ -1192,12 +1201,126 @@ def test_fimo_binary_vanishing_mid_call_falls_back(monkeypatch, tmp_path):
     result = json.loads(asyncio.run(server.tfbs_fimo(
         sequences=[TG_24MER], motif_file=str(NKX_MOTIF), output_dir=str(tmp_path / "fimo"),
     )))
-    assert result["backend"] == "tangermeme" and result["total_hits"] >= 1
+    assert result["backend"] == _expected_backend() and result["total_hits"] >= 1
     monkeypatch.setattr(server, "_python_fimo", lambda: (None, None))
     result = json.loads(asyncio.run(server.tfbs_fimo(
         sequences=[TG_24MER], motif_file=str(NKX_MOTIF), output_dir=str(tmp_path / "fimo2"),
     )))
     assert result["error"] == server._FIMO_MISSING["error"]
+
+
+def test_fimo_fallback_scores_the_window_that_ends_on_the_last_base(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    _no_binaries(monkeypatch)
+    site = "CTCACTTGACCTT"
+    tail = "ACGTGCAGTA" + site
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[site, tail, site.lower()], motif_file=str(NKX_MOTIF),
+        output_dir=str(tmp_path / "fimo"))))
+    assert "error" not in result, result
+    by_seq = {}
+    for h in result["hits"]:
+        by_seq.setdefault(h["sequence"], []).append(h)
+    assert len(by_seq["seq0"]) == 1 and len(by_seq["seq2"]) == 1
+    assert (by_seq["seq0"][0]["start"], by_seq["seq0"][0]["end"]) == (1, 13)
+    end_hit = next(h for h in by_seq["seq1"] if h["strand"] == "+")
+    assert (end_hit["start"], end_hit["end"]) == (len(tail) - 12, len(tail))
+    lengths = {"seq0": len(site), "seq1": len(tail), "seq2": len(site)}
+    for h in result["hits"]:
+        assert h["end"] <= lengths[h["sequence"]] and "N" not in h["matched_sequence"]
+        assert h["matched_sequence"] == site
+    fasta = Path(result["files"]["sequences_fasta"]).read_text()
+    assert "N" not in fasta.replace(">", "").replace("seq", "")
+
+
+def test_fimo_fallback_reads_padded_sequences_and_names_its_backend(monkeypatch, tmp_path):
+    import pandas as pd
+    from tfbs.mcp import server
+
+    _no_binaries(monkeypatch)
+    seen = {}
+
+    def fake_fimo(motifs, fasta, threshold, reverse_complement):
+        seen["fasta"] = Path(fasta).read_text()
+        return [pd.DataFrame([
+            {"motif_name": "M1 alt", "sequence_name": "seq0", "start": 0, "end": 4,
+             "strand": "+", "score": 5.0, "p-value": 1e-5},
+            {"motif_name": "M1 alt", "sequence_name": "seq0", "start": 2, "end": 6,
+             "strand": "+", "score": 4.0, "p-value": 2e-5},
+        ])]
+
+    monkeypatch.setattr(server, "_python_fimo", lambda: (fake_fimo, "tangermeme.tools.fimo"))
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=["ACGTA"], motif_file=str(NKX_MOTIF), output_dir=str(tmp_path / "f"))))
+    assert seen["fasta"] == ">seq0" + chr(10) + "ACGTAN" + chr(10)
+    assert result["backend"] == "tangermeme"
+    assert result["backend_module"] == "tangermeme.tools.fimo"
+    assert [(h["start"], h["end"], h["matched_sequence"]) for h in result["hits"]] == [(1, 4, "ACGT")]
+
+
+def test_fimo_writes_to_the_results_dir_by_default(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    _no_binaries(monkeypatch)
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    first = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER], motif_file=str(NKX_MOTIF))))
+    out = Path(first["output_dir"])
+    assert out.parent.parent == tmp_path / "results" / "fimo"
+    again = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER], motif_file=str(NKX_MOTIF))))
+    assert again["output_dir"] == first["output_dir"]
+    other = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER], motif_file=str(NKX_MOTIF), threshold=1e-3)))
+    assert other["output_dir"] != first["output_dir"]
+    doc = " ".join(server.tfbs_fimo.__doc__.split())
+    assert "<results>/fimo/<digest>/" in doc and "temp" not in doc
+
+
+def test_fimo_descriptions_name_memelite_not_pytorch():
+    from tfbs.mcp import server
+
+    doc = " ".join(server.tfbs_fimo.__doc__.split())
+    assert "memelite, numba-based, shipped with tangermeme 1.x" in doc
+    assert '"memelite" when memelite.fimo ran' in doc
+    for text in (server.__doc__ or "", doc, json.dumps(server._FIMO_MISSING),
+                 (REPO / "README.md").read_text(encoding="utf-8"),
+                 (REPO / "docs" / "development.md").read_text(encoding="utf-8")):
+        assert "PyTorch FIMO" not in text and "pure-PyTorch" not in text
+
+
+def test_startup_warms_up_the_fimo_reimplementation(monkeypatch):
+    from tfbs.mcp import server
+
+    calls = []
+    monkeypatch.setattr(server, "_warm_up_python_fimo", lambda: calls.append(1))
+    server._preload_native_modules()
+    assert calls == [1]
+
+    def failing():
+        raise RuntimeError("no threading layer")
+
+    monkeypatch.setattr(server, "_warm_up_python_fimo", failing)
+    server._preload_native_modules()
+
+
+def test_fimo_warm_up_compiles_without_error():
+    from tfbs.mcp import server
+
+    if server._python_fimo()[0] is None:
+        pytest.skip("no FIMO reimplementation installed")
+    server._warm_up_python_fimo()
+
+
+def test_startup_lists_a_module_only_when_no_alternative_loaded():
+    from tfbs.mcp import server
+
+    missing = {"tangermeme.ism": "x", "tangermeme.tools.fimo": "x", "pyBigWig": "x", "pysam": "x"}
+    assert server._unavailable_modules(missing) == ["pyBigWig", "pysam"]
+    both = {**missing, "memelite.fimo": "x"}
+    assert server._unavailable_modules(both) == [
+        "memelite.fimo", "pyBigWig", "pysam", "tangermeme.tools.fimo"]
 
 
 def test_server_info_reports_cuda_version_and_default_partition(monkeypatch):
@@ -1339,3 +1462,65 @@ def test_call_log_is_off_without_the_variable(monkeypatch, tmp_path):
 def test_unwritable_call_log_does_not_break_the_tool_call(monkeypatch, tmp_path):
     monkeypatch.setenv("TFBS_CALL_LOG", str(tmp_path))
     assert "test_model" in _call_via_mcp("tfbs_list_models", {})
+
+
+def test_fimo_fallback_with_a_sequence_shorter_than_the_motif_has_no_hits(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    _no_binaries(monkeypatch)
+    if server._python_fimo()[0] is None:
+        pytest.skip("no FIMO reimplementation installed")
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=["ACGT", "ACGTACGTAC"], motif_file=str(NKX_MOTIF),
+        output_dir=str(tmp_path / "fimo"))))
+    assert "error" not in result, result
+    assert result["total_hits"] == 0 and result["hits"] == []
+
+
+def test_fimo_fallback_finds_a_motif_that_ends_the_file(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    _no_binaries(monkeypatch)
+    if server._python_fimo()[0] is None:
+        pytest.skip("no FIMO reimplementation installed")
+    text = NKX_MOTIF.read_text()
+    rows = text[:text.index("URL")].rstrip("\n")
+    motif = tmp_path / "last.meme"
+    motif.write_bytes(rows.encode())
+    original = motif.read_bytes()
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER], motif_file=str(motif), output_dir=str(tmp_path / "fimo"))))
+    assert "error" not in result, result
+    plus = [h for h in result["hits"] if h["strand"] == "+"]
+    assert [(h["motif"], h["start"], h["end"]) for h in plus] == [("MA1994.1", 7, 19)]
+    assert motif.read_bytes() == original
+    copy = tmp_path / "fimo" / "motifs.meme"
+    assert copy.read_bytes().endswith(b"\n\n") and b"\r" not in copy.read_bytes()
+
+
+def test_fimo_binary_reads_the_original_motif_file(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    monkeypatch.setattr(server.shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+    seen = {}
+
+    def meme_fimo(cmd, **kwargs):
+        seen["motif"] = cmd[-2]
+        out = Path(cmd[cmd.index("--oc") + 1])
+        out.mkdir(parents=True)
+        (out / "fimo.tsv").write_text("motif_id\tmotif_alt_id\tsequence_name\tstart\tstop"
+                                      "\tstrand\tscore\tp-value\tq-value\tmatched_sequence\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(server.subprocess, "run", meme_fimo)
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER], motif_file=str(NKX_MOTIF), output_dir=str(tmp_path / "f"))))
+    assert result["backend"] == "meme" and seen["motif"] == str(NKX_MOTIF.resolve())
+    assert not (tmp_path / "f" / "motifs.meme").exists()
+
+
+def test_fimo_is_not_annotated_read_only():
+    from tfbs.mcp import server
+
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+    assert tools["tfbs_fimo"].annotations.readOnlyHint is False

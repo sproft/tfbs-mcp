@@ -101,7 +101,7 @@ def _decode(t):
 def test_extract_loci_derives_its_output_dir_from_the_bed(demo_bed):
     result = run(server.tfbs_extract_loci(bed_path=str(demo_bed), genome_fasta=str(GENOME)))
 
-    out = demo_bed.parent / "demo_peaks_loci"
+    out = demo_bed.parent / "demo_peaks_loci_200bp"
     assert result["output_dir"] == str(out)
     assert result["num_peaks_extracted"] == 4
     assert result["shape"] == [4, 4, 200]
@@ -121,11 +121,28 @@ def test_extract_loci_on_the_bundled_demo_writes_to_the_results_dir(tmp_path):
     before = sorted(p.name for p in DEMO.parent.iterdir())
     result = run(server.tfbs_extract_loci(bed_path=str(DEMO / "demo_peaks.bed"),
                                           genome_fasta=str(GENOME), in_window=24))
-    out = tmp_path / "results" / "demo_peaks_loci"
+    out = tmp_path / "results" / "demo_peaks_loci_24bp"
     assert result["output_dir"] == str(out)
     assert result["shape"] == [4, 4, 24]
     assert all(Path(p).parent == out for p in result["files"].values())
     assert sorted(p.name for p in DEMO.parent.iterdir()) == before
+
+
+def test_extract_loci_names_its_output_after_the_window_and_negatives(demo_bed):
+    dirs = {}
+    for window, negatives in ((51, None), (51, "gc_matched"), (24, None), (24, "shuffled")):
+        result = run(server.tfbs_extract_loci(
+            bed_path=str(demo_bed), genome_fasta=str(GENOME), in_window=window,
+            negatives=negatives))
+        dirs[(window, negatives)] = Path(result["output_dir"]).name
+        assert result["shape"][2] == window
+    assert dirs == {(51, None): "demo_peaks_loci_51bp", (51, "gc_matched"): "demo_peaks_loci_51bp_gc",
+                    (24, None): "demo_peaks_loci_24bp", (24, "shuffled"): "demo_peaks_loci_24bp_shuffled"}
+    plain = demo_bed.parent / "demo_peaks_loci_51bp"
+    assert not (plain / "negatives").exists()
+    assert torch.load(plain / "sequences.pt", weights_only=True).shape[2] == 51
+    doc = " ".join(server.tfbs_extract_loci.__doc__.split())
+    assert "<bed_name>_loci_<in_window>bp[_gc|_shuffled]" in doc and "demo_peaks_loci_51bp_gc" in doc
 
 
 def test_extract_loci_explicit_output_dir_wins(demo_bed, tmp_path):
@@ -221,20 +238,20 @@ def test_chain_from_bed_to_dataset_needs_no_paths_from_the_user(demo_bed):
         bed_path=str(demo_bed), genome_fasta=str(GENOME), in_window=24, negatives="gc_matched"))
     clf = run(server.tfbs_prepare_classification(
         positive_path=loci["sequences_path"], negative_path=loci["negatives_path"]))
-    assert clf["output_dir"] == str(demo_bed.parent / "demo_peaks_classification")
+    assert clf["output_dir"] == str(demo_bed.parent / "demo_peaks_24bp_gc_classification")
     assert (clf["num_positive"], clf["num_negative"]) == (4, 4)
     assert set(clf["files"]) == {"sequences", "labels"}
 
     ds = run(server.tfbs_prepare_dataset(
         sequences_path=clf["files"]["sequences"], labels_path=clf["files"]["labels"]))
-    assert ds["output_dir"] == str(demo_bed.parent / "demo_peaks_dataset")
+    assert ds["output_dir"] == str(demo_bed.parent / "demo_peaks_24bp_gc_dataset")
     assert ds["train_count"] + ds["val_count"] + ds["test_count"] == 8
     assert len(ds["files"]) == 6 and all(Path(p).is_file() for p in ds["files"].values())
 
     reg = run(server.tfbs_prepare_regression(
         sequences_path=loci["sequences_path"],
         scores_path=str(Path(loci["output_dir"]) / "scores.pt")))
-    assert reg["output_dir"] == str(demo_bed.parent / "demo_peaks_regression")
+    assert reg["output_dir"] == str(demo_bed.parent / "demo_peaks_24bp_gc_regression")
     assert all(Path(p).is_file() for p in reg["files"].values())
 
 
@@ -527,6 +544,12 @@ def test_sibling_dir_strips_pipeline_suffixes(tmp_path):
         tmp_path.resolve() / "x_dataset"
     assert server._sibling_dir(tmp_path / "data" / "seqs.pt", "dataset") == \
         tmp_path.resolve() / "data_dataset"
+    assert server._sibling_dir(tmp_path / "x_loci_51bp_gc" / "sequences.pt", "classification") == \
+        tmp_path.resolve() / "x_51bp_gc_classification"
+    assert server._sibling_dir(tmp_path / "x_loci_24bp" / "sequences.pt", "regression") == \
+        tmp_path.resolve() / "x_24bp_regression"
+    assert server._sibling_dir(tmp_path / "x_24bp_gc_classification" / "seqs.pt", "dataset") == \
+        tmp_path.resolve() / "x_24bp_gc_dataset"
 
 
 # ---------------------------------------------------------------------------

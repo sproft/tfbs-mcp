@@ -214,9 +214,12 @@ def main(argv=None):
     parser.add_argument("--models-dir", default="saved_models_final")
     parser.add_argument("--model-type", default="VCNNBpnet")
     parser.add_argument("--scaling-method", default=DEFAULT_SCALING,
-                        help="Scaling subdirectory of each dataset's checkpoint; "
-                             "when <models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt "
-                             "is missing, a single <dataset>/*/best_<model-type>.ckpt is used")
+                        help="Scaling subdirectory of each dataset's checkpoint: "
+                             "<models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt "
+                             "(default: the standardize folder). "
+                             "Only when this flag is omitted and that file is missing "
+                             "is a single <dataset>/*/best_<model-type>.ckpt used; an "
+                             "explicit value never falls back to another folder")
     parser.add_argument("--checkpoints", nargs="+", metavar="NAME=PATH",
                         help="Explicit checkpoints; replace --models-dir and --datasets")
     parser.add_argument("--n-per-tf", type=int, default=500,
