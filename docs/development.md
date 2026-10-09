@@ -28,13 +28,29 @@ data = TFBSDataModule(data_path="data/CTCF", batch_size=64)
 tfbs-train fit --config my_config.yaml
 ```
 
-`tfbs-train` is installed by pip, but the example configs live in the repo and are not packaged. Clone the repository to get `scripts/cli/config.example.yaml`, copy it, and replace the `/path/to/...` placeholders with your own data and checkpoint locations. The `tfbs_config` MCP tool generates a fresh config if you would rather start from scratch; it errors unless the `data_path` you give it already exists.
+`tfbs-train` and the example configs are both installed by pip. The configs live in the package under `tfbs/configs/`: `config.example.yaml`, one model block per architecture in `models/`, a trainer block in `trainers/`, and `wandb_sweep_config.yaml`, the search space `tfbs_sweep` can use. Print their installed location with:
 
-The scripts under `scripts/` read `TFBS_PROJECT_ROOT`, the directory holding `data/`, `saved_models/` and `results/`. It defaults to the repository root, so a fresh clone runs unedited. Set it if your data lives elsewhere:
+```bash
+python -c "import tfbs.configs as c; print(c.config_dir())"
+```
+
+Copy `config.example.yaml` from there and replace the `/path/to/...` placeholders with your own data and checkpoint locations. The `tfbs_config` MCP tool generates a fresh config from the same model templates if you would rather start from scratch; it errors unless the `data_path` you give it already exists.
+
+The MCP tools resolve data, checkpoints and results against `TFBS_PROJECT_ROOT`, the directory holding `data/`, `saved_models/` and `results/`; the benchmark and validation pipelines run with it as their working directory. It defaults to the repository root in a clone and to the server's working directory otherwise. The SLURM helpers under `scripts/cli/` read it too. Set it if your data lives elsewhere:
 
 ```bash
 export TFBS_PROJECT_ROOT=/mnt/lab/tfbs
 ```
+
+## Training and validation pipelines
+
+The six tools that run a longer job (`tfbs_validate`, `tfbs_sweep`, `tfbs_chipseq_benchmark`, `tfbs_chipseq_method_comparison`, `tfbs_remap_validation`, `tfbs_disease_variant_validation`) start a module from the installed package as `python -m tfbs.pipelines.<name>`, directly or inside a SLURM job, with the same interpreter as the server. Each one also runs by hand and lists its options with `--help`:
+
+```bash
+python -m tfbs.pipelines.remap_validation --help
+```
+
+The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working.
 
 ## Prediction
 
@@ -61,10 +77,10 @@ The install command in the README already includes everything the server needs. 
 | Extra | Installs | Needed for |
 |---|---|---|
 | `mcp` | the MCP protocol library | the server itself |
-| `genomics` | pyfaidx, tangermeme | reading a genome FASTA |
+| `genomics` | pyfaidx, tangermeme, pysam (not on Windows) | reading a genome FASTA (`tfbs_extract_loci`, the benchmark and validation tools); pysam reads the ClinVar VCF in `tfbs_disease_variant_validation` |
 | `viz` | captum, tangermeme, logomaker, seaborn | attribution, mutagenesis, seqlets |
-| `tracking` | wandb | experiment logging during training |
-| `foldx` | pyBigWig | not FoldX itself, see [Adding your data](../README.md#adding-your-data) in the README |
+| `tracking` | wandb | `tfbs_sweep`, and Weights & Biases logging during training |
+| `foldx` | pyBigWig | the bigWig track of `tfbs_binding_scan`; not FoldX itself, see [Adding your data](../README.md#adding-your-data) in the README |
 | `equinet` | equirc | the `EquiNet` architecture only |
 | `dev` | pytest | running the test suite (also needs `mcp` and `viz`) |
 | `all` | all of the above | |
@@ -81,10 +97,10 @@ All models inherit from `BaseModel` (a PyTorch Lightning `LightningModule`) and 
 - **MultiCNN**: CNN that also consumes numerical covariates
 - **EquiNet**: Reverse-complement equivariant network (needs the `equinet` extra)
 
-Each has a ready-to-use config in `scripts/cli/yamls/models/`. Compose one with the full example config:
+Each has a ready-to-use config in `tfbs/configs/models/`, installed with the package. Compose one with the full example config (paths as in a clone; after a pip install, use the directory printed under [Training](#training)):
 
 ```bash
-tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/VCNNBpnet.yaml
+tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/VCNNBpnet.yaml
 ```
 
 `VCNNBpnet.yaml` and `RNN.yaml` carry the tuned settings from `do_train_final.sh`; the rest use class defaults. All thirteen instantiate at a 24 bp window, and eleven accept one-hot `(batch, 4, L)` input directly. `FlexibleMLP` expects tabular features and `MultiCNN` also needs a covariate tensor, as noted in those files.
@@ -114,18 +130,19 @@ tfbs/                     Python package
 ├── prediction/           Window-based scoring and analysis
 ├── predict.py            ChIP-seq peak prediction CLI
 ├── cli/train_cli.py      Lightning CLI backing the tfbs-train command
+├── pipelines/            Validation, sweep and benchmark jobs the MCP tools run
+├── configs/              Training config templates (package data)
 ├── data/demo/            Bundled demo genome slice, peaks and motif (package data)
 └── mcp/                  MCP server
     ├── cli.py            tfbs-mcp command: version guard, --check and --setup
     ├── server.py         FastMCP server, 30 of 33 tools
     └── foldx_tools.py    Structure-based tools
 
-scripts/                  Repo-only analysis scripts (not installed by pip)
-├── cli/                  Training configs and SLURM job templates
+scripts/                  Repo-only scripts (not installed by pip)
+├── cli/                  SLURM job templates; run_sweep.py wraps tfbs.pipelines
 ├── make_demo_data.py     Rebuilds tfbs/data/demo/ from a GRCh38 FASTA
-├── chipseq_benchmark*.py ChIP-seq classification benchmarks
-├── disease_variant_validation.py
-├── remap_validation.py   ReMap external validation
+├── chipseq_benchmark*.py Wrappers around tfbs.pipelines (likewise
+├── remap_validation.py   validate.py and disease_variant_validation.py)
 └── ...
 
 docs/development.md       This page

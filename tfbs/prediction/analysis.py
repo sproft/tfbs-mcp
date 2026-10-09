@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import pandas as pd
 import torch
@@ -5,6 +7,8 @@ from torch.nn import Module
 from typing import Tuple
 
 from . import utils
+
+logger = logging.getLogger(__name__)
 
 
 def find_best_windows_fast(
@@ -45,7 +49,7 @@ def find_best_windows_fast(
     final_best_windows, final_best_scores = [], []
     final_all_scores, final_mean_scores = [], []
 
-    print(f"Processing {N} sequences on device '{device}'...")
+    logger.info("Processing %d sequences on device '%s'...", N, device)
     with torch.no_grad():
         for i in range(0, N, processing_batch_size):
             X_chunk = X[i:i + processing_batch_size].to(device)
@@ -114,7 +118,7 @@ def process_sequences_and_save(
         file_prefix: The base path and name for output files.
         motif_window_size: The size of the sliding window for motif discovery.
     """
-    print(f"Finding best windows for model: {model_name}")
+    logger.info("Finding best windows for model: %s", model_name)
     best_windows, best_scores, all_scores, mean_scores = find_best_windows_fast(
         X, model, window_size=motif_window_size
     )
@@ -124,7 +128,7 @@ def process_sequences_and_save(
 
     # --- Save results to CSV ---
     csv_path = f"{file_prefix}_sequences.csv"
-    print(f"Saving sequences and scores to: {csv_path}")
+    logger.info("Saving sequences and scores to: %s", csv_path)
     seqs_df = pd.DataFrame({
         'sequence': seqs,
         'max_score': best_scores,
@@ -135,5 +139,5 @@ def process_sequences_and_save(
 
     # --- Plot and save sequence logo ---
     logo_path = f"{file_prefix}_logo.png"
-    print(f"Saving sequence logo to: {logo_path}")
+    logger.info("Saving sequence logo to: %s", logo_path)
     utils.plot_sequence_logo(seqs, model_name, save_path=logo_path)

@@ -41,7 +41,7 @@ scaling_method="standardize" # Fixed for the initial sweep as per your earlier c
 WANDB_SWEEP_BASE_DIR="./wandb_sweep_ids"
 WANDB_SWEEP_ID_SUFFIX="_sweep_id.txt"
 WANDB_SWEEP_ID_FULL=""
-SWEEP_CONFIG="wandb_sweep_config.yaml"
+SWEEP_CONFIG="../../tfbs/configs/wandb_sweep_config.yaml"
 
 # Define the base checkpoint directory
 CHECKPOINT_DIR="${TFBS_PROJECT_ROOT}/saved_models_tuned"

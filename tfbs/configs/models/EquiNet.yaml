@@ -5,10 +5,10 @@
 # REQUIRES the optional equirc package:
 #   pip install equirc
 #
-# Use from the scripts/cli/ directory:
-#   tfbs-train fit --config config.example.yaml --model yamls/models/EquiNet.yaml
+# Use from the installed configs directory (tfbs/configs/):
+#   tfbs-train fit --config config.example.yaml --model models/EquiNet.yaml
 # ...or from the repo root:
-#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/EquiNet.yaml
+#   tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/EquiNet.yaml
 #
 # Values are the class defaults - tune them for your data.
 class_path: tfbs.nn.models.EquiNet

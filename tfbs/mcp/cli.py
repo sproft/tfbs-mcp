@@ -368,6 +368,48 @@ def parse_setup_args(args: list[str]) -> argparse.Namespace:
     return parser.parse_args(args)
 
 
+PIPELINES = (
+    "validate", "run_sweep", "chipseq_benchmark", "chipseq_benchmark_with_foldx",
+    "remap_validation", "disease_variant_validation",
+)
+
+# Optional modules: (import name, pip extra, what needs it).
+OPTIONAL_MODULES = (
+    ("pyfaidx", "genomics", "tfbs_extract_loci and the benchmark and validation tools"),
+    ("pysam", "genomics", "tfbs_disease_variant_validation (reads the ClinVar VCF)"),
+    ("pyBigWig", "foldx", "the bigWig track of tfbs_binding_scan"),
+    ("wandb", "tracking", "tfbs_sweep"),
+)
+
+
+def _module_found(name: str) -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def packaged_pipelines() -> tuple[list[str], int]:
+    """Pipeline modules missing from the install, and the number of model templates."""
+    missing = [name for name in PIPELINES if not _module_found(f"tfbs.pipelines.{name}")]
+    try:
+        models = importlib.resources.files("tfbs.configs") / "models"
+        templates = sum(1 for p in models.iterdir() if p.name.endswith(".yaml"))
+    except (ImportError, OSError):
+        templates = 0
+    return missing, templates
+
+
+def optional_module_note(module: str, extra: str, needed_for: str) -> str:
+    """The --check line for an optional module that is not installed."""
+    if module == "pysam" and sys.platform == "win32":
+        return (f"{module} not installed: {needed_for} needs it, and pysam has no "
+                "Windows build, so run that tool under WSL")
+    return f'{module} not installed: {needed_for} needs it (pip install "tfbs-mcp[{extra}]")'
+
+
 def _count_tools() -> int:
     import tfbs.mcp.server as server
     import tfbs.mcp.foldx_tools  # noqa: F401  registers the structure tools
@@ -415,6 +457,18 @@ def check() -> int:
            f"tangermeme {tangermeme_version}" if tangermeme_version
            else "tangermeme not installed: attribution, mutagenesis and genome "
                 "tools will be unavailable (install the genomics and viz extras)")
+
+    missing, templates = packaged_pipelines()
+    if missing or not templates:
+        report(False, "training and validation pipelines incomplete (missing: "
+                      f"{', '.join(missing) or 'model templates'}); reinstall tfbs-mcp")
+    else:
+        report(True, f"{len(PIPELINES)} training and validation pipelines and "
+                     f"{templates} model templates installed")
+
+    for module, extra, needed_for in OPTIONAL_MODULES:
+        if not _module_found(module):
+            report(None, optional_module_note(module, extra, needed_for))
 
     executable = find_executable()
     report(executable is not None,

@@ -43,7 +43,7 @@ do
     --model.input_length 70 \
     --data.data_path ${TFBS_PROJECT_ROOT}/data/tensors/${data} \
     --data.batch_size 8 \
-    --trainer yamls/trainers/default.yaml \
+    --trainer ../../tfbs/configs/trainers/default.yaml \
     --trainer.logger.init_args.project P09x_${data} \
     --trainer.callbacks.init_args.dirpath ${TFBS_PROJECT_ROOT}/saved_models/${data}/${norm} \
     --trainer.callbacks.init_args.filename best_${model}_{epoch:02d}-{val_loss:.4f}

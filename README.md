@@ -68,13 +68,16 @@ tfbs-mcp installation check
   [ok  ] server loads, 33 tools registered
   [ok  ] PyTorch 2.14.0
   [ok  ] tangermeme 1.5.0
+  [ok  ] 6 training and validation pipelines and 13 model templates installed
+  [note] pyBigWig not installed: the bigWig track of tfbs_binding_scan needs it (pip install "tfbs-mcp[foldx]")
+  [note] wandb not installed: tfbs_sweep needs it (pip install "tfbs-mcp[tracking]")
   [ok  ] executable: /home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp
 
 Everything needed is installed. Connect the server with ONE of these:
 ...
 ```
 
-If a line says `FAIL`, it also says how to fix it. The command then prints the exact setup text for step 3, with the path to your installation already filled in.
+If a line says `FAIL`, it also says how to fix it. A `note` line names an optional extra that one tool needs; every other tool works without it, and you can add the extra later with the `pip install` command shown. The command then prints the exact setup text for step 3, with the path to your installation already filled in.
 
 ### Step 3: Connect Claude
 
@@ -186,6 +189,8 @@ claude mcp add tfbs --scope user -- (Get-Command tfbs-mcp).Source
 
 In `claude_desktop_config.json`, every backslash in a Windows path is written twice, as in `C:\\Users\\you\\...`. The blocks printed by `tfbs-mcp --check` and `tfbs-mcp --setup` already have them, so paste those rather than typing a path.
 
+One tool needs Linux or macOS: `tfbs_disease_variant_validation` reads the ClinVar VCF with pysam, which has no Windows build, so the `genomics` extra leaves pysam out on Windows and `tfbs-mcp --check` prints a note about it. Run that tool under WSL (<https://learn.microsoft.com/windows/wsl/install>) if you need it.
+
 ### Troubleshooting
 
 In most cases, run `tfbs-mcp --check` in the activated environment first. It names the problem.
@@ -239,9 +244,9 @@ That 13-mer is the strongest match in the slice, about 4.2 kb upstream of the th
 | Disease-variant validation (`tfbs_disease_variant_validation`) | An indexed ClinVar VCF: `clinvar.vcf.gz` and its `.tbi` index side by side | NCBI, GRCh38: <https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz> (about 200 MB) and <https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz.tbi>. Both are refreshed regularly, so sizes change | `TFBS_CLINVAR_VCF` |
 | Prediction and attribution (`tfbs_predict`, `tfbs_analyze`, `tfbs_mutagenesis`, ...) | A trained model checkpoint; none ship with the package | Train one on peaks from ChIP-Atlas (<https://chip-atlas.org/>) following [Training](docs/development.md#training) | none; load it with `tfbs_load_model` |
 | `slurm_*` tools, and any `slurm=true` option | An HPC cluster running the SLURM scheduler | Your cluster's documentation; the scheduler itself is at <https://slurm.schedmd.com/> | none |
-| Training, benchmark and validation tools (`tfbs_train`, `tfbs_sweep`, `tfbs_validate`, `tfbs_chipseq_benchmark`, ...) | A git clone of this repository, because these tools run scripts under `scripts/`, which pip does not install | `git clone https://github.com/sproft/tfbs-mcp.git` (<https://github.com/sproft/tfbs-mcp>) | `TFBS_PROJECT_ROOT` |
+| Training, benchmark and validation tools (`tfbs_train`, `tfbs_sweep`, `tfbs_validate`, `tfbs_chipseq_benchmark`, ...) | A directory for your datasets, checkpoints and results. The code these tools run is installed with the package. `tfbs_sweep` also needs the `tracking` extra and `wandb login`; `tfbs_disease_variant_validation` needs pysam, which the `genomics` extra installs (not on Windows) | Any directory you choose | `TFBS_PROJECT_ROOT` |
 
-`TFBS_PROJECT_ROOT` is the directory holding `data/`, `saved_models/` and `results/`. The repo-only scripts under `scripts/` read it too. It defaults to the directory containing the installed `tfbs` package, which is the repository root in a clone, so a fresh clone runs unedited; set it if your data or your checkout lives elsewhere. The example configs and the `tfbs_config` tool are described under [Training](docs/development.md#training).
+`TFBS_PROJECT_ROOT` is the directory holding `data/`, `saved_models/` and `results/`. The benchmark and validation tools run from it, so a relative `models_dir`, such as their default `saved_models_final`, is looked up there as `<models_dir>/<dataset>/standardize/best_<model_type>.ckpt`. Without the variable the server uses the repository root when it runs from a clone, and otherwise the directory it was started in; `tfbs_server_info` reports the one in use as `project_root`. The example configs and the `tfbs_config` tool are described under [Training](docs/development.md#training).
 
 Any tool argument you pass explicitly overrides these variables. If neither is set, the tool tells you which argument and which variable would fix it.
 
@@ -314,7 +319,11 @@ With a genome FASTA registered and a BED file of peaks on disk:
 
 > Extract 200 bp sequences centred on every peak in /data/peaks/nkx2-1.bed and save the tensors to /data/tensors/nkx2-1.
 
-Claude calls `tfbs_extract_loci`, reads the genome from `TFBS_GENOME_FASTA`, writes `sequences.pt` (and `scores.pt` when the BED file has a score column) into the output folder, and reports the tensor shape and how many peaks were extracted.
+Claude calls `tfbs_extract_loci`, reads the genome from `TFBS_GENOME_FASTA`, writes `sequences.pt` (and `scores.pt` when the BED file has a score column) and `regions.bed` into the output folder, and reports the tensor shape, how many peaks were extracted and the paths it wrote. Without an output folder the tool uses `nkx2-1_loci/` next to the BED file, and the data tools after it name their outputs from that (`nkx2-1_classification/`, `nkx2-1_dataset/`), so a chain of calls needs no file names.
+
+> Extract 24 bp windows around the peaks in /data/peaks/nkx2-1.bed with GC-matched negatives, and build a classification dataset.
+
+Claude calls `tfbs_extract_loci` with `negatives="gc_matched"`, which samples one genomic window per peak with the same length and GC content (away from the peaks, without N) into `negatives/sequences.pt`, then `tfbs_prepare_classification` and `tfbs_prepare_dataset` on the paths it returned.
 
 With the MEME Suite installed and the JASPAR motif `MA1994.1` (NKX2-1) registered as the motif file:
 

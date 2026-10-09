@@ -1,10 +1,10 @@
 # Example model config for MultiCNN.
 # CNN that also consumes numerical covariates.
 #
-# Use from the scripts/cli/ directory:
-#   tfbs-train fit --config config.example.yaml --model yamls/models/MultiCNN.yaml
+# Use from the installed configs directory (tfbs/configs/):
+#   tfbs-train fit --config config.example.yaml --model models/MultiCNN.yaml
 # ...or from the repo root:
-#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/MultiCNN.yaml
+#   tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/MultiCNN.yaml
 #
 # NOTE: MultiCNN.forward(x, x_num) also needs a numerical covariate tensor,
 # so it needs a data module that supplies one alongside the sequence.

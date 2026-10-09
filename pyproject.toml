@@ -36,6 +36,9 @@ viz = [
 genomics = [
     "pyfaidx>=0.7",
     "tangermeme>=0.4",
+    # Reads the ClinVar VCF in tfbs_disease_variant_validation. pysam has no
+    # Windows build, so that one tool needs Linux, macOS or WSL.
+    "pysam>=0.21; sys_platform != 'win32'",
 ]
 tracking = [
     "wandb>=0.16",
@@ -78,6 +81,7 @@ include = ["tfbs*"]
 [tool.setuptools.package-data]
 "tfbs.prediction" = ["*.yaml"]
 "tfbs.data" = ["demo/*"]
+"tfbs.configs" = ["*.yaml", "models/*.yaml", "trainers/*.yaml", "datas/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

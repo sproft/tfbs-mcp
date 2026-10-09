@@ -46,7 +46,7 @@ do
     --data.data_path ${TFBS_PROJECT_ROOT}/data/tensors/${data} \
     --data.batch_size 64 \
     --data.scaling_method ${norm} \
-    --trainer yamls/trainers/default.yaml \
+    --trainer ../../tfbs/configs/trainers/default.yaml \
     --trainer.logger.init_args.project P09_${data}_${norm}_${model} \
     --trainer.callbacks.init_args.dirpath ${TFBS_PROJECT_ROOT}/saved_models_tuned/${data}/${norm} \
     --trainer.callbacks.init_args.filename best_${model}

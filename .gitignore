@@ -23,3 +23,5 @@ wandb/
 lightning_logs/
 saved_models/
 saved_models_final/
+results/
+tfbs_results/

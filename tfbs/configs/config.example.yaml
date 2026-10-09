@@ -5,9 +5,11 @@
 # tools (sequences.pt, plus scores.pt for regression), and the checkpoint
 # `dirpath` at somewhere writable.
 #
-# Compose it with any of the per-model configs in yamls/models/ (the --model
-# file overrides the model block below):
-#   tfbs-train fit --config config.example.yaml --model yamls/models/VCNNBpnet.yaml
+# Compose it with any of the per-model configs in models/ next to this file
+# (the --model file overrides the model block below). Both ship with the
+# package; `python -c "import tfbs.configs as c; print(c.config_dir())"`
+# prints their directory:
+#   tfbs-train fit --config config.example.yaml --model models/VCNNBpnet.yaml
 #
 # Deliberately minimal. Run `tfbs-train fit --print_config` for the exhaustive
 # list of every available option.

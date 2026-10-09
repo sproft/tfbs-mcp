@@ -1,11 +1,26 @@
 """Tests for FoldX MCP tools."""
 import asyncio
+import io
 import json
+import logging
 import os
+import random
 import shutil
+import subprocess
+import sys
 import tempfile
+import types
+import urllib.error
+import urllib.request
+import warnings
+from pathlib import Path
 
 import pytest
+
+with warnings.catch_warnings():
+    # Registering the marker would need pyproject.toml, which these tests leave alone.
+    warnings.simplefilter("ignore", pytest.PytestUnknownMarkWarning)
+    network = pytest.mark.network
 
 
 # ---------------------------------------------------------------------------
@@ -14,6 +29,10 @@ import pytest
 
 def _foldx_installed() -> bool:
     return shutil.which("foldx") is not None or shutil.which("foldx5") is not None
+
+
+def _run(coro) -> dict:
+    return json.loads(asyncio.run(coro))
 
 
 def _make_temp_pdb(tmpdir: str) -> str:
@@ -28,6 +47,182 @@ def _make_temp_pdb(tmpdir: str) -> str:
     return pdb_path
 
 
+def _pdb_atom(serial: int, name: str, resname: str, chain: str, resnum: int) -> str:
+    return (f"ATOM  {serial:5d} {name:<4} {resname:>3} {chain}{resnum:4d}    "
+            f"{0.0:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00 90.00")
+
+
+def _pdb_text(dna: str | None = None) -> str:
+    """A protein residue on chain A, plus DNA on chains C and D if ``dna`` is given."""
+    lines = [_pdb_atom(1, "CA", "ALA", "A", 1)]
+    if dna:
+        partner = dna.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+        for chain, seq in (("C", dna), ("D", partner)):
+            for resnum, base in enumerate(seq, start=1):
+                lines.append(_pdb_atom(len(lines) + 1, "P", f"D{base}", chain, resnum))
+    return "\n".join(lines) + "\nEND\n"
+
+
+def _make_dna_pdb(directory: str, dna: str = "ACGTA") -> str:
+    path = os.path.join(directory, "complex.pdb")
+    with open(path, "w") as f:
+        f.write(_pdb_text(dna))
+    return path
+
+
+def _make_genome(directory: str, length: int = 6000, seed: int = 7) -> tuple[str, str]:
+    rng = random.Random(seed)
+    seq = "".join(rng.choice("ACGT") for _ in range(length))
+    path = os.path.join(directory, "genome.fa")
+    with open(path, "w", newline="\n") as f:
+        f.write(">chr1\n")
+        for i in range(0, length, 60):
+            f.write(seq[i:i + 60] + "\n")
+    return path, seq
+
+
+def _toy_energy(seq: str) -> float:
+    return -(2 * seq.count("G") + seq.count("C")) / len(seq)
+
+
+@pytest.fixture
+def network_opt_in(request):
+    """Live tests run only with ``-m network`` or TFBS_NETWORK_TESTS=1."""
+    selected = "network" in (request.config.getoption("markexpr") or "")
+    if not selected and os.environ.get("TFBS_NETWORK_TESTS") != "1":
+        pytest.skip("live network test; run with -m network or TFBS_NETWORK_TESTS=1")
+
+
+class _FakeBigWig:
+    def __init__(self, path, registry):
+        self.path, self.registry = path, registry
+        self.header, self.entries = None, []
+
+    def addHeader(self, header):
+        self.header = dict(header)
+
+    def addEntries(self, chroms, starts, ends=None, values=None):
+        for chrom, start, end, value in zip(chroms, starts, ends, values):
+            last_end = self.entries[-1][2] if self.entries else 0
+            assert start >= last_end and end > start, "bigWig entries must be sorted and non-overlapping"
+            assert end <= self.header[chrom]
+            self.entries.append((chrom, start, end, value))
+
+    def close(self):
+        Path(self.path).write_bytes(b"")
+        self.registry[str(Path(self.path).resolve())] = self
+
+
+@pytest.fixture
+def fake_bigwig(monkeypatch):
+    """pyBigWig stand-in that enforces the bigWig entry rules; maps path to file."""
+    written: dict = {}
+    module = types.ModuleType("pyBigWig")
+    module.open = lambda path, mode="r": _FakeBigWig(path, written)
+    monkeypatch.setitem(sys.modules, "pyBigWig", module)
+    return written
+
+
+@pytest.fixture
+def fake_foldx(monkeypatch):
+    """FoldX stand-in: a placement's energy is _toy_energy of its sequence."""
+    import tfbs.mcp.foldx_tools as fx
+
+    placements: list[str] = []
+
+    def run(foldx_bin, structure, working_dir, mutation_string=None):
+        placements.append(mutation_string)
+        return _toy_energy(mutation_string)
+
+    monkeypatch.setattr(fx, "_find_foldx", lambda: "foldx")
+    monkeypatch.setattr(fx, "_mutation_string", lambda template, seq: seq)
+    monkeypatch.setattr(fx, "_run_foldx_energy", run)
+    return placements
+
+
+@pytest.fixture
+def scan_inputs(tmp_path):
+    pdb = _make_dna_pdb(str(tmp_path))
+    fasta, seq = _make_genome(str(tmp_path))
+    return pdb, fasta, seq
+
+
+def _scan(scan_inputs, output_dir, **kwargs) -> dict:
+    from tfbs.mcp.foldx_tools import tfbs_binding_scan
+
+    pdb, fasta, _ = scan_inputs
+    args = {"structure_path": pdb, "genome_fasta": fasta, "region": "chr1:100-1100",
+            "output_dir": str(output_dir)}
+    args.update(kwargs)
+    return _run(tfbs_binding_scan(**args))
+
+
+@pytest.fixture
+def fake_sbatch(monkeypatch):
+    """Replace slurm_submit; append the JSON replies it should give to ``replies``."""
+    import tfbs.mcp.server as server
+
+    calls: list[dict] = []
+    replies: list[dict] = []
+
+    async def submit(script_path, args=None, sbatch_flags=None, working_dir=None):
+        calls.append({"script": script_path, "flags": sbatch_flags})
+        return json.dumps(replies.pop(0))
+
+    monkeypatch.setattr(server, "slurm_submit", submit)
+    return calls, replies
+
+
+_AF_API = "https://alphafold.ebi.ac.uk/api/prediction/P43699"
+_AF_MODEL = "https://alphafold.ebi.ac.uk/files/AF-P43699-F1-model_v6.pdb"
+_AF_ENTRIES = [
+    # The API lists isoforms too; the isoform comes first to test the exact match.
+    {"entryId": "AF-P43699-3-F1", "modelEntityId": "AF-P43699-3-F1",
+     "uniprotAccession": "P43699-3", "latestVersion": 6, "globalMetricValue": 54.69,
+     "entityType": "protein",
+     "pdbUrl": "https://alphafold.ebi.ac.uk/files/AF-P43699-3-F1-model_v6.pdb"},
+    {"entryId": "AF-P43699-F1", "modelEntityId": "AF-P43699-F1",
+     "uniprotAccession": "P43699", "latestVersion": 6, "globalMetricValue": 56.31,
+     "entityType": "protein", "pdbUrl": _AF_MODEL},
+]
+_RCSB_SEARCH = "https://search.rcsb.org/rcsbsearch/v2/query"
+
+
+def _rcsb(pdb_id: str) -> str:
+    return f"https://files.rcsb.org/download/{pdb_id}.pdb"
+
+
+def _http_error(url: str, code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(url, code, "error", {}, io.BytesIO(b"{}"))
+
+
+class _FakeWeb:
+    """urlopen stand-in serving canned bodies by URL and recording each request."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.requested: list[str] = []
+
+    def __call__(self, req, timeout=None, **kwargs):
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        self.requested.append(url)
+        reply = self.routes.get(url)
+        if reply is None:
+            raise urllib.error.URLError(f"no route to {url}")
+        if isinstance(reply, Exception):
+            raise reply
+        return io.BytesIO(reply)
+
+
+@pytest.fixture
+def fake_web(monkeypatch):
+    def install(routes):
+        web = _FakeWeb(routes)
+        monkeypatch.setattr(urllib.request, "urlopen", web)
+        return web
+    return install
+
+
 # ---------------------------------------------------------------------------
 # tfbs_fetch_structure
 # ---------------------------------------------------------------------------
@@ -40,6 +235,9 @@ def test_fetch_structure_local_pdb():
         pdb_path = _make_temp_pdb(tmpdir)
         result = json.loads(asyncio.run(tfbs_fetch_structure(local_path=pdb_path)))
         assert result["source"] == "local"
+        assert result["argument"] == "local_path"
+        assert result["attempted"] == []
+        assert result["metadata"]["has_dna"] is False
         assert os.path.isfile(result["structure_path"])
 
 
@@ -49,9 +247,127 @@ def test_fetch_structure_missing_local():
 
     result = json.loads(asyncio.run(tfbs_fetch_structure(local_path="/nonexistent/path.pdb")))
     assert "error" in result
+    assert result["fix"]
+    assert [a["argument"] for a in result["attempted"]] == ["local_path"]
 
 
-def test_fetch_structure_pdb_id():
+def test_fetch_structure_requires_a_source():
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    for kwargs in ({}, {"pdb_id": "", "uniprot_id": "  "}):
+        result = _run(tfbs_fetch_structure(**kwargs))
+        assert "error" in result and "uniprot_id" in result["fix"]
+
+
+def test_fetch_structure_alphafold_uses_api_model(fake_web, tmp_path, capsys):
+    """The AlphaFold DB leg downloads the pdbUrl the API returns, not a fixed version."""
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    web = fake_web({_AF_API: json.dumps(_AF_ENTRIES).encode(), _AF_MODEL: _pdb_text().encode()})
+    result = _run(tfbs_fetch_structure(uniprot_id="P43699", output_dir=str(tmp_path)))
+
+    assert result["source"] == "alphafold"
+    assert result["argument"] == "uniprot_id"
+    assert result["attempted"] == []
+    meta = result["metadata"]
+    assert meta["latest_version"] == 6
+    assert meta["mean_plddt"] == 56.31
+    assert meta["url"] == _AF_MODEL
+    assert meta["entry_id"] == "AF-P43699-F1"
+    assert meta["has_dna"] is False
+    assert "protein-only" in result["note"]
+    assert Path(result["structure_path"]).name == "AF-P43699-F1-model_v6.pdb"
+    assert Path(result["structure_path"]).is_file()
+    assert web.requested == [_AF_API, _AF_MODEL]
+    assert capsys.readouterr().out == ""
+
+
+def test_fetch_structure_alphafold_missing_entry(fake_web, tmp_path):
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    api = "https://alphafold.ebi.ac.uk/api/prediction/Q00000"
+    fake_web({api: _http_error(api, 404)})
+    result = _run(tfbs_fetch_structure(uniprot_id="Q00000", output_dir=str(tmp_path)))
+
+    assert "no entry" in result["error"] and "404" in result["error"]
+    assert "UniProt accession" in result["fix"]
+    assert [a["argument"] for a in result["attempted"]] == ["uniprot_id"]
+
+
+def test_fetch_structure_falls_through_in_order(fake_web, tmp_path):
+    """Each failing source hands over to the next, in the documented order."""
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    web = fake_web({
+        _rcsb("9ZZZ"): _http_error(_rcsb("9ZZZ"), 404),
+        _RCSB_SEARCH: b"",
+        _AF_API: json.dumps(_AF_ENTRIES).encode(),
+        _AF_MODEL: _pdb_text().encode(),
+    })
+    result = _run(tfbs_fetch_structure(
+        local_path=str(tmp_path / "missing.pdb"),
+        pdb_id="9zzz",
+        gene_name="NOTAGENE",
+        uniprot_id="P43699",
+        output_dir=str(tmp_path),
+    ))
+
+    assert result["source"] == "alphafold"
+    assert result["argument"] == "uniprot_id"
+    assert [a["argument"] for a in result["attempted"]] == ["local_path", "pdb_id", "gene_name"]
+    assert all(a["error"] and a["fix"] for a in result["attempted"])
+    assert web.requested == [_rcsb("9ZZZ"), _RCSB_SEARCH, _AF_API, _AF_MODEL]
+
+
+def test_fetch_structure_stops_at_first_success(fake_web, tmp_path):
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    web = fake_web({_rcsb("3RKQ"): _pdb_text("ACGTA").encode()})
+    result = _run(tfbs_fetch_structure(
+        local_path=str(tmp_path / "missing.pdb"),
+        pdb_id="3RKQ",
+        uniprot_id="P43699",
+        output_dir=str(tmp_path),
+    ))
+
+    assert result["source"] == "pdb"
+    assert result["argument"] == "pdb_id"
+    assert [a["argument"] for a in result["attempted"]] == ["local_path"]
+    assert result["metadata"]["has_dna"] is True
+    assert "note" not in result
+    assert web.requested == [_rcsb("3RKQ")]
+
+
+def test_fetch_structure_gene_search(fake_web, tmp_path):
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    fake_web({
+        _RCSB_SEARCH: json.dumps({"result_set": [{"identifier": "3RKQ"}]}).encode(),
+        _rcsb("3RKQ"): _pdb_text("ACGTA").encode(),
+    })
+    result = _run(tfbs_fetch_structure(gene_name="NKX2-1", output_dir=str(tmp_path)))
+
+    assert result["source"] == "pdb"
+    assert result["argument"] == "gene_name"
+    assert result["metadata"]["pdb_id"] == "3RKQ"
+    assert result["metadata"]["gene_name"] == "NKX2-1"
+
+
+def test_fetch_structure_all_sources_fail(fake_web, tmp_path):
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    fake_web({_AF_API: _http_error(_AF_API, 404)})
+    result = _run(tfbs_fetch_structure(
+        local_path=str(tmp_path / "missing.pdb"), uniprot_id="P43699", output_dir=str(tmp_path),
+    ))
+
+    assert "local_path, uniprot_id" in result["error"]
+    assert result["fix"]
+    assert [a["argument"] for a in result["attempted"]] == ["local_path", "uniprot_id"]
+
+
+@network
+def test_fetch_structure_pdb_id(network_opt_in):
     """Download 3RKQ from RCSB and verify the file exists (needs internet)."""
     from tfbs.mcp.foldx_tools import tfbs_fetch_structure
 
@@ -60,6 +376,20 @@ def test_fetch_structure_pdb_id():
         assert result.get("source") == "pdb", f"Unexpected result: {result}"
         assert os.path.isfile(result["structure_path"])
         assert os.path.getsize(result["structure_path"]) > 0
+
+
+@network
+def test_fetch_structure_alphafold_live(network_opt_in, tmp_path):
+    """Fetch the NKX2-1 model from the live AlphaFold DB (needs internet)."""
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    result = _run(tfbs_fetch_structure(uniprot_id="P43699", output_dir=str(tmp_path)))
+    assert result.get("source") == "alphafold", f"Unexpected result: {result}"
+    meta = result["metadata"]
+    assert meta["latest_version"] >= 6
+    assert 0 < meta["mean_plddt"] <= 100
+    assert meta["has_dna"] is False
+    assert os.path.getsize(result["structure_path"]) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -78,14 +408,30 @@ def test_binding_energy_no_foldx():
         result = json.loads(asyncio.run(tfbs_binding_energy(structure_path=pdb_path)))
         assert "error" in result
         assert "foldx" in result["error"].lower() or "FoldX" in result["error"]
+        assert "PATH" in result["fix"]
 
 
-def test_binding_energy_missing_structure():
+def test_binding_energy_missing_structure(monkeypatch):
     """Verify error JSON when structure file does not exist."""
-    from tfbs.mcp.foldx_tools import tfbs_binding_energy
+    import tfbs.mcp.foldx_tools as fx
 
-    result = json.loads(asyncio.run(tfbs_binding_energy(structure_path="/nonexistent/file.pdb")))
-    assert "error" in result
+    monkeypatch.setattr(fx, "_find_foldx", lambda: "foldx")
+    result = _run(fx.tfbs_binding_energy(structure_path="/nonexistent/file.pdb"))
+    assert "not found" in result["error"]
+    assert result["fix"]
+
+
+def test_binding_energy_timeout_returns_error(monkeypatch, tmp_path):
+    import tfbs.mcp.foldx_tools as fx
+
+    def timeout(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 600))
+
+    monkeypatch.setattr(fx, "_find_foldx", lambda: "foldx")
+    monkeypatch.setattr(subprocess, "run", timeout)
+    result = _run(fx.tfbs_binding_energy(structure_path=_make_dna_pdb(str(tmp_path))))
+    assert "RepairPDB timed out" in result["error"]
+    assert result["fix"]
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +448,7 @@ def test_binding_scan_missing_inputs():
         region="chr1:1000-2000",
     )))
     assert "error" in result
+    assert result["fix"]
 
 
 def test_binding_scan_no_foldx():
@@ -125,3 +472,196 @@ def test_binding_scan_no_foldx():
         )))
         assert "error" in result
         assert "foldx" in result["error"].lower() or "FoldX" in result["error"]
+        assert result["fix"]
+
+
+def test_binding_scan_needs_dna_in_structure(fake_foldx, fake_bigwig, tmp_path):
+    from tfbs.mcp.foldx_tools import tfbs_binding_scan
+
+    fasta, _ = _make_genome(str(tmp_path))
+    result = _run(tfbs_binding_scan(
+        structure_path=_make_temp_pdb(str(tmp_path)), genome_fasta=fasta, region="chr1:100-1000",
+    ))
+    assert result["error"] == "No DNA chains found in the PDB structure."
+    assert "AlphaFold" in result["fix"]
+
+
+def test_binding_scan_reports_missing_pybigwig(scan_inputs, fake_foldx, monkeypatch, tmp_path):
+    """The bigWig dependency is checked before any FoldX run."""
+    monkeypatch.setitem(sys.modules, "pyBigWig", None)
+    result = _scan(scan_inputs, tmp_path / "out")
+    assert "pyBigWig" in result["error"]
+    assert "foldx" in result["fix"]
+    assert fake_foldx == []
+
+
+def test_binding_scan_unknown_chromosome(scan_inputs, fake_foldx, fake_bigwig, tmp_path):
+    result = _scan(scan_inputs, tmp_path / "out", region="chr2:100-1000")
+    assert "chr2" in result["error"] and result["fix"]
+
+
+def test_binding_scan_default_window_is_dna_length(scan_inputs, fake_foldx, fake_bigwig, tmp_path):
+    _, _, seq = scan_inputs
+    result = _scan(scan_inputs, tmp_path / "out")
+
+    assert result["mode"] == "local"
+    assert (result["window"], result["dna_length"], result["step"]) == (5, 5, 50)
+    assert result["num_windows"] == (1100 - 100 - 5) // 50 + 1
+    starts = [100 + 50 * i for i in range(result["num_windows"])]
+    bw = fake_bigwig[result["bigwig_path"]]
+    assert [(s, e) for _, s, e, _ in bw.entries] == [(s, s + 5) for s in starts]
+    assert [v for *_, v in bw.entries] == pytest.approx([_toy_energy(seq[s:s + 5]) for s in starts])
+    assert result["foldx_runs"] == len(starts) == result["num_scored"]
+
+
+def test_binding_scan_explicit_window_scores_best_placement(scan_inputs, fake_foldx, fake_bigwig, tmp_path):
+    """An explicit window is honoured: its value is the best placement inside it."""
+    _, _, seq = scan_inputs
+    result = _scan(scan_inputs, tmp_path / "out", region="chr1:200-260", window=8, step=2)
+
+    assert (result["window"], result["dna_length"], result["step"]) == (8, 5, 2)
+    starts = [200 + 2 * i for i in range(result["num_windows"])]
+    assert starts[-1] == 252
+    expected = [min(_toy_energy(seq[p:p + 5]) for p in range(s, s + 4)) for s in starts]
+    bw = fake_bigwig[result["bigwig_path"]]
+    assert [v for *_, v in bw.entries] == pytest.approx(expected)
+    assert [(s, e) for _, s, e, _ in bw.entries] == [(s + 3, s + 5) for s in starts]
+    unique_placements = starts[-1] + 3 - 200 + 1
+    assert len(fake_foldx) == result["foldx_runs"] == unique_placements
+
+
+def test_binding_scan_rejects_window_below_dna_length(scan_inputs, fake_foldx, fake_bigwig, tmp_path):
+    result = _scan(scan_inputs, tmp_path / "out", window=3)
+    assert "shorter than the DNA" in result["error"]
+    assert "window >= 5" in result["fix"]
+    assert fake_foldx == []
+
+
+def test_binding_scan_logs_progress_without_stdout(scan_inputs, fake_foldx, fake_bigwig, tmp_path,
+                                                   capsys, caplog):
+    """Progress goes to logging; stdout (the MCP stdio channel) stays empty."""
+    caplog.set_level(logging.INFO, logger="tfbs.mcp.foldx_tools")
+    result = _scan(scan_inputs, tmp_path / "out", region="chr1:0-5500")
+
+    assert result["num_windows"] == 110
+    assert capsys.readouterr().out == ""
+    assert any("100/110 windows processed" in r.getMessage() for r in caplog.records)
+
+
+def test_foldx_tools_source_has_no_print():
+    import tfbs.mcp.foldx_tools as fx
+
+    assert "print(" not in Path(fx.__file__).read_text(encoding="utf-8")
+
+
+def test_mutation_string_threads_both_strands(tmp_path):
+    from tfbs.mcp.foldx_tools import _dna_template, _mutation_string
+
+    template = _dna_template(_make_dna_pdb(str(tmp_path), "ACGTA"))
+    assert (template.fwd_chain, template.rev_chain) == ("C", "D")
+    assert _mutation_string(template, "ACGTA") is None
+    assert _mutation_string(template, "ACGTT") == "aC5t,tD1a;"
+
+
+def test_binding_scan_slurm_reports_missing_sbatch(scan_inputs, fake_foldx, fake_bigwig, tmp_path,
+                                                   monkeypatch):
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which",
+                        lambda cmd, *a, **k: None if cmd == "sbatch" else real_which(cmd, *a, **k))
+    result = _scan(scan_inputs, tmp_path / "out", slurm=True)
+
+    assert "sbatch" in result["error"]
+    assert "slurm=false" in result["fix"]
+    assert result["stage"] == "array"
+    assert "array_job_id" not in result
+
+
+def test_binding_scan_slurm_reports_failed_array_submit(scan_inputs, fake_foldx, fake_bigwig,
+                                                        fake_sbatch, tmp_path):
+    calls, replies = fake_sbatch
+    replies.append({"error": "sbatch failed (exit 1)", "stderr": "invalid partition"})
+    result = _scan(scan_inputs, tmp_path / "out", slurm=True)
+
+    assert "sbatch failed" in result["error"] and result["fix"]
+    assert result["stderr"] == "invalid partition"
+    assert len(calls) == 1
+
+
+def test_binding_scan_slurm_reports_missing_job_id(scan_inputs, fake_foldx, fake_bigwig,
+                                                   fake_sbatch, tmp_path):
+    calls, replies = fake_sbatch
+    replies.append({"job_id": None, "submit_command": "sbatch foldx_scan.sh"})
+    result = _scan(scan_inputs, tmp_path / "out", slurm=True)
+
+    assert "no job ID" in result["error"] and result["fix"]
+    assert len(calls) == 1
+
+
+def test_binding_scan_slurm_reports_failed_merge_submit(scan_inputs, fake_foldx, fake_bigwig,
+                                                        fake_sbatch, tmp_path):
+    calls, replies = fake_sbatch
+    replies += [{"job_id": "4242"}, {"error": "sbatch failed (exit 1)", "stderr": "bad dependency"}]
+    result = _scan(scan_inputs, tmp_path / "out", slurm=True)
+
+    assert "4242" in result["error"] and "merge" in result["error"]
+    assert "--dependency=afterany:4242" in result["fix"]
+    assert result["array_job_id"] == "4242"
+    assert result["stage"] == "merge"
+    assert calls[1]["flags"] == ["--dependency=afterany:4242"]
+
+
+def test_binding_scan_slurm_jobs_match_local_scan(scan_inputs, fake_foldx, fake_bigwig, fake_sbatch,
+                                                  tmp_path, monkeypatch):
+    """The array and merge jobs score windows exactly as the local scan does."""
+    import tfbs.mcp.foldx_tools as fx
+
+    calls, replies = fake_sbatch
+    replies += [{"job_id": "11"}, {"job_id": "12"}]
+    monkeypatch.setattr(fx, "_FOLDX_RUNS_PER_TASK", 20)
+    kwargs = {"region": "chr1:200-260", "window": 8, "step": 2}
+    result = _scan(scan_inputs, tmp_path / "slurm", slurm=True, **kwargs)
+
+    assert (result["array_job_id"], result["merge_job_id"]) == ("11", "12")
+    assert (result["window"], result["dna_length"]) == (8, 5)
+    assert (result["windows_per_task"], result["num_tasks"]) == (5, 6)
+    array_sh = Path(calls[0]["script"]).read_text()
+    assert "--array=0-5" in array_sh
+    assert sys.executable in array_sh
+    assert sys.executable in Path(calls[1]["script"]).read_text()
+    for name in ("foldx_scan_worker.py", "foldx_scan_merge.py"):
+        compile(Path(result["output_dir"], name).read_text(), name, "exec")
+
+    for task in range(result["num_tasks"]):
+        monkeypatch.setenv("SLURM_ARRAY_TASK_ID", str(task))
+        fx._scan_chunk_job(result["params_path"])
+    runs = len(fake_foldx)
+    fx._scan_chunk_job(result["params_path"])
+    assert len(fake_foldx) == runs, "a completed chunk must be skipped on resubmission"
+    fx._merge_chunks_job(result["params_path"])
+
+    local = _scan(scan_inputs, tmp_path / "local", **kwargs)
+    assert fake_bigwig[result["bigwig_path"]].entries == fake_bigwig[local["bigwig_path"]].entries
+
+
+def test_binding_scan_slurm_worker_script_runs_standalone(scan_inputs, fake_foldx, fake_bigwig,
+                                                          fake_sbatch, tmp_path):
+    """The generated worker runs as SLURM would start it, with nothing on stdout."""
+    _, replies = fake_sbatch
+    replies += [{"job_id": "11"}, {"job_id": "12"}]
+    result = _scan(scan_inputs, tmp_path / "slurm", slurm=True, region="chr1:200-230", step=10)
+    params_path = Path(result["params_path"])
+    params = json.loads(params_path.read_text())
+    params["foldx_bin"] = str(tmp_path / "no-foldx-here")
+    params_path.write_text(json.dumps(params))
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(result["output_dir"], "foldx_scan_worker.py"))],
+        capture_output=True, text=True, timeout=300, cwd=str(tmp_path),
+        env={**os.environ, "SLURM_ARRAY_TASK_ID": "0"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    rows = Path(result["chunks_dir"], "chunk_00000.csv").read_text().splitlines()
+    assert rows[0] == "position,energy"
+    assert [r.split(",")[0] for r in rows[1:]] == ["200", "210", "220"]

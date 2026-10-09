@@ -37,7 +37,7 @@ command:
 - --model.input_length=24
 - --data.data_path=/path/to/tfbs-project/data/tensors/flank_mean
 - --data.scaling_method=standardize
-- --trainer=scripts/cli/yamls/trainers/default.yaml
+- --trainer=tfbs/configs/trainers/default.yaml
 - --trainer.logger.init_args.project=P09_flank_mean_standardize_BPNetReal
 - --trainer.callbacks.init_args.dirpath=/path/to/tfbs-project/saved_models_tuned/flank_mean/standardize
 - --trainer.callbacks.init_args.filename=best_BPNetReal
