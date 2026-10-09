@@ -614,8 +614,8 @@ async def tfbs_binding_energy(
     structure file's name without .pdb.  Its path, returned as
     ``repaired_structure_path``, is the repaired structure that
     tfbs_binding_scan (structure_path) and the FoldX legs of
-    tfbs_chipseq_method_comparison, tfbs_remap_validation and
-    tfbs_disease_variant_validation (foldx_pdb, or $TFBS_FOLDX_PDB)
+    tfbs_chipseq_method_comparison and tfbs_remap_validation (foldx_pdb,
+    or $TFBS_FOLDX_PDB) and tfbs_disease_variant_validation (foldx_pdb)
     expect.
 
     Args:
