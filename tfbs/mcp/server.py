@@ -1225,7 +1225,13 @@ def _inference_scaling(payload: dict, path: Path, model_type: str, data_path: st
     if given, must hold the same values.  A file without a scaling block
     falls back to the lookup of _find_scaling_params.
     """
-    own = _json_safe(payload.get("scaling"))
+    try:
+        own = _json_safe(payload.get("scaling"))
+    except RecursionError:
+        return None, None, _error(
+            f"The scaling block of {path} refers to itself or is nested too deeply to read.",
+            "Save scaling as a plain dict such as "
+            '{"scaling_method": "standardize", "mean": ..., "std": ...}.')
     if not (isinstance(own, dict) and isinstance(own.get("scaling_method"), str)):
         return _find_scaling_params(data_path, path, model_type,
                                     {"hyper_parameters": {}, "datamodule_hyper_parameters": {}})
@@ -1849,8 +1855,9 @@ async def tfbs_analyze(
         sequence) and, for FASTA, "ids"; "warnings" lists the distinct
         warnings captum or tangermeme raised during the attribution,
         each once as {message, count}, with message the warning's
-        category and its text before the first ":" (so tensor values do
-        not split one warning into many).
+        category and its text before the first ": " (colon and space),
+        so tensor values do not split one warning into many while a
+        path such as C:/data/x.pt stays whole.
     """
     try:
         from captum.attr import DeepLiftShap, InputXGradient
@@ -3193,22 +3200,34 @@ async def tfbs_train(
         "local", command (the argv list), exit_code, log_path, log_tail
         (last 20 lines), checkpoint_path and checkpoint_exists (from the
         config's ModelCheckpoint dirpath and filename; true only for a
-        file written by this run), and "metrics" from the metrics.csv
-        this run's CSVLogger wrote (<save_dir>/<name>/version_<n>/ of the
-        config's trainer.logger): the row of the best epoch, the one
-        with the lowest val_loss that ModelCheckpoint keeps ({val_loss,
-        and for classifiers val_acc and val_auc, as floats}), plus
-        best_epoch and epochs_run (last epoch + 1), with the file as
-        metrics_path.  A CSVLogger with a fixed version reuses its
-        metrics.csv, and some Lightning releases append to it, so only
-        the rows this run added are read: rows the file held when the
-        run started are skipped.  metrics is null, with a "note" saying
-        why, when the config has no CSVLogger or this run wrote no
-        metrics.csv;
+        file this run created or rewrote, i.e. one that did not exist
+        before the run or whose modification time changed during it),
+        and "metrics" from the metrics.csv this run's CSVLogger wrote
+        (<save_dir>/<name>/version_<n>/ of the config's trainer.logger;
+        likewise a file that is new or was modified during the run): the
+        row of the best epoch, the one with the lowest finite val_loss
+        that ModelCheckpoint keeps ({val_loss, and for classifiers
+        val_acc and val_auc, as floats}), plus best_epoch and epochs_run
+        (last epoch + 1), with the file as metrics_path; a row whose
+        epoch or val_loss is nan or inf is skipped.  A CSVLogger with
+        a fixed version reuses its metrics.csv, and some Lightning
+        releases append to it, so only the rows this run added are read:
+        rows the file held when the run started are skipped when the
+        rows after them start again at an earlier or equal (epoch, step),
+        as an appended run does.  The file is read whole when its new
+        rows continue past the old ones (Lightning 2.6 deletes the file,
+        so a rerun logs the same epochs again and then goes on), when it
+        holds no more rows than before, or when its first rows differ
+        from the old ones.  metrics is null, with a "note" saying why,
+        when the config has no CSVLogger, this run wrote no metrics.csv,
+        or the file cannot be read;
         val_auc is null, with a note, when the validation split holds a
         single class (AUROC is undefined there).  A failed run returns
         error, fix, exit_code, log_path and log_tail; a run killed after
-        local_timeout returns error, fix and log_path.
+        local_timeout returns error, fix and log_path.  In local mode a
+        config whose trainer, or the init_args of its ModelCheckpoint or
+        CSVLogger, is not a mapping returns error and fix before anything
+        runs.
     """
     if script and config_path:
         return _error("Provide exactly one of 'script' or 'config_path', not both.",
@@ -3334,14 +3353,26 @@ def _no_sbatch_for_training() -> str:
     )
 
 
+def _mapping(parent: dict, key: str, where: str) -> dict:
+    """parent[key] as a dict ({} when absent); ValueError naming where if it is not a mapping."""
+    value = parent.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} is a {type(value).__name__} ({value!r:.80}), not a mapping")
+    return value
+
+
 def _checkpoint_target(config: dict, base: Path) -> Path | None:
-    """<dirpath>/<filename>.ckpt of the config's ModelCheckpoint callback."""
-    trainer = config.get("trainer") or {}
-    callbacks = trainer.get("callbacks") or []
+    """<dirpath>/<filename>.ckpt of the config's ModelCheckpoint callback.
+
+    Raises ValueError when trainer or the callback's init_args is not a mapping.
+    """
+    callbacks = _mapping(config, "trainer", "trainer").get("callbacks") or []
     for cb in callbacks if isinstance(callbacks, list) else [callbacks]:
         if not isinstance(cb, dict) or not str(cb.get("class_path", "")).endswith("ModelCheckpoint"):
             continue
-        args = cb.get("init_args") or {}
+        args = _mapping(cb, "init_args", f"init_args of {cb['class_path']}")
         if not args.get("dirpath"):
             return None
         dirpath = Path(str(args["dirpath"])).expanduser()
@@ -3353,12 +3384,15 @@ def _checkpoint_target(config: dict, base: Path) -> Path | None:
 
 
 def _csv_logger_dir(config: dict, base: Path) -> Path | None:
-    """<save_dir>/<name> of the config's CSVLogger (relative save_dir against base), or None."""
-    loggers = (config.get("trainer") or {}).get("logger")
+    """<save_dir>/<name> of the config's CSVLogger (relative save_dir against base), or None.
+
+    Raises ValueError when trainer or the logger's init_args is not a mapping.
+    """
+    loggers = _mapping(config, "trainer", "trainer").get("logger")
     for lg in loggers if isinstance(loggers, list) else [loggers]:
         if not isinstance(lg, dict) or not str(lg.get("class_path", "")).endswith("CSVLogger"):
             continue
-        args = lg.get("init_args") or {}
+        args = _mapping(lg, "init_args", f"init_args of {lg['class_path']}")
         if not args.get("save_dir"):
             return None
         save_dir = Path(str(args["save_dir"])).expanduser()
@@ -3370,9 +3404,21 @@ def _csv_logger_dir(config: dict, base: Path) -> Path | None:
 
 
 def _as_float(value: Any) -> float | None:
+    """value as a finite float, or None (blank, not a number, nan or inf)."""
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _mtime_ns(path: Path | None) -> int | None:
+    """path's st_mtime_ns, or None when it does not exist (or cannot be read)."""
+    if path is None:
+        return None
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
         return None
 
 
@@ -3383,16 +3429,29 @@ def _read_metrics_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
-def _metrics_snapshot(log_dir: Path | None) -> dict[Path, list[dict[str, str]]]:
-    """The rows of every metrics.csv under log_dir before a run starts."""
-    if log_dir is None or not log_dir.is_dir():
-        return {}
-    snapshot = {}
-    for path in log_dir.glob("*/metrics.csv"):
-        try:
-            snapshot[path] = _read_metrics_rows(path)
-        except (OSError, UnicodeDecodeError):
+def _metrics_snapshot(log_dir: Path | None) -> dict[Path, tuple[int, list[dict[str, str]] | None]]:
+    """{metrics.csv: (st_mtime_ns, rows)} under log_dir before a run starts.
+
+    rows is None for a file that cannot be read.
+    """
+    import csv
+
+    snapshot: dict[Path, tuple[int, list[dict[str, str]] | None]] = {}
+    if log_dir is None:
+        return snapshot
+    try:
+        paths = list(log_dir.glob("*/metrics.csv")) if log_dir.is_dir() else []
+    except OSError:
+        return snapshot
+    for path in paths:
+        stamp = _mtime_ns(path)
+        if stamp is None:
             continue
+        try:
+            rows = _read_metrics_rows(path)
+        except (OSError, UnicodeDecodeError, csv.Error):
+            rows = None
+        snapshot[path] = (stamp, rows)
     return snapshot
 
 
@@ -3421,36 +3480,49 @@ def _rows_of_this_run(rows: list[dict[str, str]], before: list[dict[str, str]] |
     return rows[len(before):]
 
 
-def _best_epoch_metrics(log_dir: Path, since: float,
-                        before: dict[Path, list[dict[str, str]]] | None = None,
+def _best_epoch_metrics(log_dir: Path,
+                        before: dict[Path, tuple[int, list[dict[str, str]] | None]],
                         ) -> tuple[dict | None, Path | None, str | None]:
     """(metrics, metrics.csv, None) for the best epoch of the run, or (None, path or None, note).
 
-    Only a metrics.csv under log_dir modified at or after since (a
-    time.time() stamp) counts, and only the rows it gained during the
-    run: rows it held already (before, from _metrics_snapshot) are
-    skipped, so an earlier run's log is never reported.
+    Only a metrics.csv under log_dir that is new or whose st_mtime_ns
+    changed since before (from _metrics_snapshot) counts, and only the
+    rows it gained during the run, so an earlier run's log is never
+    reported.  A row whose epoch or val_loss is blank, nan or inf is
+    not a candidate for the best epoch.
     """
-    csvs = [p for p in log_dir.glob("*/metrics.csv") if p.stat().st_mtime >= since] \
-        if log_dir.is_dir() else []
-    if not csvs:
-        return None, None, (f"This run wrote no metrics.csv under {log_dir} (the config's "
-                            "CSVLogger directory), so no validation metrics are reported.")
-    path = max(csvs, key=lambda p: p.stat().st_mtime)
-    rows = _rows_of_this_run(_read_metrics_rows(path), (before or {}).get(path))
-    epochs = [int(e) for e in (_as_float(r.get("epoch")) for r in rows) if e is not None]
-    scored = [r for r in rows if _as_float(r.get("val_loss")) is not None]
+    import csv
+
+    path = None
+    try:
+        stamps = {p: _mtime_ns(p) for p in log_dir.glob("*/metrics.csv")} \
+            if log_dir.is_dir() else {}
+        fresh = {p: ns for p, ns in stamps.items()
+                 if ns is not None and (p not in before or before[p][0] != ns)}
+        if not fresh:
+            return None, None, (f"This run wrote no metrics.csv under {log_dir} (the config's "
+                                "CSVLogger directory), so no validation metrics are reported.")
+        path = max(fresh, key=fresh.__getitem__)
+        rows = _rows_of_this_run(_read_metrics_rows(path), before.get(path, (0, None))[1])
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        return None, path, (f"Could not read {path or log_dir} after the run "
+                            f"({type(exc).__name__}: {exc}), so no validation metrics "
+                            "are reported.")
+    numbered = [(r, _as_float(r.get("epoch"))) for r in rows]
+    epochs = [int(e) for _, e in numbered if e is not None]
+    scored = [(r, e) for r, e in numbered
+              if e is not None and _as_float(r.get("val_loss")) is not None]
     if not scored:
-        return None, path, f"{path} has no val_loss row, so no validation metrics are reported."
-    best = min(scored, key=lambda r: _as_float(r["val_loss"]))
+        return None, path, (f"{path} has no row with a finite val_loss and epoch, so no "
+                            "validation metrics are reported.")
+    best, best_epoch = min(scored, key=lambda pair: _as_float(pair[0]["val_loss"]))
     metrics: dict[str, Any] = {}
     for key in ("val_loss", "val_acc", "val_auc"):
         value = _as_float(best.get(key))
         if value is not None:
             metrics[key] = value
-    best_epoch = _as_float(best.get("epoch"))
-    metrics["best_epoch"] = int(best_epoch) if best_epoch is not None else None
-    metrics["epochs_run"] = max(epochs) + 1 if epochs else None
+    metrics["best_epoch"] = int(best_epoch)
+    metrics["epochs_run"] = max(epochs) + 1
     return metrics, path, None
 
 
@@ -3500,6 +3572,15 @@ def _kill_process_group(proc, posix: bool | None = None) -> None:
         pass
 
 
+def _stop_process_group(proc, timeout: float = 30.0) -> None:
+    """Kill proc's process group, then wait up to timeout seconds for proc to exit."""
+    _kill_process_group(proc)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("Process %s had not exited %s s after it was killed.", proc.pid, timeout)
+
+
 def _wait_polling(proc, timeout: float, poll: float = 0.5) -> int:
     """proc's exit code; kills its process group and raises TimeoutExpired after timeout seconds."""
     deadline = time.monotonic() + timeout
@@ -3524,15 +3605,19 @@ async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str
                       "Pass a Lightning CLI YAML config, e.g. from tfbs_config.")
 
     config = config if isinstance(config, dict) else {}
-    target = _checkpoint_target(config, config_p.parent)
-    log_dir = _csv_logger_dir(config, config_p.parent)
+    try:
+        target = _checkpoint_target(config, config_p.parent)
+        log_dir = _csv_logger_dir(config, config_p.parent)
+    except (ValueError, OSError) as exc:
+        return _error(f"The config {config_p} is not a usable Lightning CLI config: {exc}.",
+                      "Write trainer, and the init_args of its ModelCheckpoint and "
+                      "CSVLogger, as YAML mappings (key: value), as tfbs_config does.")
     cmd = [sys.executable, "-m", "tfbs.cli.train_cli", "fit", "--config", str(config_p),
            "--data.num_workers", "0", *tokens]
     log_path = config_p.parent / f"{config_p.stem}_train.log"
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     env = {**_pipeline_env(), "PYTHONIOENCODING": "utf-8"}
-    # Whole seconds: some filesystems store mtimes no finer than that.
-    started = float(int(time.time()))
+    target_before = _mtime_ns(target)
     before = _metrics_snapshot(log_dir)
     try:
         with open(log_path, "a", encoding="utf-8", newline="\n") as log:
@@ -3546,8 +3631,7 @@ async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str
             try:
                 returncode = await asyncio.to_thread(_wait_polling, proc, timeout)
             except asyncio.CancelledError:
-                _kill_process_group(proc)
-                proc.wait()
+                await asyncio.shield(asyncio.to_thread(_stop_process_group, proc))
                 raise
     except subprocess.TimeoutExpired:
         return _error(
@@ -3571,7 +3655,7 @@ async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str
             exit_code=returncode, log_path=str(log_path), log_tail=tail,
         )
     notes: list[str] = []
-    fresh = bool(target and target.is_file() and target.stat().st_mtime >= started)
+    fresh = bool(target and target.is_file() and _mtime_ns(target) != target_before)
     if target and target.is_file() and not fresh:
         notes.append(f"{target} predates this run, so it is not reported as written by it.")
     result: dict[str, Any] = {
@@ -3588,7 +3672,7 @@ async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str
         notes.append("The config has no CSVLogger with a save_dir (trainer.logger), so no "
                      "validation metrics are reported; tfbs_config adds one.")
     else:
-        metrics, metrics_path, note = _best_epoch_metrics(log_dir, started, before)
+        metrics, metrics_path, note = _best_epoch_metrics(log_dir, before)
         if note:
             notes.append(note)
         if metrics is not None and "val_auc" in metrics \
@@ -6887,7 +6971,8 @@ def main():
     # Register FoldX tools on the shared mcp instance
     import tfbs.mcp.foldx_tools  # noqa: F401
 
-    unavailable = _unavailable_modules(_preload_native_modules())
+    with _stdout_to_stderr():
+        unavailable = _unavailable_modules(_preload_native_modules())
     if unavailable:
         logger.info("Optional modules not available: %s", ", ".join(unavailable))
     _detach_child_stdin()

@@ -868,3 +868,37 @@ def test_binding_scan_writes_to_the_results_dir_by_default(scan_inputs, fake_fol
         assert _run(tfbs_binding_scan(**{**args, **change}))["output_dir"] != str(out), change
     doc = " ".join(tfbs_binding_scan.__doc__.split())
     assert "<results>/binding_scan/<digest>/" in doc and "temp" not in doc
+
+
+def test_binding_scan_default_dir_tells_genomes_and_structures_apart(scan_inputs, fake_foldx,
+                                                                     fake_bigwig, tmp_path,
+                                                                     monkeypatch):
+    from tfbs.mcp.foldx_tools import tfbs_binding_scan
+
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    pdb, fasta, _ = scan_inputs
+    args = {"structure_path": pdb, "genome_fasta": fasta, "region": "chr1:100-1100"}
+    seen = {_run(tfbs_binding_scan(**args))["output_dir"]}
+    other = tmp_path / "other"
+    other.mkdir()
+    other_fasta, _ = _make_genome(str(other), seed=8)
+    for change in ({"genome_fasta": other_fasta}, {"structure_path": _make_dna_pdb(str(other))}):
+        out = _run(tfbs_binding_scan(**{**args, **change}))["output_dir"]
+        assert out not in seen, change
+        seen.add(out)
+    for rewritten in (fasta, pdb):
+        st = os.stat(rewritten)
+        os.utime(rewritten, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+        out = _run(tfbs_binding_scan(**args))["output_dir"]
+        assert out not in seen, rewritten
+        seen.add(out)
+    doc = " ".join(tfbs_binding_scan.__doc__.split())
+    assert "size and modification time of both the structure and the genome FASTA" in doc
+
+
+def test_fetch_structure_says_a_repeated_call_downloads_again():
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    doc = " ".join(tfbs_fetch_structure.__doc__.split())
+    assert "reuses that directory and downloads the file again" in doc
+    assert "reuses its download" not in doc

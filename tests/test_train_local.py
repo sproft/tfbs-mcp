@@ -2,7 +2,11 @@
 import asyncio
 import json
 import os
+import shutil
+import signal
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -483,3 +487,257 @@ def test_train_description_states_the_fixed_version_and_group_kill():
     assert "rows the file held when the run started are skipped" in doc
     assert "that whole group (the process tree, on Windows) is killed" in doc
     assert "on Windows the quotes around each token are then removed" not in doc
+
+
+# ---------------------------------------------------------------------------
+# Non-finite rows, unreadable logs, cancellation off the event loop, a real
+# process-tree kill, malformed configs, freshness by st_mtime_ns
+# ---------------------------------------------------------------------------
+
+def _version_csv(config_file: Path, version: int = 0) -> Path:
+    return config_file.parent / "ckpts" / "logs" / "best_RNN" / f"version_{version}" / "metrics.csv"
+
+
+def test_as_float_drops_non_finite_values():
+    assert server._as_float("1.5") == 1.5 and server._as_float(2) == 2.0
+    for value in ("nan", "inf", "-inf", "NaN", "", None, "x", 10 ** 400):
+        assert server._as_float(value) is None, value
+
+
+def test_non_finite_rows_are_not_candidates_for_the_best_epoch(popen, config_file):
+    settings, _ = popen
+    settings["action"] = lambda cmd, kwargs: _metrics_csv(
+        _version_csv(config_file),
+        "epoch,step,val_loss\n0,5,nan\n1,11,0.5\n2,17,0.6\nnan,20,0.1\ninf,23,0.2\n3,29,inf\n")
+    result = run(server.tfbs_train(config_path=str(config_file), local=True))
+    assert result["metrics"] == {"val_loss": 0.5, "best_epoch": 1, "epochs_run": 4}
+
+
+def test_a_log_without_a_finite_val_loss_has_no_metrics(popen, config_file):
+    settings, _ = popen
+    settings["action"] = lambda cmd, kwargs: _metrics_csv(
+        _version_csv(config_file), "epoch,step,val_loss\n0,5,nan\ninf,11,0.4\n")
+    result = run(server.tfbs_train(config_path=str(config_file), local=True))
+    assert result["exit_code"] == 0 and result["metrics"] is None
+    assert "finite val_loss" in result["note"]
+
+
+@pytest.mark.parametrize("content", [
+    b"epoch,step,val_loss\n0,5,0.\xff\n",
+    b'epoch,step,val_loss\n0,5,"' + b"9" * 200_000 + b'"\n',
+], ids=["not_utf8", "csv_error"])
+def test_an_unreadable_metrics_csv_leaves_the_run_successful(popen, config_file, content):
+    settings, _ = popen
+    ckpts = config_file.parent / "ckpts"
+    csv_path = _version_csv(config_file)
+
+    def ok(cmd, kwargs):
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        (ckpts / "best_RNN.ckpt").write_text("x")
+        csv_path.write_bytes(content)
+
+    settings["action"] = ok
+    result = run(server.tfbs_train(config_path=str(config_file), local=True))
+    assert "error" not in result, result
+    assert result["exit_code"] == 0 and result["checkpoint_exists"] is True
+    assert result["metrics"] is None
+    assert "Could not read" in result["note"] and "metrics.csv" in result["note"]
+    assert Path(result["metrics_path"]).name == "metrics.csv"
+
+
+def test_an_unreadable_earlier_log_is_snapshotted_and_skipped(popen, config_file):
+    settings, _ = popen
+    old = _version_csv(config_file)
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"epoch,step,val_loss\n0,5,0.\xff\n")
+    snapshot = server._metrics_snapshot(old.parent.parent.resolve())
+    assert [(rows, stamp == old.stat().st_mtime_ns) for stamp, rows in snapshot.values()] == [
+        (None, True)]
+    settings["action"] = lambda cmd, kwargs: _metrics_csv(
+        _version_csv(config_file, 1), "epoch,step,val_loss\n0,5,0.4\n")
+    result = run(server.tfbs_train(config_path=str(config_file), local=True))
+    assert result["metrics"] == {"val_loss": 0.4, "best_epoch": 0, "epochs_run": 1}
+    assert Path(result["metrics_path"]).parent.name == "version_1"
+
+
+def test_cancellation_kills_and_waits_off_the_event_loop(popen, config_file, monkeypatch):
+    settings, procs = popen
+    settings["hang"] = True
+    real_kill = server._kill_process_group
+    kill_started, loop_answered = threading.Event(), threading.Event()
+    seen: dict = {}
+
+    def kill(proc, posix=None):
+        seen["thread"] = threading.get_ident()
+        kill_started.set()
+        seen["loop_answered"] = loop_answered.wait(timeout=10)
+        real_kill(proc, posix)
+
+    monkeypatch.setattr(server, "_kill_process_group", kill)
+
+    async def scenario():
+        seen["loop"] = threading.get_ident()
+        task = asyncio.create_task(server.tfbs_train(
+            config_path=str(config_file), local=True, local_timeout=600))
+        while not procs:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        task.cancel()
+        while not kill_started.is_set():
+            await asyncio.sleep(0.01)
+        loop_answered.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert seen["thread"] != seen["loop"]
+    assert seen["loop_answered"] is True
+    assert procs[0].killed
+
+
+def test_stop_process_group_waits_a_bounded_time(monkeypatch):
+    waits: list = []
+
+    class Stuck(FakeProc):
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            raise subprocess.TimeoutExpired(self.cmd, timeout)
+
+    monkeypatch.setattr(server, "_kill_process_group", lambda proc, posix=None: None)
+    server._stop_process_group(Stuck(["x"], {}))
+    assert waits == [30.0]
+
+
+def _process_alive(pid: int) -> bool:
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                             capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return f'"{pid}"' in out.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state != "Z"
+
+
+def _gone_within(pid: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while _process_alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+@pytest.mark.skipif(
+    (os.name == "nt" and shutil.which("tasklist") is None)
+    or (os.name != "nt" and not hasattr(os, "kill")),
+    reason="no way to check whether a process is alive on this platform")
+def test_timeout_kills_a_real_child_and_its_grandchild(tmp_path):
+    pid_file = tmp_path / "grandchild.pid"
+    child_code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n"
+    )
+    child = subprocess.Popen([sys.executable, "-c", child_code], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             **server._new_process_group())
+    grandchild = None
+    try:
+        deadline = time.monotonic() + 60
+        while grandchild is None and time.monotonic() < deadline:
+            text = pid_file.read_text() if pid_file.is_file() else ""
+            grandchild = int(text) if text.strip().isdigit() else None
+            time.sleep(0.05)
+        assert grandchild is not None, "the child never started its grandchild"
+        assert _process_alive(child.pid) and _process_alive(grandchild)
+        with pytest.raises(subprocess.TimeoutExpired):
+            server._wait_polling(child, 1.0)
+        assert child.poll() is not None
+        assert _gone_within(child.pid, 10) and _gone_within(grandchild, 10)
+    finally:
+        for pid in filter(None, (child.pid, grandchild)):
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
+                               stdin=subprocess.DEVNULL)
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        child.wait(timeout=30)
+
+
+@pytest.mark.parametrize("text", [
+    "trainer: fast\n",
+    "trainer:\n- max_epochs\n- 3\n",
+    CONFIG.replace("{dirpath: ckpts, filename: best_RNN}", "ckpts"),
+    CONFIG.replace("{save_dir: ckpts/logs, name: best_RNN}", "[ckpts/logs, best_RNN]"),
+], ids=["trainer_str", "trainer_list", "checkpoint_init_args_str", "logger_init_args_list"])
+def test_a_malformed_trainer_section_is_a_json_error(popen, tmp_path, text):
+    _, procs = popen
+    cfg = tmp_path / "cfg" / "RNN.yaml"
+    cfg.parent.mkdir()
+    cfg.write_text(text)
+    result = run(server.tfbs_train(config_path=str(cfg), local=True))
+    assert "not a mapping" in result["error"] and "mappings" in result["fix"], result
+    assert procs == []
+
+
+def test_a_logger_given_as_a_string_or_list_is_not_an_error(popen, tmp_path):
+    cfg = tmp_path / "cfg" / "RNN.yaml"
+    cfg.parent.mkdir()
+    for logger in ("pytorch_lightning.loggers.CSVLogger", "[false, other]"):
+        cfg.write_text(f"trainer:\n  logger: {logger}\n")
+        result = run(server.tfbs_train(config_path=str(cfg), local=True))
+        assert result["exit_code"] == 0 and result["metrics"] is None, result
+        assert "CSVLogger" in result["note"]
+
+
+def test_files_written_in_the_same_second_before_the_run_are_not_reported(popen, config_file):
+    ckpts = config_file.parent / "ckpts"
+    ckpt = _metrics_csv(ckpts / "best_RNN.ckpt", "x")
+    _metrics_csv(_version_csv(config_file), "epoch,step,val_loss\n0,5,0.1\n")
+    result = run(server.tfbs_train(config_path=str(config_file), local=True))
+    assert result["exit_code"] == 0 and ckpt.is_file()
+    assert result["checkpoint_exists"] is False and result["metrics"] is None
+    assert "predates this run" in result["note"] and "no metrics.csv" in result["note"]
+
+
+def test_a_checkpoint_the_run_rewrites_is_reported_whatever_its_second(popen, config_file):
+    settings, _ = popen
+    ckpt = _metrics_csv(config_file.parent / "ckpts" / "best_RNN.ckpt", "x")
+    csv_path = _metrics_csv(_version_csv(config_file), "epoch,step,val_loss\n0,5,0.1\n")
+    stamps = {p: p.stat().st_mtime_ns for p in (ckpt, csv_path)}
+
+    def rewrite(cmd, kwargs):
+        for path, ns in stamps.items():
+            with open(path, "a", newline="\n") as f:
+                f.write("1,11,0.05\n" if path == csv_path else "y")
+            os.utime(path, ns=(ns + 1_000_000, ns + 1_000_000))
+
+    settings["action"] = rewrite
+    result = run(server.tfbs_train(config_path=str(config_file), local=True))
+    assert result["checkpoint_exists"] is True
+    assert result["metrics"] == {"val_loss": 0.05, "best_epoch": 1, "epochs_run": 2}
+
+
+def test_train_description_states_the_continuation_case_and_freshness():
+    doc = " ".join(server.tfbs_train.__doc__.split())
+    assert "The file is read whole when its new rows continue past the old ones" in doc
+    assert "whose modification time changed during it" in doc
+    assert "or the file cannot be read" in doc and "is not a mapping returns error" in doc
+
+
+def test_analyze_description_says_warnings_group_on_colon_and_space():
+    doc = " ".join(server.tfbs_analyze.__doc__.split())
+    assert 'its text before the first ": " (colon and space)' in doc
+    assert 'before the first ":" (' not in doc

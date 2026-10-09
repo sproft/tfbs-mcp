@@ -625,6 +625,16 @@ def test_unreportable_metadata_leaves_no_model_registered(tmp_path):
     assert "lm_loop" not in server._model_registry
 
 
+def test_self_referential_scaling_is_a_json_error(tmp_path):
+    loop = dict(STD)
+    loop["self"] = loop
+    path = _save_inference(tmp_path / "rel" / "vcnnbpnet.pt", scaling=loop)
+    result = _load_vcnn(path, model_id="lm_scaling_loop")
+    assert "scaling block" in result["error"] and "refers to itself" in result["error"]
+    assert "scaling_method" in result["fix"]
+    assert "lm_scaling_loop" not in server._model_registry
+
+
 @pytest.mark.parametrize("scaling, expected", [
     ({**STD, "std": float("nan")}, "not a finite number"),
     ({**STD, "mean": float("inf")}, "not a finite number"),

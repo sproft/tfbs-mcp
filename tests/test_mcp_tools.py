@@ -1431,6 +1431,25 @@ def test_stray_prints_inside_a_tool_call_go_to_stderr(monkeypatch, capsys):
     assert sys.stdout is stdout_before
 
 
+def test_startup_preload_prints_go_to_stderr(monkeypatch, capsys):
+    from tfbs.mcp import server
+
+    seen: dict = {}
+
+    def noisy_preload():
+        print("library banner at import")
+        return {}
+
+    monkeypatch.setattr(server, "_preload_native_modules", noisy_preload)
+    monkeypatch.setattr(server, "_detach_child_stdin", lambda: None)
+    monkeypatch.setattr(server.mcp, "run", lambda *a, **k: seen.setdefault("stdout", sys.stdout))
+    stdout_before = sys.stdout
+    server.main()
+    captured = capsys.readouterr()
+    assert captured.out == "" and "library banner at import" in captured.err
+    assert seen["stdout"] is stdout_before
+
+
 # ---------------------------------------------------------------------------
 # Opt-in call log (TFBS_CALL_LOG)
 # ---------------------------------------------------------------------------

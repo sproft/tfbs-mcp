@@ -476,8 +476,9 @@ async def tfbs_fetch_structure(
                      results_dir of tfbs_server_info and <id> the value of
                      the source argument being tried (e.g. 3RKQ, NKX2-1 or
                      P43699; PDB and UniProt IDs uppercased, so 3rkq and
-                     3RKQ share a directory), so a repeated call reuses
-                     its download.
+                     3RKQ share a directory).  A repeated call reuses
+                     that directory and downloads the file again,
+                     overwriting an earlier copy of the same file.
 
     Returns:
         JSON with ``source`` (``local``, ``pdb`` or ``alphafold``),
@@ -1057,8 +1058,11 @@ async def tfbs_binding_scan(
         output_dir:     Where to write the bigWig.  Default
                         <results>/binding_scan/<digest>/, with <results>
                         the results_dir of tfbs_server_info and <digest> a
-                        hash of the region, window, step and structure
-                        path, so a repeated call writes to the same place.
+                        hash of the region, window, step and the path,
+                        size and modification time of both the structure
+                        and the genome FASTA, so a repeated call writes to
+                        the same place, while scans against a different
+                        or rewritten genome or structure never share one.
         window:         Window size in bp.  Default None means the DNA
                         length of the structure (e.g. 11 bp), one FoldX run
                         per window.  An explicit value is used as given,
@@ -1187,7 +1191,8 @@ async def tfbs_binding_scan(
 
     out = (Path(output_dir).expanduser() if output_dir
            else _server._results_root() / "binding_scan"
-           / _server._digest(region, window, step, str(pdb)))
+           / _server._digest(region, window, step, _server._file_identity(str(pdb)),
+                             _server._file_identity(str(fasta))))
     try:
         out.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
