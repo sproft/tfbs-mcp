@@ -3,6 +3,7 @@ import asyncio
 import importlib
 import json
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -270,3 +271,82 @@ def test_tfbs_config_writes_nothing_to_stdout(tmp_path, capfd):
     data = _dataset(tmp_path, 24)
     _config(model_type="VCNNBpnet", data_path=str(data), output_path=str(tmp_path / "c.yaml"))
     assert capfd.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint naming, metrics logging and the classify default
+# ---------------------------------------------------------------------------
+
+def _binary_dataset(tmp_path, length=24, n=8, name="cls"):
+    root = _dataset(tmp_path, length, n, name)
+    for split in ("train", "val", "test"):
+        torch.save(torch.tensor([[1.0], [0.0]] * (n // 2)), root / split / "labels.pt")
+    return root
+
+
+def test_retraining_overwrites_the_checkpoint_and_logs_metrics_to_csv(tmp_path):
+    data = _dataset(tmp_path, 24)
+    out = tmp_path / "c.yaml"
+    result = _config(model_type="VCNNBpnet", data_path=str(data), output_path=str(out),
+                     checkpoint_dir=str(tmp_path / "ckpt"))
+    cfg = yaml.safe_load(out.read_text())
+    ckpt = cfg["trainer"]["callbacks"][1]
+    assert ckpt["class_path"] == "pytorch_lightning.callbacks.ModelCheckpoint"
+    assert ckpt["init_args"]["enable_version_counter"] is False
+    [logger] = cfg["trainer"]["logger"]
+    assert logger["class_path"] == "pytorch_lightning.loggers.CSVLogger"
+    save_dir = logger["init_args"]["save_dir"]
+    assert save_dir == str((tmp_path / "ckpt" / "logs").resolve())
+    assert logger["init_args"]["name"] == "best_VCNNBpnet"
+    assert result["metrics_dir"] == str((tmp_path / "ckpt" / "logs" / "best_VCNNBpnet").resolve())
+
+    wandb = tmp_path / "w.yaml"
+    result = _config(model_type="VCNNBpnet", data_path=str(data), output_path=str(wandb),
+                     wandb_project="proj")
+    [logger] = yaml.safe_load(wandb.read_text())["trainer"]["logger"]
+    assert logger["class_path"] == "pytorch_lightning.loggers.WandbLogger"
+    assert result["metrics_dir"] is None
+
+
+def test_relative_checkpoint_dir_resolves_against_the_project_root(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    root.mkdir()
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(root))
+    monkeypatch.chdir(tmp_path)
+    data = _dataset(tmp_path, 24)
+    out = tmp_path / "c.yaml"
+    result = _config(model_type="RNN", data_path=str(data), output_path=str(out),
+                     checkpoint_dir="models/run1")
+    dirpath = yaml.safe_load(out.read_text())["trainer"]["callbacks"][1]["init_args"]["dirpath"]
+    assert dirpath == str((root / "models" / "run1").resolve())
+    assert result["checkpoint_path"] == str(Path(dirpath) / "best_RNN.ckpt")
+
+
+def test_binary_labels_make_a_classifier_by_default(tmp_path):
+    data = _binary_dataset(tmp_path)
+    out = tmp_path / "c.yaml"
+    result = _config(model_type="VCNNBpnet", data_path=str(data), output_path=str(out))
+    assert result["classify"] is True and result["scaling_method"] == "none"
+    assert "0 or 1" in result["note"] and "warning" not in result
+    cfg = yaml.safe_load(out.read_text())
+    assert cfg["model"]["init_args"]["classify"] is True
+    assert cfg["data"]["scaling_method"] == "none"
+
+
+def test_explicit_regression_on_binary_labels_warns(tmp_path):
+    data = _binary_dataset(tmp_path)
+    reg = _config(model_type="VCNNBpnet", data_path=str(data),
+                  output_path=str(tmp_path / "r.yaml"), classify=False)
+    assert reg["classify"] is False and reg["scaling_method"] == "standardize"
+    assert "classify=false" in reg["warning"] and "note" not in reg
+    scaled = _config(model_type="VCNNBpnet", data_path=str(data),
+                     output_path=str(tmp_path / "s.yaml"), scaling_method="normalize")
+    assert scaled["classify"] is False and "0 or 1" in scaled["warning"]
+
+
+def test_continuous_labels_stay_regression(tmp_path):
+    data = _dataset(tmp_path, 24)
+    result = _config(model_type="VCNNBpnet", data_path=str(data),
+                     output_path=str(tmp_path / "c.yaml"))
+    assert result["classify"] is False and result["scaling_method"] == "standardize"
+    assert "note" not in result and "warning" not in result

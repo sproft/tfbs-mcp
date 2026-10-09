@@ -204,12 +204,15 @@ def test_train_config_mode_quotes_the_command_and_sets_pythonpath(tmp_path, monk
     rec = Sbatch(monkeypatch)
     config = tmp_path / "my config.yaml"
     config.write_text("model: {}\n")
-    extra = ["--trainer.max_epochs=3", "--data.data_path=/data/with space"]
+    extra = ["--trainer.max_epochs=3", "--data.data_path='/data/with space'",
+             "--trainer.devices 1", r"C:\data\x.ckpt"]
+    tokens = ["--trainer.max_epochs=3", "--data.data_path=/data/with space",
+              "--trainer.devices", "1", r"C:\data\x.ckpt"]
     result = run(server.tfbs_train(config_path=str(config), extra_args=extra))
     assert result["job_id"] == "9"
     script = result["generated_script"]
     expected = shlex.join([sys.executable, "-m", "tfbs.cli.train_cli", "fit", "--config",
-                           str(config.resolve()), *extra])
+                           str(config.resolve()), *tokens])
     assert expected in script
     assert server._sbatch_pythonpath_line() in script
     written = Path(rec.calls[-1][-1]).read_bytes()
@@ -242,7 +245,9 @@ def test_sweep_description_mentions_the_tracking_extra():
 def test_epistasis_description_names_both_csv_names_and_counts():
     doc = " ".join(server.tfbs_epistasis.__doc__.split())
     assert "epistasis_matrix.csv" in doc and "epistasis_top.csv" in doc
-    assert "num_position_pairs" in doc and "num_pairs_analyzed (the number of double mutants" in doc
+    assert "num_pairs_analyzed (the number of position pairs" in doc
+    assert "num_double_mutants (the double mutants scored" in doc
+    assert "num_position_pairs" not in doc
 
 
 def test_validate_description_lists_the_classifier_metrics():
@@ -341,3 +346,205 @@ def test_no_dashes_in_changed_text():
                  "tfbs/pipelines/validate.py", "tfbs/configs/models/FlexibleMLP.yaml"):
         text = (REPO / name).read_text(encoding="utf-8")
         assert chr(0x2014) not in text and chr(0x2013) not in text, name
+
+
+# ---------------------------------------------------------------------------
+# tfbs_predict and tfbs_marginalize input checks
+# ---------------------------------------------------------------------------
+
+class ThreeOutputs(torch.nn.Module):
+    def forward(self, x):
+        return x.sum(dim=2)[:, :3]
+
+
+def test_predict_rejects_a_length_other_than_the_input_length():
+    result = run(server.tfbs_predict(model_id="tc", sequences=[SEQ + "AC"]))
+    assert "12 bp" in result["error"] and "10 bp" in result["error"]
+    assert "window_mode=true" in result["fix"] and "window_size=10" in result["fix"]
+    assert "in_window=10" in result["fix"]
+
+
+def test_window_mode_checks_the_window_size():
+    longer = run(server.tfbs_predict(model_id="tc", sequences=[SEQ], window_mode=True,
+                                     window_size=12))
+    assert "longer than the sequences" in longer["error"] and longer["fix"]
+    other = run(server.tfbs_predict(model_id="tc", sequences=[SEQ * 2], window_mode=True,
+                                    window_size=5))
+    assert "differs from the input length" in other["error"]
+    assert "window_size=10" in other["fix"]
+    default = run(server.tfbs_predict(model_id="tc", sequences=[SEQ * 2], window_mode=True))
+    assert len(default["best_sequences"][0]) == 10
+
+
+def test_window_mode_without_an_input_length_defaults_to_70():
+    server._model_registry["tc_nolen"] = {**server._model_registry["tc"], "input_length": None}
+    short = run(server.tfbs_predict(model_id="tc_nolen", sequences=[SEQ], window_mode=True))
+    assert "window_size 70" in short["error"]
+    ok = run(server.tfbs_predict(model_id="tc_nolen", sequences=[SEQ * 8], window_mode=True))
+    assert len(ok["best_sequences"][0]) == 70
+
+
+def test_predict_names_output_dim_of_a_multi_output_model():
+    server._model_registry["tc_wide"] = {"model": ThreeOutputs(), "model_type": "ThreeOutputs",
+                                         "device": "cpu", "input_length": 10, "classify": False}
+    result = run(server.tfbs_predict(model_id="tc_wide", sequences=[SEQ]))
+    assert result["output_dim"] == 3 and "output_dim=3" in result["error"]
+    result = run(server.tfbs_predict(model_id="tc_wide", sequences=[SEQ * 2], window_mode=True))
+    assert result["output_dim"] == 3
+
+
+def test_flexible_mlp_input_length_counts_four_values_per_base():
+    entry = {"model_type": "FlexibleMLP", "input_length": 96}
+    assert server._sequence_length(entry) == 24
+    assert server._sequence_length({"model_type": "VCNNBpnet", "input_length": 24}) == 24
+    assert server._sequence_length({"input_length": None}) is None
+
+
+@pytest.mark.parametrize("start", [-1, 9, 20])
+def test_marginalize_rejects_a_start_outside_the_backgrounds(start):
+    result = run(server.tfbs_marginalize(model_id="tc", sequences=[SEQ], motif="AC", start=start))
+    assert f"start {start}" in result["error"] and "from 0 to 8" in result["fix"]
+
+
+def test_marginalize_accepts_the_last_start():
+    result = run(server.tfbs_marginalize(model_id="tc", sequences=[SEQ], motif="AC", start=8))
+    assert len(result["delta_predictions"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Mutagenesis, marginalization and epistasis report tfbs_predict's units
+# ---------------------------------------------------------------------------
+
+STD = {"scaling_method": "standardize", "mean": 5.0, "std": 2.0}
+NORM = {"scaling_method": "normalize", "min": -1.0, "max": 3.0}
+
+
+def _scaled(params):
+    server._model_registry["tc_scaled"] = {**server._model_registry["tc"],
+                                           "scaling_params": params}
+    return "tc_scaled"
+
+
+@pytest.fixture(autouse=True)
+def _drop_scaled():
+    yield
+    server._model_registry.pop("tc_scaled", None)
+
+
+@pytest.mark.parametrize("params, a, b", [(STD, 2.0, 5.0), (NORM, 4.0, -1.0)])
+def test_mutagenesis_reports_original_units(params, a, b, tmp_path):
+    raw = run(server.tfbs_mutagenesis(model_id="tc", sequences=[SEQ]))
+    scaled = run(server.tfbs_mutagenesis(model_id=_scaled(params), sequences=[SEQ]))
+    assert raw["inverse_transformed"] is False and scaled["inverse_transformed"] is True
+    assert torch.allclose(torch.tensor(scaled["scores"]), a * torch.tensor(raw["scores"]))
+    raw_out = run(server.tfbs_mutagenesis(model_id="tc", sequences=[SEQ], raw_outputs=True))
+    out = run(server.tfbs_mutagenesis(model_id="tc_scaled", sequences=[SEQ], raw_outputs=True))
+    for key in ("original_scores", "mutant_scores"):
+        assert torch.allclose(torch.tensor(out[key]), a * torch.tensor(raw_out[key]) + b)
+    saved = torch.load(out["files"]["original_scores"], weights_only=True)
+    assert torch.allclose(saved, torch.tensor(out["original_scores"]))
+
+
+def test_marginalize_reports_original_units():
+    raw = run(server.tfbs_marginalize(model_id="tc", sequences=[SEQ], motif="ACGT", start=2))
+    scaled = run(server.tfbs_marginalize(model_id=_scaled(STD), sequences=[SEQ], motif="ACGT",
+                                         start=2))
+    assert raw["inverse_transformed"] is False and scaled["inverse_transformed"] is True
+    assert scaled["predictions_before"][0] == pytest.approx(2 * raw["predictions_before"][0] + 5)
+    assert scaled["predictions_after"][0] == pytest.approx(2 * raw["predictions_after"][0] + 5)
+    assert scaled["mean_delta"] == pytest.approx(2 * raw["mean_delta"])
+
+
+class PairModel(torch.nn.Module):
+    """1 only when position 1 is A and position 3 is C."""
+
+    def forward(self, x):
+        return (x[:, 0, 1] * x[:, 1, 3]).unsqueeze(1)
+
+
+def test_epistasis_reports_original_units(tmp_path):
+    server._model_registry["tc_scaled"] = {"model": PairModel(), "model_type": "PairModel",
+                                           "device": "cpu", "input_length": 6, "classify": False,
+                                           "scaling_params": STD}
+    result = run(server.tfbs_epistasis(model_id="tc_scaled", sequence="GGGGGG",
+                                       output_dir=str(tmp_path)))
+    assert result["inverse_transformed"] is True
+    assert result["original_prediction"] == pytest.approx(5.0)
+    top = result["top_interactions"][0]
+    assert top["delta_delta"] == pytest.approx(2.0) and top["prediction"] == pytest.approx(7.0)
+    import csv
+    with open(result["files"]["single_mutations"], newline="") as f:
+        singles = list(csv.DictReader(f))
+    assert {float(r["prediction"]) for r in singles} == {5.0}
+    assert open(result["files"]["epistasis_matrix"], "rb").read().count(b"\r\n") == 0
+
+
+def test_classifier_outputs_are_never_transformed():
+    server._model_registry["tc_scaled"] = {**server._model_registry["tc"], "classify": True,
+                                           "scaling_params": STD}
+    result = run(server.tfbs_mutagenesis(model_id="tc_scaled", sequences=[SEQ]))
+    assert result["inverse_transformed"] is False
+
+
+def test_unit_conversion_is_documented():
+    for name in ("tfbs_mutagenesis", "tfbs_marginalize", "tfbs_epistasis"):
+        doc = " ".join(getattr(server, name).__doc__.split())
+        assert "the same as tfbs_predict" in doc and "inverse_transformed" in doc, name
+
+
+class EdgeConv(torch.nn.Module):
+    """Activates only on windows that hold kernel column 0 or 4 alone (padding 10)."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv1d(4, 1, kernel_size=5, padding=10)
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            self.conv.weight[0, :, 0] = 1.0
+            self.conv.weight[0, :, 4] = 1.0
+            self.conv.weight[0, :, 1:4] = -10.0
+            self.conv.bias.zero_()
+
+    def forward(self, x):
+        return torch.relu(self.conv(x)).mean(dim=(1, 2)).unsqueeze(1)
+
+
+def test_conv_filters_fill_uncovered_kernel_columns_with_uniform(tmp_path):
+    server._model_registry["tc_wide"] = {"model": EdgeConv().eval(), "model_type": "EdgeConv",
+                                         "device": "cpu", "input_length": 10, "classify": False}
+    result = run(server.tfbs_conv_filters(model_id="tc_wide", sequences=[SEQ],
+                                          output_dir=str(tmp_path)))
+    assert "uniform 0.25" in result["warning"] and "conv filter 0" in result["warning"]
+    [record] = result["filter_summary"]
+    assert record["pfm_width"] == 5 and record["pfm_sites"] == 2
+    meme = (tmp_path / "filters.meme").read_text()
+    header = next(line for line in meme.splitlines() if line.startswith("letter-probability"))
+    assert "w= 5 " in header and "nsites= 1 " in header
+    rows = [[float(v) for v in line.split()] for line in meme.splitlines() if line.startswith(" ")]
+    assert rows[0] == [0.0, 1.0, 0.0, 0.0]   # column 0 sees the last base, C
+    assert rows[1] == rows[2] == rows[3] == [0.25] * 4
+    assert rows[4] == [1.0, 0.0, 0.0, 0.0]   # column 4 sees the first base, A
+
+
+class WarningConv(TinyConv):
+    def forward(self, x):
+        import warnings
+        warnings.warn("attribution looks unstable", RuntimeWarning)
+        return super().forward(x)
+
+
+@pytest.mark.parametrize("method", ["input_x_gradient", "deepliftshap"])
+def test_analyze_returns_the_warnings_raised_during_attribution(method):
+    server._model_registry["tc_wide"] = {**server._model_registry["tc"],
+                                         "model": WarningConv().eval()}
+    result = run(server.tfbs_analyze(model_id="tc_wide", sequences=[SEQ], method=method,
+                                     n_shuffles=2))
+    assert "RuntimeWarning: attribution looks unstable" in result["warnings"]
+    assert len(result["warnings"]) == len(set(result["warnings"]))
+    assert "warnings" not in run(server.tfbs_analyze(model_id="tc", sequences=[SEQ],
+                                                     method="input_x_gradient"))
+
+
+def test_validate_description_says_concurrent_jobs_need_separate_files():
+    doc = " ".join(server.tfbs_validate.__doc__.split())
+    assert "at the same time should each get their own output_file" in doc

@@ -157,10 +157,12 @@ def test_built_wheel_contains_the_pipelines_and_templates(tmp_path):
     for name in ("pyproject.toml", "README.md", "LICENSE"):
         shutil.copy2(REPO / name, src / name)
     dist = tmp_path / "dist"
+    dist.mkdir()
+    # Through the PEP 517 backend directly: a uv venv has no pip.
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
-         "-w", str(dist), str(src)],
-        capture_output=True, text=True, timeout=600,
+        [sys.executable, "-c",
+         "import sys, setuptools.build_meta as b; b.build_wheel(sys.argv[1])", str(dist)],
+        cwd=src, capture_output=True, text=True, timeout=600,
     )
     assert result.returncode == 0, (result.stdout + result.stderr)[-3000:]
     wheel = next(dist.glob("tfbs_mcp-*.whl"))
@@ -598,6 +600,53 @@ def test_validate_widens_an_older_csv_and_keeps_its_rows(tmp_path):
     assert rows[0]["test_auc"] == "" and rows[1]["test_auc"] == "0.9"
     validate.save_results(_args(tmp_path), {"test_loss": 0.3})
     assert len(_csv_rows(tmp_path / "results.csv")) == 3
+
+
+def test_validate_widens_the_csv_through_an_atomic_replace(tmp_path, monkeypatch):
+    from tfbs.pipelines import validate
+
+    replaced = []
+    real_replace = os.replace
+
+    def recording_replace(src, dst):
+        replaced.append((os.path.dirname(os.path.abspath(src)), dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", recording_replace)
+    validate.save_results(_args(tmp_path), 1.5)
+    assert replaced == []
+    validate.save_results(_args(tmp_path), {"test_loss": 0.4, "test_auc": 0.9})
+    assert replaced == [(str(tmp_path), str(tmp_path / "results.csv"))]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["results.csv"]
+    assert [r["test_auc"] for r in _csv_rows(tmp_path / "results.csv")] == ["", "0.9"]
+
+
+def test_a_failed_widening_leaves_the_csv_and_no_temporary_file(tmp_path, monkeypatch):
+    from tfbs.pipelines import validate
+
+    validate.save_results(_args(tmp_path), 1.5)
+    before = (tmp_path / "results.csv").read_bytes()
+
+    def failing_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    validate.save_results(_args(tmp_path), {"test_loss": 0.4, "test_auc": 0.9})
+    assert (tmp_path / "results.csv").read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["results.csv"]
+
+
+def test_validate_appends_under_the_existing_header(tmp_path):
+    from tfbs.pipelines import validate
+
+    validate.save_results(_args(tmp_path), {"test_loss": 0.4, "test_acc": 0.8, "test_auc": 0.9})
+    before = (tmp_path / "results.csv").read_bytes()
+    validate.save_results(_args(tmp_path), 0.3)
+    after = (tmp_path / "results.csv").read_bytes()
+    assert after.startswith(before)
+    assert _csv_rows(tmp_path / "results.csv")[1] == {
+        "modeltype": "VCNNBpnet", "scaling_method": "none", "dataset_path": "peaks_dataset",
+        "test_loss": "0.3", "test_acc": "", "test_auc": ""}
 
 
 def test_validate_run_saves_the_metrics_trainer_test_reports(tmp_path, monkeypatch):

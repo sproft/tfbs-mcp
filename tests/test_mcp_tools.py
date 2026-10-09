@@ -573,7 +573,9 @@ def test_seqlets_reports_an_empty_result(monkeypatch, tiny_conv):
     _patch_seqlet_caller(monkeypatch, _seqlet_frame(0))
     result = json.loads(asyncio.run(server.tfbs_seqlets(model_id=tiny_conv, sequences=SEQS_30)))
     files = result.pop("files")
+    note = result.pop("note")
     assert result == {"num_seqlets": 0, "seqlets": [], "truncated": False}
+    assert "No seqlets were called" in note and "significance threshold" in note
     lines = Path(files["seqlets"]).read_text().splitlines()
     assert lines == ["	".join(SEQLET_COLUMNS)]
 
@@ -585,6 +587,87 @@ def test_seqlets_survives_a_seqlet_caller_error(monkeypatch, tiny_conv):
     result = json.loads(asyncio.run(server.tfbs_seqlets(model_id=tiny_conv, sequences=SEQS_30)))
     assert result["num_seqlets"] == 0
     assert result["seqlets"] == []
+    assert "ValueError" in result["note"] and "non-empty" in result["note"]
+    _patch_seqlet_caller(monkeypatch, ZeroDivisionError("division by zero"))
+    result = json.loads(asyncio.run(server.tfbs_seqlets(model_id=tiny_conv, sequences=SEQS_30)))
+    assert result["num_seqlets"] == 0 and "ZeroDivisionError" in result["note"]
+
+
+def test_seqlets_return_tangermeme_warnings_and_pass_the_seed(monkeypatch, tiny_conv):
+    import warnings as _warnings
+    from tfbs.mcp import server
+
+    dls = importlib.import_module("tangermeme.deep_lift_shap")
+    seen = {}
+
+    def warning_dls(model, X, **kw):
+        seen.update(kw)
+        for _ in range(3):
+            _warnings.warn("Convergence deltas too high: tensor([0.5, 0.7])", RuntimeWarning)
+        return torch.zeros_like(X)
+
+    _patch_seqlet_caller(monkeypatch, _seqlet_frame(2))
+    monkeypatch.setattr(dls, "deep_lift_shap", warning_dls)
+    result = json.loads(asyncio.run(server.tfbs_seqlets(
+        model_id=tiny_conv, sequences=SEQS_30, seed=7)))
+    assert seen["random_state"] == 7
+    assert result["warnings"] == ["RuntimeWarning: Convergence deltas too high: tensor([0.5, 0.7])"]
+    assert "note" not in result
+
+
+class PlantedMotifModel(torch.nn.Module):
+    """Max over positions of a Conv1d that matches CACTTG exactly (score 6)."""
+
+    MOTIF = "CACTTG"
+
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv1d(4, 1, kernel_size=len(self.MOTIF))
+        with torch.no_grad():
+            self.conv.weight.fill_(-1.0)
+            for k, base in enumerate(self.MOTIF):
+                self.conv.weight[0, "ACGT".index(base), k] = 1.0
+            self.conv.bias.fill_(-4.0)
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(self.conv(x)).sum(dim=2)
+
+
+def _planted(n=16, length=100, seed=3):
+    import random
+    rng = random.Random(seed)
+    seqs = []
+    for i in range(n):
+        background = [rng.choice("AGT") for _ in range(length)]
+        at = 5 + (i * 7) % (length - 12)
+        background[at:at + 6] = list(PlantedMotifModel.MOTIF)
+        seqs.append("".join(background))
+    return seqs
+
+
+def test_seqlets_find_a_planted_motif_and_repeat_with_the_same_seed(tmp_path):
+    from tfbs.mcp import server
+
+    _register("planted", PlantedMotifModel(), 100)
+    try:
+        seqs = _planted()
+        first = json.loads(asyncio.run(server.tfbs_seqlets(
+            model_id="planted", sequences=seqs, n_shuffles=4, min_seqlet_len=3,
+            max_seqlet_len=10, output_dir=str(tmp_path / "a"))))
+        second = json.loads(asyncio.run(server.tfbs_seqlets(
+            model_id="planted", sequences=seqs, n_shuffles=4, min_seqlet_len=3,
+            max_seqlet_len=10, output_dir=str(tmp_path / "b"))))
+    finally:
+        server._model_registry.pop("planted", None)
+    assert "error" not in first, first
+    assert first["num_seqlets"] > 0 and "note" not in first
+    assert first["seqlets"] == second["seqlets"]
+    hits = 0
+    for s in first["seqlets"]:
+        at = 5 + (s["example_idx"] * 7) % 88
+        hits += s["start"] < at + 6 and s["end"] > at
+    assert hits == len(first["seqlets"])
 
 
 MEME_TWO_MOTIFS = "\n".join([
@@ -702,9 +785,10 @@ def test_epistasis_is_zero_for_an_additive_model(tmp_path):
     finally:
         server._model_registry.pop("additive", None)
 
-    assert result["num_position_pairs"] == L * (L - 1) // 2
-    assert result["num_pairs_analyzed"] == 9 * L * (L - 1) // 2
-    assert result["num_double_mutants"] == result["num_pairs_analyzed"]
+    assert result["num_pairs_analyzed"] == L * (L - 1) // 2
+    assert result["num_double_mutants"] == 9 * result["num_pairs_analyzed"]
+    assert "num_position_pairs" not in result
+    assert result["inverse_transformed"] is False
     assert result["top_interactions"] == []
 
     with open(result["files"]["epistasis_matrix"], newline="") as f:
@@ -1029,22 +1113,76 @@ def test_sweep_agent_runs_the_packaged_pipeline_from_the_project_root(monkeypatc
 # tfbs_fimo and tfbs_server_info
 # ---------------------------------------------------------------------------
 
-def test_fimo_without_the_binary_returns_an_error(monkeypatch, tmp_path):
+NKX_MOTIF = Path(__file__).resolve().parent.parent / "tfbs" / "data" / "demo" / "MA1994.1.meme"
+TG_24MER = "GGGCTCCTCACTTGACCTTTGCTG"
+
+
+def test_fimo_without_binary_or_python_fimo_returns_an_error(monkeypatch, tmp_path):
     from tfbs.mcp import server
 
     motif = tmp_path / "m.meme"
     motif.write_text("MEME version 4\n")
     _no_binaries(monkeypatch)
+    monkeypatch.setattr(server, "_python_fimo", lambda: (None, None))
     result = json.loads(asyncio.run(server.tfbs_fimo(sequences=["ACGT"], motif_file=str(motif))))
-    assert result["error"] == "fimo not found on PATH"
-    assert "MEME Suite" in result["fix"]
+    assert result["error"] == server._FIMO_MISSING["error"]
+    assert "MEME Suite" in result["fix"] and "tangermeme" in result["fix"]
 
 
-def test_fimo_binary_vanishing_mid_call_returns_the_same_error(monkeypatch, tmp_path):
+def test_fimo_falls_back_to_the_pytorch_fimo(monkeypatch, tmp_path):
     from tfbs.mcp import server
 
-    motif = tmp_path / "m.meme"
-    motif.write_text("MEME version 4\n")
+    _no_binaries(monkeypatch)
+    rc = TG_24MER.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER, rc, "ACGTACGTACGTAC"], motif_file=str(NKX_MOTIF),
+        output_dir=str(tmp_path / "fimo"))))
+    assert result["backend"] == "tangermeme", result
+    hits = {(h["sequence"], h["strand"]): h for h in result["hits"]}
+    plus = hits[("seq0", "+")]
+    assert plus["motif"] == "MA1994.1" and plus["matched_sequence"] == "CTCACTTGACCTT"
+    assert (plus["start"], plus["end"]) == (7, 19)
+    assert TG_24MER[plus["start"] - 1:plus["end"]] == "CTCACTTGACCTT"
+    assert plus["p_value"] < 1e-4 and plus["score"] > 0
+    minus = hits[("seq1", "-")]
+    assert minus["matched_sequence"] == "CTCACTTGACCTT"
+    assert minus["p_value"] == pytest.approx(plus["p_value"])
+    assert all(h["sequence"] != "seq2" for h in result["hits"])
+    assert all(set(h) == set(server._FIMO_COLUMNS) for h in result["hits"])
+    tsv = Path(result["files"]["fimo_tsv"]).read_bytes()
+    assert b"\r\n" not in tsv
+    assert tsv.splitlines()[0].decode().split("\t") == server._FIMO_COLUMNS
+    assert Path(result["files"]["sequences_fasta"]).read_text().startswith(">seq0\n" + TG_24MER)
+
+
+def test_fimo_binary_output_comes_back_in_the_same_columns(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    monkeypatch.setattr(server.shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+
+    def meme_fimo(cmd, **kwargs):
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        out = Path(cmd[cmd.index("--oc") + 1])
+        out.mkdir(parents=True)
+        (out / "fimo.tsv").write_text(
+            "motif_id\tmotif_alt_id\tsequence_name\tstart\tstop\tstrand\tscore\tp-value"
+            "\tq-value\tmatched_sequence\n"
+            "MA1994.1\tNkx2-1\tseq0\t7\t19\t+\t12.28\t3.9e-05\t0.002\tCTCACTTGACCTT\n"
+            "# fimo --thresh 0.0001\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(server.subprocess, "run", meme_fimo)
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER], motif_file=str(NKX_MOTIF), output_dir=str(tmp_path / "f"))))
+    assert result["backend"] == "meme" and "backend_module" not in result
+    assert result["hits"] == [{
+        "motif": "MA1994.1", "sequence": "seq0", "start": 7, "end": 19, "strand": "+",
+        "score": 12.28, "p_value": 3.9e-05, "matched_sequence": "CTCACTTGACCTT"}]
+
+
+def test_fimo_binary_vanishing_mid_call_falls_back(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
     monkeypatch.setattr(server.shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
 
     def missing(*args, **kwargs):
@@ -1052,10 +1190,14 @@ def test_fimo_binary_vanishing_mid_call_returns_the_same_error(monkeypatch, tmp_
 
     monkeypatch.setattr(server.subprocess, "run", missing)
     result = json.loads(asyncio.run(server.tfbs_fimo(
-        sequences=["ACGT"], motif_file=str(motif), output_dir=str(tmp_path / "fimo"),
+        sequences=[TG_24MER], motif_file=str(NKX_MOTIF), output_dir=str(tmp_path / "fimo"),
     )))
-    assert result["error"] == "fimo not found on PATH"
-    assert result["fix"]
+    assert result["backend"] == "tangermeme" and result["total_hits"] >= 1
+    monkeypatch.setattr(server, "_python_fimo", lambda: (None, None))
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER], motif_file=str(NKX_MOTIF), output_dir=str(tmp_path / "fimo2"),
+    )))
+    assert result["error"] == server._FIMO_MISSING["error"]
 
 
 def test_server_info_reports_cuda_version_and_default_partition(monkeypatch):
@@ -1070,12 +1212,43 @@ def test_server_info_reports_cuda_version_and_default_partition(monkeypatch):
     for key in info:
         assert key in server.tfbs_server_info.__doc__, key
 
+    # Imported in-process too, without main()'s startup preload.
     monkeypatch.setattr(server, "_torch", None)
-    before_torch = json.loads(asyncio.run(server.tfbs_server_info()))
-    assert before_torch["torch_loaded"] is False
-    assert "cuda_version" not in before_torch
-    for key in before_torch:
-        assert key in server.tfbs_server_info.__doc__, key
+    fresh = json.loads(asyncio.run(server.tfbs_server_info()))
+    assert fresh["torch_version"] == torch.__version__
+    assert fresh["cuda_version"] == torch.version.cuda
+    assert "cuda_available" in fresh and "torch_loaded" not in fresh
+
+
+def test_startup_preloads_every_native_module_the_tools_import():
+    """main() imports these before the stdio loop; a tool importing more would hang on Windows."""
+    from tfbs.mcp import server
+
+    for name in ("numpy", "pandas", "sklearn.metrics", "scipy.linalg", "torchmetrics",
+                 "pytorch_lightning", "captum.attr", "tangermeme.deep_lift_shap",
+                 "tangermeme.seqlet", "tangermeme.annotate", "pyfaidx", "pyBigWig", "pysam"):
+        assert name in server._NATIVE_MODULES, name
+    sources = [Path(server.__file__), Path(server.__file__).with_name("foldx_tools.py")]
+    pure = {"importlib.util", "tfbs.configs", "tfbs.pipelines.checkpoints", "tfbs.mcp",
+            "ctypes", "msvcrt", "sys", "csv", "bisect", "torch", "torch.nn.functional",
+            "tfbs.nn.models", "tfbs.prediction.analysis", "tfbs.mcp.foldx_tools", "shlex",
+            "tfbs.mcp.server"}
+    for path in sources:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            for fn in ([node] if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else []):
+                for inner in ast.walk(fn):
+                    if isinstance(inner, ast.Import):
+                        names = [a.name for a in inner.names]
+                    elif isinstance(inner, ast.ImportFrom) and inner.level == 0:
+                        names = [inner.module]
+                    else:
+                        continue
+                    for name in names:
+                        assert name in pure or name in server._NATIVE_MODULES, (
+                            f"{path.name}:{inner.lineno} imports {name}")
+    missing = server._preload_native_modules()
+    assert "torch" not in missing and "numpy" not in missing
+    assert server._torch is not None and server._pd is not None
 
 
 def test_default_partition_comes_from_the_environment(monkeypatch):
@@ -1107,7 +1280,7 @@ def test_window_mode_prediction_writes_nothing_to_stdout(capsys):
     from tfbs.mcp import server
 
     result = json.loads(asyncio.run(server.tfbs_predict(
-        model_id="test_model", sequences=["ACGTACGTAC"], window_mode=True, window_size=5,
+        model_id="test_model", sequences=["ACGTACGTAC" * 2], window_mode=True, window_size=10,
     )))
     assert len(result["best_scores"]) == 1
     assert capsys.readouterr().out == ""
@@ -1125,8 +1298,8 @@ def test_stray_prints_inside_a_tool_call_go_to_stderr(monkeypatch, capsys):
     monkeypatch.setattr(server, "_find_best_windows_fast", noisy)
     stdout_before = sys.stdout
     result = _call_via_mcp("tfbs_predict", {
-        "model_id": "test_model", "sequences": ["ACGTACGTAC"],
-        "window_mode": True, "window_size": 5,
+        "model_id": "test_model", "sequences": ["ACGTACGTAC" * 2],
+        "window_mode": True, "window_size": 10,
     })
     captured = capsys.readouterr()
     assert "best_scores" in result

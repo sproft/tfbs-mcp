@@ -117,6 +117,17 @@ def test_extract_loci_derives_its_output_dir_from_the_bed(demo_bed):
     assert scores.flatten().tolist() == pytest.approx([10.37, 12.06, 10.36, 8.99])
 
 
+def test_extract_loci_on_the_bundled_demo_writes_to_the_results_dir(tmp_path):
+    before = sorted(p.name for p in DEMO.parent.iterdir())
+    result = run(server.tfbs_extract_loci(bed_path=str(DEMO / "demo_peaks.bed"),
+                                          genome_fasta=str(GENOME), in_window=24))
+    out = tmp_path / "results" / "demo_peaks_loci"
+    assert result["output_dir"] == str(out)
+    assert result["shape"] == [4, 4, 24]
+    assert all(Path(p).parent == out for p in result["files"].values())
+    assert sorted(p.name for p in DEMO.parent.iterdir()) == before
+
+
 def test_extract_loci_explicit_output_dir_wins(demo_bed, tmp_path):
     out = tmp_path / "mine"
     result = run(server.tfbs_extract_loci(

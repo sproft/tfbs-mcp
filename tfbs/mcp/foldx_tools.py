@@ -94,6 +94,52 @@ def _parse_dna_from_pdb(pdb_path: str) -> dict[str, list[tuple[int, str]]]:
     return {ch: sorted(bases.items()) for ch, bases in chains.items()}
 
 
+_PLDDT_CONFIDENT = 70.0
+_PLDDT_LOW = 50.0
+_MAX_LOW_SEGMENTS = 20
+
+
+def _plddt_summary(pdb_path: str) -> dict | None:
+    """Per-residue pLDDT statistics from the B-factor column of an AlphaFold PDB.
+
+    AlphaFold writes the residue's pLDDT into the B-factor of each of its
+    atoms; the first atom of every residue is read.  None when the file
+    has no ATOM records.
+    """
+    residues: list[tuple[str, int, float]] = []
+    seen: set[tuple[str, str]] = set()
+    with open(pdb_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.startswith("ATOM") or len(line) < 66:
+                continue
+            key = (line[21], line[22:27])
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                residues.append((line[21], int(line[22:26]), float(line[60:66])))
+            except ValueError:
+                continue
+    if not residues:
+        return None
+    n = len(residues)
+    segments: list[list[int]] = []
+    previous: tuple[str, int] | None = None
+    for chain, resnum, plddt in residues:
+        if plddt < _PLDDT_LOW:
+            if (segments and previous is not None and previous[0] == chain
+                    and resnum == previous[1] + 1 and segments[-1][1] == previous[1]):
+                segments[-1][1] = resnum
+            else:
+                segments.append([resnum, resnum])
+        previous = (chain, resnum)
+    return {
+        "fraction_confident": round(sum(p >= _PLDDT_CONFIDENT for *_, p in residues) / n, 4),
+        "fraction_low": round(sum(p < _PLDDT_LOW for *_, p in residues) / n, 4),
+        "low_confidence_segments": segments[:_MAX_LOW_SEGMENTS],
+    }
+
+
 def _has_dna(structure_path: str) -> bool | None:
     """Whether a PDB-format file has DNA chains; None if it cannot be parsed."""
     if Path(structure_path).suffix.lower() not in (".pdb", ".ent"):
@@ -147,12 +193,13 @@ def _run_foldx_energy(
     # Apply mutations if needed
     if mutation_string:
         mut_file = wd / "individual_list.txt"
-        mut_file.write_text(mutation_string + "\n")
+        mut_file.write_text(mutation_string + "\n", newline="\n")
         try:
             subprocess.run(
                 [foldx_bin, "--command=BuildModel",
                  f"--pdb={pdb_name}", f"--mutant-file={mut_file.name}"],
-                capture_output=True, text=True, timeout=1200, cwd=str(wd),
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                timeout=1200, cwd=str(wd),
             )
         except subprocess.TimeoutExpired:
             return None
@@ -166,7 +213,7 @@ def _run_foldx_energy(
     subprocess.run(
         [foldx_bin, "--command=AnalyseComplex",
          f"--pdb={analyse_target}", "--complexWithDNA=true"],
-        capture_output=True, text=True, timeout=60, cwd=str(wd),
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60, cwd=str(wd),
     )
 
     # Parse energy from output file
@@ -403,7 +450,11 @@ async def tfbs_fetch_structure(
 
     AlphaFold DB models are protein-only (``has_dna`` false), so FoldX
     cannot score TF-DNA binding on them; report their ``mean_plddt`` (0 to
-    100, below 70 is low confidence) whenever you use one.
+    100, below 70 is low confidence) whenever you use one.  For them the
+    result also has ``plddt_summary``, read from the per-residue pLDDT in
+    the model's B-factor column, which lets the client flag low-confidence
+    regions (often the disordered parts of a transcription factor
+    outside its DNA-binding domain).
 
     Default structure source and why: a PDB co-crystal first (pdb_id, or
     gene_name for the top RCSB entry with protein and DNA), with
@@ -427,8 +478,13 @@ async def tfbs_fetch_structure(
         with ``argument``, ``value``, ``error`` and ``fix``).  ``metadata``
         always has ``has_dna`` (null if the file is not PDB format); for
         AlphaFold DB it also has ``mean_plddt``, ``latest_version``,
-        ``entry_id`` and the model ``url``.  If every source fails, JSON
-        with ``error``, ``fix`` and ``attempted``.
+        ``entry_id`` and the model ``url``.  An AlphaFold DB model also
+        gets ``plddt_summary``: ``fraction_confident`` (share of residues
+        with pLDDT >= 70), ``fraction_low`` (share below 50) and
+        ``low_confidence_segments`` (up to 20 [start_residue,
+        end_residue] runs with pLDDT below 50); PDB entries have none.
+        If every source fails, JSON with ``error``, ``fix`` and
+        ``attempted``.
     """
     legs = (
         ("local_path", local_path, _fetch_local),
@@ -469,6 +525,13 @@ async def tfbs_fetch_structure(
             result["attempted"] = attempted
             if has_dna is False:
                 result["note"] = _NO_DNA_NOTE
+            if result["source"] == "alphafold":
+                try:
+                    summary = _plddt_summary(result["structure_path"])
+                except OSError:
+                    summary = None
+                if summary is not None:
+                    result["plddt_summary"] = summary
             return json.dumps(result)
         logger.info("tfbs_fetch_structure: %s=%r failed: %s", arg, value, error)
         attempted.append({"argument": arg, "value": value, "error": error, "fix": fix})
@@ -546,7 +609,8 @@ async def tfbs_binding_energy(
                 f"--pdb={pdb_name}",
                 f"--output-dir={tmpdir}",
             ]
-            subprocess.run(cmd_repair, capture_output=True, text=True, cwd=tmpdir, timeout=600)
+            subprocess.run(cmd_repair, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, cwd=tmpdir, timeout=600)
             repaired = work / f"{stem}_Repair.pdb"
             if repaired.is_file():
                 pdb_name = repaired.name
@@ -565,7 +629,8 @@ async def tfbs_binding_energy(
             "--complexWithDNA=true",
             f"--output-dir={tmpdir}",
         ]
-        result = subprocess.run(cmd_analyse, capture_output=True, text=True, cwd=tmpdir, timeout=600)
+        result = subprocess.run(cmd_analyse, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL, cwd=tmpdir, timeout=600)
     except subprocess.TimeoutExpired as exc:
         return _error(
             f"FoldX {stage} timed out after {exc.timeout:.0f} s",
@@ -833,7 +898,7 @@ def _scan_chunk_job(params_path: str) -> None:
     try:
         with open(csv_path, "w", newline="") as fh:
             fh.write(f"{_DIGEST_PREFIX}{digest}\n")
-            writer = csv.writer(fh)
+            writer = csv.writer(fh, lineterminator="\n")
             writer.writerow(["position", "energy"])
             for done, i in enumerate(range(w_from, w_to), start=1):
                 w_start = p["start"] + i * p["step"]
@@ -1003,8 +1068,10 @@ async def tfbs_binding_scan(
         JSON with ``bigwig_path``, ``num_windows``, and the ``window``,
         ``dna_length``, ``placements`` (DNA placements per window) and
         ``step`` actually used, plus ``foldx_runs_planned`` (distinct
-        placements to score); with slurm=true, also ``array_job_id`` and
-        ``merge_job_id``.  ``warning`` reports the FoldX run count when a
+        placements to score; with slurm=true a lower bound, because array
+        tasks do not share the placements of overlapping windows at
+        their chunk boundaries); with slurm=true, also ``array_job_id``
+        and ``merge_job_id``.  ``warning`` reports the FoldX run count when a
         window holds more than one placement.  When windows overlap, each
         value covers the step-wide bigWig bin centred on its window.
     """

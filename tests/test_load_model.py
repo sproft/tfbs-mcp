@@ -29,7 +29,8 @@ def _cleanup():
         server._model_registry.pop(key)
 
 
-def _save_ckpt(path: Path, class_path: str | None = None, input_length: int = 10) -> Path:
+def _save_ckpt(path: Path, class_path: str | None = None, input_length: int = 10,
+               datamodule: dict | None = None) -> Path:
     """A checkpoint as LightningCLI writes it, of a SimpleCNN."""
     torch.manual_seed(0)
     model = models.SimpleCNN(input_length=input_length)
@@ -38,8 +39,11 @@ def _save_ckpt(path: Path, class_path: str | None = None, input_length: int = 10
         hparams["_class_path"] = class_path
         hparams["_instantiator"] = INSTANTIATOR
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": model.state_dict(), "hyper_parameters": hparams,
-                "pytorch-lightning_version": pl.__version__}, path)
+    ckpt = {"state_dict": model.state_dict(), "hyper_parameters": hparams,
+            "pytorch-lightning_version": pl.__version__}
+    if datamodule is not None:
+        ckpt["datamodule_hyper_parameters"] = datamodule
+    torch.save(ckpt, path)
     return path
 
 
@@ -214,10 +218,19 @@ def test_combined_file_is_read_by_the_checkpoint_key(study):
     assert result["scaling_params"] == STD
 
 
-def test_direct_json_path(study, tmp_path):
-    _, ckpt = study
+def test_direct_json_path(tmp_path):
+    ckpt = _save_ckpt(tmp_path / "run" / "best_SimpleCNN.ckpt")
     path = _write(tmp_path / "anything.json", {"scaling_method": "normalize", "min": 1.0, "max": 3.0})
     assert _load(ckpt, str(path))["scaling_params"]["scaling_method"] == "normalize"
+
+
+def test_scaling_file_must_match_the_checkpoint_scaling(study, tmp_path):
+    _, ckpt = study  # .../all_mean/standardize/best_SimpleCNN.ckpt
+    path = _write(tmp_path / "anything.json", {"scaling_method": "normalize", "min": 1.0, "max": 3.0})
+    result = _load(ckpt, str(path))
+    assert "'normalize'" in result["error"] and "'standardize'" in result["error"]
+    assert result["checkpoint_scaling_method"] == "standardize" and result["fix"]
+    assert "lm_sp" not in server._model_registry
 
 
 def test_directory_with_scaling_params_json(tmp_path):
@@ -315,3 +328,114 @@ def test_predict_description_states_the_default():
     doc = " ".join(server.tfbs_predict.__doc__.split())
     assert "Default null, because" in doc and "explicit opt-out" in doc
     assert "always a list" in doc
+
+
+# ---------------------------------------------------------------------------
+# Scaling parameters without data_path: the lookup order
+# ---------------------------------------------------------------------------
+
+def test_training_data_dir_recorded_in_the_checkpoint_is_searched(tmp_path):
+    data = tmp_path / "peaks_dataset"
+    _write(data / "scaling_params.json", STD)
+    ckpt = _save_ckpt(tmp_path / "saved_models" / "peaks" / "standardize" / "best_SimpleCNN.ckpt",
+                      datamodule={"data_path": str(data), "scaling_method": "standardize"})
+    result = _load(ckpt)
+    assert result["scaling_params"] == STD
+    assert Path(result["scaling_source"]) == data / "scaling_params.json"
+    assert result["checkpoint_scaling_method"] == "standardize" and "warning" not in result
+
+
+def test_scaling_params_next_to_the_checkpoint_come_first(tmp_path):
+    data = tmp_path / "data"
+    _write(data / "scaling_params.json", {**STD, "mean": 1.0})
+    ckpt = _save_ckpt(tmp_path / "m" / "best_SimpleCNN.ckpt",
+                      datamodule={"data_path": str(data), "scaling_method": "standardize"})
+    _write(ckpt.parent / "scaling_params.json", STD)
+    assert _load(ckpt)["scaling_params"] == STD
+
+
+def test_study_layout_is_found_without_data_path(study):
+    root, ckpt = study
+    result = _load(ckpt)
+    assert result["scaling_params"] == STD
+    assert Path(result["scaling_source"]) == root / "scaling_params" / "all_mean_standardize_SimpleCNN.json"
+    (root / "scaling_params" / "core_mean_standardize_SimpleCNN.json").unlink()
+    core = _load(root / "core_mean" / "standardize" / "best_SimpleCNN.ckpt", model_id="lm_core")
+    assert core["scaling_params"]["mean"] == -1.0
+    assert core["scaling_source"].endswith("scaling_params_all_models.json")
+
+
+def test_recorded_scaling_method_must_match_the_file(tmp_path):
+    data = tmp_path / "data"
+    _write(data / "scaling_params.json", STD)
+    ckpt = _save_ckpt(tmp_path / "m" / "best_SimpleCNN.ckpt",
+                      datamodule={"data_path": str(data), "scaling_method": "normalize"})
+    result = _load(ckpt)
+    assert "'standardize'" in result["error"] and "'normalize'" in result["error"]
+    assert result["scaling_source"] == str(data / "scaling_params.json")
+
+
+def test_regression_checkpoint_without_scaling_params_warns(tmp_path):
+    ckpt = _save_ckpt(tmp_path / "ds" / "standardize" / "best_SimpleCNN.ckpt",
+                      datamodule={"data_path": "/cluster/only/data", "scaling_method": "standardize"})
+    result = _load(ckpt)
+    assert result["scaling_params"] is None
+    assert "data_path" in result["warning"] and "standardize" in result["warning"]
+    assert "/cluster/only/data" in result["warning"].replace("\\", "/")
+    unscaled = _save_ckpt(tmp_path / "ds" / "none" / "best_SimpleCNN.ckpt")
+    assert "warning" not in _load(unscaled, model_id="lm_none")
+
+
+def test_predict_insisting_on_original_units_needs_scaling_params(tmp_path):
+    ckpt = _save_ckpt(tmp_path / "best.ckpt")
+    _load(ckpt, model_id="lm_plain")
+    result = run(server.tfbs_predict("lm_plain", sequences=[SEQ], inverse_transform=True))
+    assert "scaling parameters" in result["error"] and "data_path" in result["fix"]
+    assert "scores" in run(server.tfbs_predict("lm_plain", sequences=[SEQ]))
+
+
+STUDY = Path("D:/claude_code/TF-NN")
+STUDY_CKPT = STUDY / "saved_models_final" / "flank_mean" / "standardize" / "best_VCNNBpnet.ckpt"
+
+
+@pytest.mark.skipif(not STUDY_CKPT.is_file(), reason="the NKX2-1 study checkpoints are not on this machine")
+def test_study_checkpoint_scores_in_log2_fold_change(monkeypatch):
+    monkeypatch.syspath_prepend(str(STUDY))
+    result = run(server.tfbs_load_model("lm_study", str(STUDY_CKPT), "VCNNBpnet", device="cpu"))
+    assert "error" not in result, result
+    expected = STUDY / "saved_models_final" / "scaling_params" / "flank_mean_standardize_VCNNBpnet.json"
+    assert Path(result["scaling_source"]) == expected
+    scores = run(server.tfbs_predict("lm_study", sequences=["GGGCTCCTCACTTGACCTTTGCTG"]))
+    assert scores["inverse_transformed"] is True
+    assert scores["scores"][0] == pytest.approx(1.3907, abs=1e-3)
+
+
+def test_a_checkpoint_saved_under_a_shim_package_on_disk_loads_with_lightning(tmp_path, monkeypatch):
+    """The TF-NN situation: classes.nn.models re-exports tfbs.nn.models from a workspace."""
+    root = tmp_path / "workspace"
+    pkg = root / "diskshim_w" / "nn"
+    pkg.mkdir(parents=True)
+    (root / "diskshim_w" / "__init__.py").write_text("")
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text("from tfbs.nn.models import SimpleCNN  # noqa: F401\n")
+    monkeypatch.syspath_prepend(str(root))
+    for key in ("diskshim_w", "diskshim_w.nn", "diskshim_w.nn.models"):
+        monkeypatch.delitem(sys.modules, key, raising=False)
+    ckpt = _save_ckpt(tmp_path / "ds" / "none" / "best_SimpleCNN.ckpt",
+                      "diskshim_w.nn.models.SimpleCNN",
+                      datamodule={"data_path": str(tmp_path / "gone"), "scaling_method": "none"})
+    try:
+        result = run(server.tfbs_load_model("lm_disk", str(ckpt), "SimpleCNN", device="cpu"))
+        assert "error" not in result, result
+        assert "diskshim_w.nn.models" in sys.modules
+        model = server._model_registry["lm_disk"]["model"]
+        assert isinstance(model, models.SimpleCNN) and isinstance(model, pl.LightningModule)
+        reference = models.SimpleCNN(input_length=10)
+        reference.load_state_dict(torch.load(ckpt, weights_only=True)["state_dict"])
+        x = torch.zeros(2, 4, 10)
+        x[:, 2, :] = 1.0
+        assert torch.allclose(model(x), reference.eval()(x))
+        assert run(server.tfbs_predict("lm_disk", sequences=[SEQ]))["inverse_transformed"] is False
+    finally:
+        for key in ("diskshim_w", "diskshim_w.nn", "diskshim_w.nn.models"):
+            sys.modules.pop(key, None)

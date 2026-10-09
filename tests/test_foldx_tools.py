@@ -746,3 +746,55 @@ def test_resubmitted_scan_with_other_parameters_ignores_stale_chunks(
     fx._merge_chunks_job(second["params_path"])
     starts = [s for _, s, _, _ in fake_bigwig[second["bigwig_path"]].entries]
     assert starts == [400, 410, 420]
+
+
+def test_binding_scan_description_calls_the_slurm_run_count_a_lower_bound():
+    from tfbs.mcp.foldx_tools import tfbs_binding_scan
+
+    doc = " ".join(tfbs_binding_scan.__doc__.split())
+    assert "foldx_runs_planned" in doc and "with slurm=true a lower bound" in doc
+
+
+_PLDDT = [90, 85, 40, 30, 45, 75, 20, 95, 49, 10]
+
+
+def _af_text(plddts=_PLDDT, chain="A") -> str:
+    lines = []
+    for resnum, plddt in enumerate(plddts, start=1):
+        for name in ("N", "CA"):
+            lines.append(f"ATOM  {len(lines) + 1:5d}  {name:<3} ALA {chain}{resnum:4d}    "
+                         f"{0.0:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00{plddt:6.2f}           C")
+    return "\n".join(lines) + "\nEND\n"
+
+
+def test_plddt_summary_reads_the_b_factor_column(tmp_path):
+    from tfbs.mcp.foldx_tools import _plddt_summary
+
+    pdb = tmp_path / "af.pdb"
+    pdb.write_text(_af_text())
+    summary = _plddt_summary(str(pdb))
+    assert summary == {"fraction_confident": 0.4, "fraction_low": 0.6,
+                       "low_confidence_segments": [[3, 5], [7, 7], [9, 10]]}
+    pdb.write_text(_af_text([10, 90] * 30))
+    assert len(_plddt_summary(str(pdb))["low_confidence_segments"]) == 20
+    pdb.write_text("HEADER only\nEND\n")
+    assert _plddt_summary(str(pdb)) is None
+
+
+def test_fetch_structure_reports_plddt_for_alphafold_only(fake_web, tmp_path):
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    fake_web({_AF_API: json.dumps(_AF_ENTRIES).encode(), _AF_MODEL: _af_text().encode(),
+              _rcsb("3RKQ"): _pdb_text("ACGTA").encode()})
+    af = _run(tfbs_fetch_structure(uniprot_id="P43699", output_dir=str(tmp_path / "af")))
+    assert af["plddt_summary"]["fraction_low"] == 0.6
+    assert af["plddt_summary"]["low_confidence_segments"][0] == [3, 5]
+    pdb = _run(tfbs_fetch_structure(pdb_id="3RKQ", output_dir=str(tmp_path / "pdb")))
+    assert pdb["source"] == "pdb" and "plddt_summary" not in pdb
+
+
+def test_fetch_structure_description_explains_plddt_summary():
+    from tfbs.mcp.foldx_tools import tfbs_fetch_structure
+
+    doc = " ".join(tfbs_fetch_structure.__doc__.split())
+    assert "plddt_summary" in doc and "flag low-confidence regions" in doc

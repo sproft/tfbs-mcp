@@ -1,3 +1,5 @@
+import json
+import logging
 import os
 from typing import Optional
 from torch.utils.data import Dataset, DataLoader, TensorDataset
@@ -6,6 +8,8 @@ import torch.nn.functional as F
 import torch
 import pandas as pd
 from sklearn.model_selection import train_test_split
+
+logger = logging.getLogger(__name__)
 
 class TFBSDataModule(LightningDataModule):
     def __init__(
@@ -70,7 +74,7 @@ class TFBSDataModule(LightningDataModule):
 
         # --- SCALING LOGIC ---
         if self.hparams.scaling_method:
-            print(f"Applying '{self.hparams.scaling_method}' scaling to labels.")
+            logger.info("Applying '%s' scaling to labels.", self.hparams.scaling_method)
             
             if self.hparams.scaling_method == 'standardize':
                 # Standardization (Z-score): (x - mean) / std
@@ -107,14 +111,26 @@ class TFBSDataModule(LightningDataModule):
         self.val_dataset = TensorDataset(val_seqs, val_labels)
         self.test_dataset = TensorDataset(test_seqs, test_labels)
 
+    def _dataloader(self, dataset, shuffle: bool) -> DataLoader:
+        num_workers = self.hparams.num_workers
+        return DataLoader(
+            dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            # DataLoader rejects persistent_workers=True when num_workers is 0.
+            persistent_workers=num_workers > 0,
+            pin_memory=torch.cuda.is_available(),
+        )
+
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, num_workers=self.hparams.num_workers, persistent_workers=True, pin_memory=True)
+        return self._dataloader(self.train_dataset, shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, num_workers=self.hparams.num_workers, persistent_workers=True, pin_memory=True)
+        return self._dataloader(self.val_dataset, shuffle=False)
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, num_workers=self.hparams.num_workers, persistent_workers=True, pin_memory=True)
+        return self._dataloader(self.test_dataset, shuffle=False)
     
     def reverse_transform(self, scaled_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -144,8 +160,6 @@ class TFBSDataModule(LightningDataModule):
         This allows the MCP server (and other inference code) to reverse
         the label transform without re-loading the training set.
         """
-        import json as _json
-
         data_dir = self.hparams.data_path
         if data_dir is None:
             return
@@ -160,11 +174,11 @@ class TFBSDataModule(LightningDataModule):
 
         path = os.path.join(str(data_dir), "scaling_params.json")
         try:
-            with open(path, "w") as f:
-                _json.dump(params, f, indent=2)
-            print(f"Scaling parameters saved to {path}")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(params, f, indent=2)
+            logger.info("Scaling parameters saved to %s", path)
         except OSError as e:
-            print(f"Warning: could not save scaling params: {e}")
+            logger.warning("Could not save scaling params to %s: %s", path, e)
 
     def _one_hot_encode(self, df, seq_col, target_col):
         """Helper function to one-hot encode sequences from a dataframe."""

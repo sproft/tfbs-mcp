@@ -4,13 +4,23 @@ The row holds test_loss and, for a classifier, test_acc and test_auc.
 
 Run as ``python -m tfbs.pipelines.validate --help``; the tfbs_validate MCP tool
 submits this module as a SLURM job.
+
+A new row is appended under the file's header.  When a run reports a metric
+column the header lacks, the whole file is rewritten through a temporary file
+in the same directory and swapped in with os.replace, so a reader never sees a
+half-written CSV.  Neither path locks the file: concurrent jobs should write
+separate output files (one per job) and merge them afterwards, because a row
+another job appends during a rewrite is lost.
 """
 import argparse
-import os
-import sys
-import torch
-import pytorch_lightning as pl
 import csv
+import os
+import shutil
+import sys
+import tempfile
+
+import pytorch_lightning as pl
+import torch
 
 from tfbs.dataloaders.SeqDataset import TFBSDataModule
 import tfbs.nn.models as models
@@ -62,11 +72,7 @@ def save_results(args, metrics):
 
     try:
         if existing_fields and fieldnames != existing_fields:
-            with open(args.output_file, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, restval='')
-                writer.writeheader()
-                writer.writerows(existing_rows)
-                writer.writerow(row)
+            _rewrite_atomically(args.output_file, fieldnames, existing_rows + [row])
         else:
             with open(args.output_file, 'a', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, restval='')
@@ -76,6 +82,30 @@ def save_results(args, metrics):
         print(f"Successfully wrote results to: {args.output_file}")
     except OSError as e:
         print(f"Error writing to output file {args.output_file}: {e}", file=sys.stderr)
+
+
+def _rewrite_atomically(path, fieldnames, rows):
+    """Write header and rows to a temporary sibling of path, then os.replace it."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.', suffix='.tmp',
+                               dir=directory)
+    try:
+        with os.fdopen(fd, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval='')
+            writer.writeheader()
+            writer.writerows(rows)
+        try:
+            # mkstemp creates the file owner-only; keep the original's permissions.
+            shutil.copymode(path, tmp)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def run(args):

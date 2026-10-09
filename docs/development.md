@@ -42,6 +42,8 @@ The MCP tools resolve data, checkpoints and results against `TFBS_PROJECT_ROOT`,
 export TFBS_PROJECT_ROOT=/mnt/lab/tfbs
 ```
 
+The `tfbs_train` tool submits the training to SLURM by default. With `local=true` it runs `python -m tfbs.cli.train_cli fit --config <config> --data.num_workers 0` on the server's machine instead, from the config's directory, and blocks until training ends (at most `local_timeout` seconds, default 3600), so it is meant for small datasets and laptops. Its output goes to `<config stem>_train.log` next to the config, and the result reports the checkpoint and the last validation metrics from the CSVLogger's `metrics.csv` that every `tfbs_config` config without `wandb_project` writes under the checkpoint directory. Retraining into the same folder overwrites `best_<model_type>.ckpt`.
+
 ## Training and validation pipelines
 
 The six tools that run a longer job (`tfbs_validate`, `tfbs_sweep`, `tfbs_chipseq_benchmark`, `tfbs_chipseq_method_comparison`, `tfbs_remap_validation`, `tfbs_disease_variant_validation`) start a module from the installed package as `python -m tfbs.pipelines.<name>`, directly or inside a SLURM job, with the same interpreter as the server. Each one also runs by hand and lists its options with `--help`:
@@ -70,6 +72,19 @@ npx -y @modelcontextprotocol/inspector "$(which tfbs-mcp)"
 
 The reference-data variables (`TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE`, `TFBS_FOLDX_PDB`, `TFBS_CLINVAR_VCF`, `TFBS_PROJECT_ROOT`) are read from the server's environment, so export them in the shell before starting the Inspector.
 
+The server imports PyTorch, Lightning, scikit-learn, captum, tangermeme and the genomics libraries before it answers the first message, so it takes a few seconds to start (about 8.5 seconds on a Windows 10 workstation with a CPU build of PyTorch) and every tool call answers at once afterwards. This is required on Windows: a native extension imported for the first time after the stdio loop has started never finishes loading there. A tool that adds a function-level import of a library with native code must add it to `_NATIVE_MODULES` in `tfbs/mcp/server.py`; a test checks this.
+
+## Recording a session
+
+`scripts/record_demo_session.py` (in a clone; it is not installed) starts `tfbs-mcp` over the stdio protocol as an AI app does, runs a plan of user messages, the assistant's stated plan and tool calls, and writes every call's arguments, full result and wall time to a JSON log, together with the seconds from launch to the server's first answer. The application note's Figure 2 is produced from such a log, so no part of it is typed in by hand.
+
+```bash
+python scripts/record_demo_session.py --server "$(which tfbs-mcp)" --plan plan.json --out session_log.json \
+    --env TFBS_CALL_LOG=calls.jsonl --set DEMO="$(python -c 'import tfbs.mcp.cli as c; print(c.demo_dir())')"
+```
+
+The plan is a JSON list of steps: `{"role": "user", "text": ...}`, `{"role": "llm", "text": ...}` or `{"role": "tool", "tool": ..., "arguments": {...}}`. A tool argument `{"$ref": "3.files.sequences"}` takes that value from the result of step 3. `--set KEY=VALUE` (repeatable) replaces `@KEY` by `VALUE` in every string of the plan before the references are resolved, so one plan runs on any machine, e.g. `"@DEMO/demo_peaks.bed"`. `--env KEY=VALUE` sets a variable for the server; with `TFBS_CALL_LOG` the server's own call log is copied into the recording.
+
 ## Optional extras
 
 The install command in the README already includes everything the server needs. This table is only for choosing a different set:
@@ -78,7 +93,7 @@ The install command in the README already includes everything the server needs. 
 |---|---|---|
 | `mcp` | the MCP protocol library | the server itself |
 | `genomics` | pyfaidx, tangermeme, pysam (Linux and macOS; Windows has no pysam wheel) | reading a genome FASTA (`tfbs_extract_loci`, the benchmark and validation tools); pysam reads the ClinVar VCF in `tfbs_disease_variant_validation`, which therefore needs Linux, macOS or WSL |
-| `viz` | captum, tangermeme, logomaker, seaborn | attribution, mutagenesis, seqlets |
+| `viz` | captum, tangermeme, logomaker, seaborn | attribution, mutagenesis, seqlets; tangermeme also brings the pure-PyTorch FIMO that `tfbs_fimo` uses when the MEME Suite's `fimo` binary is not on PATH (its result says `"backend": "tangermeme"` or `"meme"`) |
 | `tracking` | wandb | `tfbs_sweep`, and Weights & Biases logging during training |
 | `foldx` | pyBigWig | the bigWig track of `tfbs_binding_scan`; not FoldX itself, see [Adding your data](../README.md#adding-your-data) in the README |
 | `equinet` | equirc | the `EquiNet` architecture only |
@@ -141,6 +156,7 @@ tfbs/                     Python package
 scripts/                  Repo-only scripts (not installed by pip)
 ├── cli/                  SLURM job templates; run_sweep.py wraps tfbs.pipelines
 ├── make_demo_data.py     Rebuilds tfbs/data/demo/ from a GRCh38 FASTA
+├── record_demo_session.py Records a stdio session log (see Recording a session)
 ├── chipseq_benchmark*.py Wrappers around tfbs.pipelines (likewise
 ├── remap_validation.py   validate.py and disease_variant_validation.py)
 └── ...

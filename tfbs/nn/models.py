@@ -40,7 +40,7 @@ class BaseModel(pl.LightningModule):
     It's designed to be flexible for both classification and regression tasks and
     now supports models with single or multiple inputs.
     """
-    # TODO (Option B — post-publication): Store label scaling params directly in the model
+    # TODO (Option B, post-publication): Store label scaling params directly in the model
     # checkpoint so they travel with the weights. This requires:
     #   1. Add label_mean: float | None = None, label_std: float | None = None
     #      (and label_min/label_max for normalize) to __init__ kwargs
@@ -89,8 +89,21 @@ class BaseModel(pl.LightningModule):
             y_hat = self.forward(*x)
         else:
             y_hat = self.forward(x)
-        loss = self.loss(y_hat, y.view_as(y_hat).float())
+        loss = self.loss(y_hat, y.reshape(y_hat.shape).to(y_hat.dtype))
         return loss, y_hat, y
+
+    def _log_classification_metrics(self, stage, y_hat, y):
+        """Update and log accuracy and AUROC for one batch of any size.
+
+        Labels arrive as (B, 1) or (B,) and a batch may hold one sequence,
+        so both sides are flattened to (B,) before the metric update.
+        """
+        preds = y_hat.detach().reshape(-1)
+        target = y.reshape(-1).long()
+        self.accuracy(preds, target)
+        self.auroc(preds, target)
+        self.log(f'{stage}_acc', self.accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f'{stage}_auc', self.auroc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
     def training_step(self, batch, batch_idx):
         """Performs a single training step."""
@@ -102,29 +115,16 @@ class BaseModel(pl.LightningModule):
         """Performs a single validation step."""
         loss, y_hat, y = self._handle_batch(batch)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        
-        # Log classification metrics if applicable
         if self.classify:
-            # Squeeze the prediction tensor to match the target tensor's shape
-            y_hat_squeezed = y_hat.squeeze()
-            self.accuracy(y_hat_squeezed, y)
-            self.auroc(y_hat_squeezed, y)
-            self.log('val_acc', self.accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log('val_auc', self.auroc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self._log_classification_metrics('val', y_hat, y)
         return loss
 
     def test_step(self, batch, batch_idx):
         """Performs a single test step."""
         loss, y_hat, y = self._handle_batch(batch)
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
-        # Log classification metrics if applicable
         if self.classify:
-            y_hat_squeezed = y_hat.squeeze()
-            self.accuracy(y_hat_squeezed, y)
-            self.auroc(y_hat_squeezed, y)
-            self.log('test_acc', self.accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log('test_auc', self.auroc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self._log_classification_metrics('test', y_hat, y)
         return loss
 
     def configure_optimizers(self):
