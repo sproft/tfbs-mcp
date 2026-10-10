@@ -623,3 +623,26 @@ def test_developer_guide_describes_local_training_as_the_tool_does():
     assert "`val_auc` is null, with a note, when the validation split holds a single class" in guide
     assert "the whole group is killed when `local_timeout` runs out or the MCP call is cancelled" in guide
     assert "last validation metrics" not in guide
+
+
+def test_method_comparison_reports_missing_fimo_before_running(monkeypatch, tmp_path):
+    """Like the ReMap and ClinVar tools, the comparison tool needs the fimo binary up front."""
+    import asyncio
+    import json
+    import shutil
+
+    from tfbs.mcp import server
+
+    real_which = shutil.which
+    monkeypatch.setattr(server.shutil, "which",
+                        lambda name, *a, **k: None if name == "fimo" else real_which(name, *a, **k))
+    for name in ("motif.meme", "complex.pdb", "genome.fa"):
+        (tmp_path / name).write_text("x
+", encoding="utf-8")
+    out = json.loads(asyncio.run(server.tfbs_chipseq_method_comparison(
+        intersect_dir=str(tmp_path), output_dir=str(tmp_path / "out"),
+        motif_file=str(tmp_path / "motif.meme"), foldx_pdb=str(tmp_path / "complex.pdb"),
+        genome_fasta=str(tmp_path / "genome.fa"))))
+    assert "fimo" in out["error"] and "tfbs_chipseq_method_comparison" in out["error"]
+    assert "fix" in out
+    assert not (tmp_path / "out").exists()

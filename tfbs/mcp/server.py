@@ -537,8 +537,8 @@ def _optional_reference(value: str | None, arg: str) -> tuple[Path | None, str |
 def _fimo_binary_error(tool: str, skip_hint: str) -> str | None:
     """Error JSON when the MEME Suite's fimo program is not on PATH, else None.
 
-    The ReMap and ClinVar validation pipelines run fimo for their FIMO leg
-    and, unlike tfbs_fimo, have no tangermeme/memelite fallback.
+    The ReMap, ClinVar and method-comparison pipelines run fimo for their
+    FIMO leg and, unlike tfbs_fimo, have no tangermeme/memelite fallback.
     """
     if shutil.which("fimo") is not None:
         return None
@@ -6816,7 +6816,10 @@ async def tfbs_chipseq_method_comparison(
         intersect_dir: Directory with *.allintersect.bed files.
         output_dir: Where to save plots, raw scores, and AUC tables.
         motif_file: JASPAR/MEME motif file for FIMO (e.g. MA1994.1.meme
-            for NKX2-1). Falls back to $TFBS_MOTIF_FILE.
+            for NKX2-1). Falls back to $TFBS_MOTIF_FILE. The FIMO leg runs
+            the MEME Suite's fimo program (no tangermeme fallback here), so
+            the call returns an error before anything runs or is submitted
+            when fimo is not on the server's PATH.
         foldx_pdb: Repaired TF-DNA complex PDB, or $TFBS_FOLDX_PDB. The
             DNA length in the
             PDB defines the FoldX scoring window (must be <= the
@@ -6870,6 +6873,9 @@ async def tfbs_chipseq_method_comparison(
         datasets = ["all_mean", "core_mean", "flank_mean"]
 
     genome_path, err = _resolve_reference(genome_fasta, "genome_fasta")
+    if err:
+        return err
+    err = _fimo_binary_error("tfbs_chipseq_method_comparison", "")
     if err:
         return err
     motif_path, err = _resolve_reference(motif_file, "motif_file")
