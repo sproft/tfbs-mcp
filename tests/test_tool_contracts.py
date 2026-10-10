@@ -637,8 +637,7 @@ def test_method_comparison_reports_missing_fimo_before_running(monkeypatch, tmp_
     monkeypatch.setattr(server.shutil, "which",
                         lambda name, *a, **k: None if name == "fimo" else real_which(name, *a, **k))
     for name in ("motif.meme", "complex.pdb", "genome.fa"):
-        (tmp_path / name).write_text("x
-", encoding="utf-8")
+        (tmp_path / name).write_text("x", encoding="utf-8")
     out = json.loads(asyncio.run(server.tfbs_chipseq_method_comparison(
         intersect_dir=str(tmp_path), output_dir=str(tmp_path / "out"),
         motif_file=str(tmp_path / "motif.meme"), foldx_pdb=str(tmp_path / "complex.pdb"),
