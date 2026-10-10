@@ -9,12 +9,14 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 import torch
 import numpy as np
+
+from tests.fake_pipeline import fake_pipelines
 
 
 class FakeModel(torch.nn.Module):
@@ -455,7 +457,7 @@ def _register(model_id, model, input_length):
 class FakeSlurm:
     """Stands in for sbatch, squeue, sacct and wandb on a machine without them."""
 
-    def __init__(self, monkeypatch, available=("sbatch",), sweep_id="abc123", job_id="4242"):
+    def __init__(self, monkeypatch, available=("sbatch", "fimo"), sweep_id="abc123", job_id="4242"):
         from tfbs.mcp import server
 
         self.calls = []
@@ -466,6 +468,7 @@ class FakeSlurm:
             lambda name, *a, **k: f"/usr/bin/{name}" if name in available else None,
         )
         monkeypatch.setattr(server.subprocess, "run", self._run)
+        fake_pipelines(monkeypatch, self._run)
 
     def _run(self, cmd, *args, **kwargs):
         self.calls.append({"cmd": list(cmd), "cwd": kwargs.get("cwd")})
@@ -843,7 +846,7 @@ def test_epistasis_rejects_positions_outside_the_sequence():
 
 def _reference_files(tmp_path):
     files = {}
-    for name in ("genome.fa", "motif.meme", "peaks.bed", "clinvar.vcf.gz"):
+    for name in ("genome.fa", "motif.meme", "peaks.bed", "clinvar.vcf.gz", "clinvar.vcf.gz.tbi"):
         path = tmp_path / name
         path.write_text("placeholder\n")
         files[name] = str(path)
@@ -1462,13 +1465,111 @@ def test_call_log_records_each_tool_call(monkeypatch, tmp_path):
     _call_via_mcp("tfbs_classify_metrics", args)
     _call_via_mcp("tfbs_list_models", {})
 
-    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    raw = log.read_bytes()
+    assert b"\r\n" not in raw and raw.endswith(b"\n")
+    records = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
     assert [r["tool"] for r in records] == ["tfbs_classify_metrics", "tfbs_list_models"]
     assert records[0]["arguments"] == args
     assert records[1]["arguments"] == {}
     for record in records:
-        assert set(record) == {"timestamp", "tool", "arguments"}
-        assert datetime.fromisoformat(record["timestamp"]).tzinfo is not None
+        assert set(record) == {"timestamp", "tool", "arguments", "seconds", "is_error", "result"}
+        started = datetime.fromisoformat(record["timestamp"])
+        assert started.utcoffset() == timedelta(0)
+        assert len(record["timestamp"].split("T")[1].split("+")[0]) == len("HH:MM:SS.mmm")
+        assert isinstance(record["seconds"], float) and record["seconds"] >= 0
+        assert record["is_error"] is False
+
+
+def test_call_log_records_the_result_the_tool_returned(monkeypatch, tmp_path):
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("TFBS_CALL_LOG", str(log))
+    args = {"positive_scores": [0.9, 0.8], "negative_scores": [0.1, 0.2]}
+
+    returned = _call_via_mcp("tfbs_classify_metrics", args)
+
+    (record,) = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert record["result"] == returned
+    assert record["result"]["roc_auc"] == 1.0
+
+
+def test_call_log_marks_an_error_result(monkeypatch, tmp_path):
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("TFBS_CALL_LOG", str(log))
+
+    returned = _call_via_mcp("tfbs_predict", {"model_id": "no_such_model", "sequences": ["ACGT"]})
+
+    (record,) = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert "error" in returned
+    assert record["is_error"] is True
+    assert record["result"] == returned
+
+
+def test_call_log_records_a_call_that_raises_and_the_exception_still_propagates(
+        monkeypatch, tmp_path):
+    from mcp.server.fastmcp.exceptions import ToolError
+    from tfbs.mcp import server
+
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("TFBS_CALL_LOG", str(log))
+
+    with pytest.raises(ToolError, match="Unknown tool"):
+        asyncio.run(server.mcp.call_tool("tfbs_no_such_tool", {"x": 1}))
+
+    (record,) = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert record["tool"] == "tfbs_no_such_tool"
+    assert record["arguments"] == {"x": 1}
+    assert record["is_error"] is True
+    assert "Unknown tool" in record["result"]["error"]
+
+
+def test_call_log_raise_with_an_unwritable_log_still_raises_the_tool_error(monkeypatch, tmp_path):
+    from mcp.server.fastmcp.exceptions import ToolError
+    from tfbs.mcp import server
+
+    monkeypatch.setenv("TFBS_CALL_LOG", str(tmp_path))
+    with pytest.raises(ToolError, match="Unknown tool"):
+        asyncio.run(server.mcp.call_tool("tfbs_no_such_tool", {}))
+
+
+def test_call_log_truncates_a_result_over_the_size_limit(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("TFBS_CALL_LOG", str(log))
+    monkeypatch.setattr(server, "CALL_LOG_MAX_RESULT_BYTES", 20)
+    args = {"positive_scores": [0.9, 0.8], "negative_scores": [0.1, 0.2]}
+
+    returned = _call_via_mcp("tfbs_classify_metrics", args)
+
+    (record,) = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    full = json.dumps(returned, ensure_ascii=False)
+    assert record["result"] == {"truncated": True, "bytes": len(full.encode("utf-8")),
+                                "head": full[:server.CALL_LOG_HEAD_CHARS]}
+    assert record["is_error"] is False
+
+
+def test_call_log_result_limit_is_one_megabyte_with_a_4096_character_head():
+    from tfbs.mcp import server
+
+    small = json.dumps({"scores": [0.5] * 1000})
+    assert server._call_log_result(small) == (json.loads(small), False)
+
+    big = json.dumps({"error": "x", "blob": "A" * (1024 * 1024)})
+    logged, is_error = server._call_log_result(big)
+    assert is_error is True
+    assert logged["truncated"] is True
+    assert logged["bytes"] == len(big.encode("utf-8"))
+    assert logged["head"] == big[:4096]
+
+
+def test_call_log_wraps_a_result_that_is_not_json():
+    from types import SimpleNamespace
+
+    from tfbs.mcp import server
+
+    assert server._call_log_result("plain text") == ({"text": "plain text"}, False)
+    blocks = [SimpleNamespace(type="text", text='{"a": 1}')]
+    assert server._call_log_result((blocks, {"result": '{"a": 1}'})) == ({"a": 1}, False)
 
 
 def test_call_log_is_off_without_the_variable(monkeypatch, tmp_path):
@@ -1478,9 +1579,64 @@ def test_call_log_is_off_without_the_variable(monkeypatch, tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_unwritable_call_log_does_not_break_the_tool_call(monkeypatch, tmp_path):
+def test_unwritable_call_log_does_not_break_the_tool_call(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv("TFBS_CALL_LOG", str(tmp_path))
-    assert "test_model" in _call_via_mcp("tfbs_list_models", {})
+    with caplog.at_level("WARNING", logger="tfbs.mcp.server"):
+        assert "test_model" in _call_via_mcp("tfbs_list_models", {})
+    assert any("Could not append" in r.getMessage() for r in caplog.records)
+
+
+def test_a_result_hook_that_raises_still_returns_the_tool_value(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("TFBS_CALL_LOG", str(log))
+
+    def broken(result):
+        raise RuntimeError("cannot serialise")
+
+    monkeypatch.setattr(server, "_call_log_result", broken)
+    returned = _call_via_mcp("tfbs_classify_metrics",
+                             {"positive_scores": [0.9], "negative_scores": [0.1]})
+    assert returned["roc_auc"] == 1.0
+
+    (record,) = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert record["tool"] == "tfbs_classify_metrics"
+    assert record["result"] == {"error": "result not loggable: cannot serialise"}
+    assert record["is_error"] is False
+
+
+def test_a_result_over_the_limit_is_cut_without_being_parsed(monkeypatch):
+    from tfbs.mcp import server
+
+    def no_parse(*a, **k):
+        raise AssertionError("json.loads must not run on an oversized result")
+
+    big = '{"hits": [' + ", ".join(["1"] * 400_000) + "]}"
+    monkeypatch.setattr(server.json, "loads", no_parse)
+    logged, is_error = server._call_log_result(big)
+    assert logged == {"truncated": True, "bytes": len(big.encode("utf-8")),
+                      "head": big[:server.CALL_LOG_HEAD_CHARS]}
+    assert is_error is False
+
+
+def test_an_exception_whose_str_raises_is_logged_by_type_and_re_raised(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    class Unprintable(Exception):
+        def __str__(self):
+            raise ValueError("no text")
+
+    async def explode(*a, **k):
+        raise Unprintable()
+
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("TFBS_CALL_LOG", str(log))
+    monkeypatch.setattr(server, "_tool_manager_call_tool", explode)
+    with pytest.raises(Unprintable):
+        asyncio.run(server.mcp.call_tool("tfbs_list_models", {}))
+    (record,) = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert record["result"] == {"error": "Unprintable"} and record["is_error"] is True
 
 
 def test_fimo_fallback_with_a_sequence_shorter_than_the_motif_has_no_hits(monkeypatch, tmp_path):
@@ -1543,3 +1699,27 @@ def test_fimo_is_not_annotated_read_only():
 
     tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
     assert tools["tfbs_fimo"].annotations.readOnlyHint is False
+
+
+def test_mkdir_error_returns_json_for_a_path_naming_a_file(tmp_path):
+    from tfbs.mcp import server
+
+    blocker = tmp_path / "taken"
+    blocker.write_text("x")
+    assert server._mkdir_error(tmp_path / "new" / "dir") is None
+    assert (tmp_path / "new" / "dir").is_dir()
+    for path in (blocker, blocker / "below"):
+        result = json.loads(server._mkdir_error(path, "output_dir"))
+        assert str(path) in result["error"] and "output_dir" in result["fix"]
+    assert "already exists" in json.loads(server._mkdir_error(blocker))["error"]
+
+
+def test_fimo_output_dir_that_is_a_file_is_an_error(monkeypatch, tmp_path):
+    from tfbs.mcp import server
+
+    monkeypatch.setattr(server.shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+    blocker = tmp_path / "taken"
+    blocker.write_text("x")
+    result = json.loads(asyncio.run(server.tfbs_fimo(
+        sequences=[TG_24MER], motif_file=str(NKX_MOTIF), output_dir=str(blocker))))
+    assert "Cannot create the directory" in result["error"] and result["fix"]

@@ -24,6 +24,7 @@ import tfbs.configs
 import tfbs.pipelines
 from tfbs.mcp import cli
 from tfbs.mcp import server
+from tests.fake_pipeline import fake_pipelines
 
 REPO = Path(__file__).resolve().parent.parent
 PIPELINES = tfbs.pipelines.PIPELINES
@@ -115,12 +116,25 @@ def test_remap_validation_without_foldx_stops_with_the_tools_error(monkeypatch, 
     from tfbs.mcp.foldx_tools import _foldx_missing_error
     from tfbs.pipelines import remap_validation as rv
 
-    monkeypatch.setattr(rv.shutil, "which", lambda name: None)
+    monkeypatch.setattr(rv.shutil, "which", lambda name: "/usr/bin/fimo" if name == "fimo" else None)
     monkeypatch.delenv("TFBS_FOLDX_BIN", raising=False)
     with pytest.raises(SystemExit) as stop:
         rv.main(["--remap-bed", str(tmp_path / "peaks.bed"), "--output-dir", str(tmp_path / "out")])
     tool_error = json.loads(_foldx_missing_error())
     assert stop.value.code == f"{tool_error['error']} {tool_error['fix']}"
+    assert not (tmp_path / "out").exists()
+
+
+def test_remap_validation_without_fimo_stops_before_any_work(monkeypatch, tmp_path):
+    from tfbs.pipelines import FIMO_REQUIRED
+    from tfbs.pipelines import remap_validation as rv
+
+    monkeypatch.setattr(rv.shutil, "which", lambda name: None)
+    with pytest.raises(SystemExit) as stop:
+        rv.main(["--remap-bed", str(tmp_path / "peaks.bed"), "--output-dir",
+                 str(tmp_path / "out"), "--skip-foldx"])
+    assert stop.value.code == FIMO_REQUIRED
+    assert "tfbs_fimo" in FIMO_REQUIRED and "fimo" in FIMO_REQUIRED
     assert not (tmp_path / "out").exists()
 
 
@@ -216,7 +230,7 @@ def test_built_wheel_contains_the_pipelines_and_templates(tmp_path):
 class Recorder:
     """Stands in for subprocess.run and shutil.which inside the server."""
 
-    def __init__(self, monkeypatch, available=("sbatch",), returncode=0):
+    def __init__(self, monkeypatch, available=("sbatch", "fimo"), returncode=0):
         self.calls = []
         self.returncode = returncode
         monkeypatch.setattr(
@@ -224,6 +238,7 @@ class Recorder:
             lambda name, *a, **k: f"/usr/bin/{name}" if name in available else None,
         )
         monkeypatch.setattr(server.subprocess, "run", self._run)
+        fake_pipelines(monkeypatch, self._run)
 
     def _run(self, cmd, *args, **kwargs):
         self.calls.append({"cmd": list(cmd), **kwargs})
@@ -242,7 +257,10 @@ def refs(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_pipeline_requirements_error", lambda *a: None)
     monkeypatch.setitem(server._ENV, "default_device", "cpu")
     files = {}
-    for name in ("genome.fa", "motif.meme", "peaks.bed", "clinvar.vcf.gz", "complex.pdb"):
+    for var in ("TFBS_MOTIF_FILE", "TFBS_FOLDX_PDB"):
+        monkeypatch.delenv(var, raising=False)
+    for name in ("genome.fa", "motif.meme", "peaks.bed", "clinvar.vcf.gz", "clinvar.vcf.gz.tbi",
+                 "complex.pdb"):
         path = tmp_path / name
         path.write_text("placeholder\n")
         files[name] = str(path)
@@ -337,6 +355,7 @@ def test_pipeline_failure_and_timeout_are_json_errors(refs, tmp_path, monkeypatc
         raise subprocess.TimeoutExpired(cmd, k.get("timeout"))
 
     monkeypatch.setattr(server.subprocess, "run", too_slow)
+    fake_pipelines(monkeypatch, too_slow)
     result = _call("chipseq_benchmark", refs, tmp_path, slurm=False)
     assert "timed out" in result["error"] and "slurm=true" in result["fix"]
 
@@ -357,7 +376,7 @@ def test_missing_pysam_is_reported_before_anything_runs(tmp_path, monkeypatch):
                         lambda name, *a: None if name == "pysam" else real(name, *a))
     rec = Recorder(monkeypatch)
     files = {}
-    for name in ("genome.fa", "peaks.bed", "clinvar.vcf.gz"):
+    for name in ("genome.fa", "peaks.bed", "clinvar.vcf.gz", "clinvar.vcf.gz.tbi"):
         (tmp_path / name).write_text("x\n")
         files[name] = str(tmp_path / name)
     result = _call("disease_variant_validation", files, tmp_path, slurm=False)
@@ -733,3 +752,114 @@ def test_scaling_method_help_says_the_fallback_needs_the_flag_omitted(module, ca
     assert "Only when this flag is omitted and that file is missing" in text
     assert "an explicit value never falls back to another folder" in text
     assert "(default: the standardize folder)" in text
+
+
+# ---------------------------------------------------------------------------
+# The direct-mode runner leaves the server responsive
+# ---------------------------------------------------------------------------
+
+def test_a_slow_pipeline_leaves_the_event_loop_free(refs, tmp_path, monkeypatch):
+    import time
+
+    def slow(cmd, timeout=None, **kwargs):
+        time.sleep(1.5)
+        return subprocess.CompletedProcess(cmd, 0, "pipeline done\n", "")
+
+    Recorder(monkeypatch, available=("sbatch", "fimo"))
+    fake_pipelines(monkeypatch, slow)
+    finished = []
+
+    async def remap():
+        result = await server.tfbs_remap_validation(
+            remap_bed=refs["peaks.bed"], output_dir=str(tmp_path / "remap"),
+            genome_fasta=refs["genome.fa"], motif_file=refs["motif.meme"],
+            models_dir=refs["models_dir"], skip_foldx=True, slurm=False)
+        finished.append("remap")
+        return json.loads(result)
+
+    async def other_call():
+        await asyncio.sleep(0.2)
+        result = await server.tfbs_classify_metrics(positive_scores=[0.9],
+                                                    negative_scores=[0.1])
+        finished.append("metrics")
+        return json.loads(result)
+
+    async def ticker(stop):
+        ticks = 0
+        while not stop.is_set():
+            await asyncio.sleep(0.05)
+            ticks += 1
+        return ticks
+
+    async def main():
+        stop = asyncio.Event()
+        tick_task = asyncio.create_task(ticker(stop))
+        remap_result, metrics = await asyncio.gather(remap(), other_call())
+        stop.set()
+        return remap_result, metrics, await tick_task
+
+    remap_result, metrics, ticks = asyncio.run(main())
+    assert remap_result["mode"] == "direct", remap_result
+    assert remap_result["stdout"] == "pipeline done\n"
+    assert metrics["roc_auc"] == 1.0
+    assert finished == ["metrics", "remap"]
+    assert ticks >= 10
+
+
+def _spawn_recorder(monkeypatch):
+    started = []
+    real_spawn = server._spawn_pipeline
+
+    def spawn(cmd, cwd):
+        proc = real_spawn(cmd, cwd)
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(server, "_spawn_pipeline", spawn)
+    return started
+
+
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+
+def test_cancelling_a_direct_run_kills_the_pipeline_process(tmp_path, monkeypatch):
+    import time
+
+    started = _spawn_recorder(monkeypatch)
+
+    async def main():
+        task = asyncio.create_task(server._run_pipeline(SLEEPER, tmp_path, 300, "Sleeper"))
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if started:
+                break
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    t0 = time.monotonic()
+    asyncio.run(main())
+    assert started, "the pipeline never started"
+    assert started[0].poll() is not None
+    assert time.monotonic() - t0 < 45
+
+
+def test_a_direct_run_past_its_timeout_is_killed_and_reported(tmp_path, monkeypatch):
+    started = _spawn_recorder(monkeypatch)
+    result, err = asyncio.run(server._run_pipeline(SLEEPER, tmp_path, 1, "Sleeper"))
+    assert result is None
+    err = json.loads(err)
+    assert "timed out after 1 s" in err["error"] and "slurm=true" in err["fix"]
+    assert started[0].poll() is not None
+
+
+def test_a_direct_run_returns_the_completed_process(tmp_path):
+    cmd = [sys.executable, "-c",
+           "import sys; print('out \\u0394'); print('err', file=sys.stderr); sys.exit(3)"]
+    result, err = asyncio.run(server._run_pipeline(cmd, tmp_path, 60, "Echo"))
+    assert err is None
+    assert result.returncode == 3
+    assert result.stdout.strip() == "out Δ" and result.stderr.strip() == "err"
+    kwargs = server._pipeline_popen_kwargs(tmp_path)
+    assert kwargs["stdin"] == subprocess.DEVNULL and kwargs["cwd"] == str(tmp_path)

@@ -44,6 +44,8 @@ export TFBS_PROJECT_ROOT=/mnt/lab/tfbs
 
 The `tfbs_train` tool submits the training to SLURM by default. With `local=true` it runs `python -m tfbs.cli.train_cli fit --config <config> --data.num_workers 0` on the server's machine instead, from the config's directory, and blocks until training ends (at most `local_timeout` seconds, default 3600), so it is meant for small datasets and laptops. Its output goes to `<config stem>_train.log` next to the config. The trainer runs in a process group of its own, and the whole group is killed when `local_timeout` runs out or the MCP call is cancelled. The result reports the checkpoint and, from the `metrics.csv` this run's CSVLogger wrote (every `tfbs_config` config without `wandb_project` has one, under the checkpoint directory), the validation metrics of the best epoch of this run, the one with the lowest `val_loss` that ModelCheckpoint keeps, with `best_epoch` and `epochs_run`. `metrics` is null, with a `note` saying why, when the config has no CSVLogger or the run wrote no fresh `metrics.csv`; `val_auc` is null, with a note, when the validation split holds a single class. Retraining into the same folder overwrites `best_<model_type>.ckpt`.
 
+A SLURM job from a config (`config_path` without `local`) runs the same trainer from the config's directory. Its generated script requests `--cpus-per-task` from `cpus_per_task`, by default the config's `data.num_workers` plus 1 for the main training process (25 for the 24 workers of a `tfbs_config` config; an `extra_args` `--data.num_workers N` overrides the worker count), and writes a `--mem` line only when `mem` is given (e.g. `"64G"`; at least 1, since SLURM reads `--mem=0` as all of the node's memory), so otherwise the cluster's default memory applies. The result names `config_path` and `checkpoint_path`, where the job's ModelCheckpoint will write, derived from the config as in local mode; after the job, `slurm_logs` finds its `<job name>_<job id>.out` and `.err` in the config's directory even when sacct reports them as relative or unexpanded patterns. A relative path reported without a WorkDir is skipped rather than read from the server's own working directory.
+
 ## Training and validation pipelines
 
 The six tools that run a longer job (`tfbs_validate`, `tfbs_sweep`, `tfbs_chipseq_benchmark`, `tfbs_chipseq_method_comparison`, `tfbs_remap_validation`, `tfbs_disease_variant_validation`) start a module from the installed package as `python -m tfbs.pipelines.<name>`, directly or inside a SLURM job, with the same interpreter as the server. Each one also runs by hand and lists its options with `--help`:
@@ -52,7 +54,7 @@ The six tools that run a longer job (`tfbs_validate`, `tfbs_sweep`, `tfbs_chipse
 python -m tfbs.pipelines.remap_validation --help
 ```
 
-The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working, including `main(args)` with an `argparse.Namespace` for `validate` and `run_sweep`.
+In direct mode (`slurm=false`) the benchmark and validation tools run the module in a worker thread, so the server keeps answering other calls while it runs, and a cancelled call kills the module's whole process group (the process tree on Windows). `remap_validation`, and `disease_variant_validation` when it has a motif file, run the MEME Suite's `fimo` program, which must be on PATH; the tools check for it before they run or submit anything. The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working, including `main(args)` with an `argparse.Namespace` for `validate` and `run_sweep`.
 
 ## Prediction
 
@@ -85,7 +87,7 @@ python scripts/record_demo_session.py --server "$(which tfbs-mcp)" --plan plan.j
     --env TFBS_CALL_LOG=calls.jsonl --set DEMO="$(python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())")"
 ```
 
-The plan is a JSON list of steps: `{"role": "user", "text": ...}`, `{"role": "llm", "text": ...}` or `{"role": "tool", "tool": ..., "arguments": {...}}`. A tool argument `{"$ref": "3.files.sequences"}` takes that value from the result of step 3. `--set KEY=VALUE` (repeatable) replaces `@KEY` by `VALUE` in every string of the plan before the references are resolved, so one plan runs on any machine, e.g. `"@DEMO/demo_peaks.bed"`. `--env KEY=VALUE` sets a variable for the server; with `TFBS_CALL_LOG` the server's own call log is copied into the recording. A step that fails, such as a `$ref` naming a key the earlier result does not have (the log entry then lists the keys it does have) or an MCP protocol error, is logged as an error entry and the run goes on, and the log is written even when the run crashes.
+The plan is a JSON list of steps: `{"role": "user", "text": ...}`, `{"role": "llm", "text": ...}` or `{"role": "tool", "tool": ..., "arguments": {...}}`. A tool argument `{"$ref": "3.files.sequences"}` takes that value from the result of step 3. `--set KEY=VALUE` (repeatable) replaces `@KEY` by `VALUE` in every string of the plan before the references are resolved, so one plan runs on any machine, e.g. `"@DEMO/demo_peaks.bed"`. `--env KEY=VALUE` sets a variable for the server; with `TFBS_CALL_LOG` the server's own call log, which holds every call's arguments and result, is copied into the recording. A step that fails, such as a `$ref` naming a key the earlier result does not have (the log entry then lists the keys it does have) or an MCP protocol error, is logged as an error entry and the run goes on, and the log is written even when the run crashes.
 
 The plan behind the application note's Figure 2 is `docs/demo_session_plan.json`. It needs three `--set` values: `DEMO`, the demo directory; `RELEASE`, the unpacked Zenodo archive (doi:10.5281/zenodo.21399578) or a clone of the nkx2-1-tfbs-variants repository, from which it loads `models/flank/vcnnbpnet.pt`; and `WORK`, a directory for the files the tools write. Its last call fetches PDB entry 9U19 from RCSB, so it needs internet access. Run from the repository root:
 
@@ -99,6 +101,41 @@ python scripts/record_demo_session.py --server "$(which tfbs-mcp)" \
     --set RELEASE=/path/to/nkx2-1-tfbs-variants --set WORK="$RUN/work" \
     --timeout 900
 ```
+
+### The call log
+
+When `TFBS_CALL_LOG` names a file, the server appends one JSON line to it after every tool call returns: `timestamp` (start of the call, UTC, milliseconds), `tool`, `arguments` as received, `seconds` (wall time), `is_error` (true when the answer has an `"error"` key or the call raised) and `result`, the tool's parsed JSON answer (`{"text": ...}` when the answer is not JSON). A result whose JSON exceeds 1 MB is stored as `{"truncated": true, "bytes": N, "head": <first 4096 characters>}`. The size is checked on the returned text before it is parsed, so a large answer is never parsed just to be cut. A call that raises is logged with `{"error": "<exception type>: <message>"}` as its result (the type name alone when the message cannot be built) and the exception reaches the client as before; an answer the hook cannot log is recorded as `{"error": "result not loggable: ..."}` and still returned unchanged. The file is append-only UTF-8 with LF line ends, and a failure to write it is a warning on stderr that never breaks the call.
+
+### A session played by a real client
+
+`scripts/session_from_call_log.py` (in a clone; it is not installed) is the route for a session typed into a real client such as Claude Code rather than played from a plan. It turns the call log, and optionally the client's transcript, into the same JSON layout `record_demo_session.py` writes, so the same renderer draws the figure from it.
+
+1. Register the server for the recording with the call log among its variables, at `--scope local` (this project directory only), so that sessions in other projects and subagents elsewhere do not append to the log. Use a fresh `calls.jsonl` for every session: the log is append-only, and a new directory per session keeps earlier runs out of it. `--env` takes all variables at once, so repeat the ones already registered (`claude mcp get tfbs` lists them):
+
+   ```bash
+   RUN=/path/to/session-$(date +%Y%m%d-%H%M%S) && mkdir -p "$RUN"
+   claude mcp add tfbs --scope local --env TFBS_CALL_LOG="$RUN/calls.jsonl" \
+       TFBS_GENOME_FASTA=/data/hg38/hg38.fa TFBS_PROJECT_ROOT=/data/tfbs -- "$(which tfbs-mcp)"
+   ```
+
+   A local registration takes precedence over a user-scope one of the same name in this directory. If you register at `--scope user` instead, remove `TFBS_CALL_LOG` afterwards (step 4), or every later Claude Code session keeps appending to the file.
+
+2. Start Claude Code, check with `tfbs_server_info` that `call_log` is the file above, and run the session.
+3. Convert. Claude Code keeps the transcript as `~/.claude/projects/<working directory with every character other than a letter, digit or - replaced by ->/<session id>.jsonl`; the newest file there is usually the session just played.
+
+   ```bash
+   python scripts/session_from_call_log.py --call-log "$RUN/calls.jsonl" --out "$RUN/session_log.json" \
+       --transcript ~/.claude/projects/<project>/<session id>.jsonl \
+       --commit "$(git rev-parse --short HEAD)" --client "Claude Code $(claude --version | cut -d' ' -f1)"
+   ```
+
+4. Remove the recording registration: `claude mcp remove tfbs --scope local` (or, after a user-scope registration, register it again without `TFBS_CALL_LOG`).
+
+Without `--transcript` the steps are the tool calls of the call log. With it, the user's messages and the assistant's text are interleaved with the tool calls in timestamp order. Each `mcp__<server>__<tool>` call of the transcript is paired with the call-log entry of the same tool and equal arguments whose timestamp is the closest at or after the call's own (an entry up to 5 s earlier counts when none is later; an entry that starts after the call's result came back never does), so a call denied by the user, a call made by a subagent, or entries the server wrote in completion order shift nothing. Only a call whose arguments equal no entry falls back to the next unused entry of the same tool inside the same time window; `converted_from.matched_by_order` counts those. Entries that start outside the transcript's time span come from other sessions and are left out, counted as `calls_outside_window`; the other unmatched entries become steps of their own (`call_log_only`), and transcript calls without an entry take their result from the transcript (`transcript_only`).
+
+The transcript fills in the result of an entry that has none (a log from before results were logged). For an entry whose result was truncated (over 1 MB), the transcript's result is used only when it parses as JSON; otherwise the step keeps the logged first 4096 characters as `result_text`, with `result_truncated: true` and `result_bytes`. Claude Code replaces any output over about 30 KB with a `<persisted-output>` "Output too large (N KB). Full output saved to: ..." note naming a local file, and that note is never used as a result, whatever the call log holds: a call with no logged result (`transcript_only`, or a log from before results were logged) then gets an empty `result_text` and `result_truncated: true`, so no local path reaches the session log. When the client's tool_result is an error but the server logged a success (the client timed out, e.g. `MCP error -32001: Request timed out`, and the server finished later), the step keeps the server's result and adds `client_saw_error: true` with the client's text as `client_error_text`. The client's own tools (Bash, Read, ...) are kept as steps with `"kind": "client"` and phase `Client`, so the figure can show that the client read a file. Subagent lines are skipped, and so is everything the client injects itself: `isMeta` and `isCompactSummary` lines, task notifications (`origin.kind` `task-notification`, written when Claude Code moves a long call to the background), and user text starting with `<command-name>`, `<command-message>`, `<local-command-stdout>`, `<local-command-caveat>`, `<task-notification>`, `<system-reminder>` or `[Request interrupted`.
+
+Each tool step gets a phase: `--phases phases.json`, a JSON object mapping a tool name or an fnmatch pattern to a label, overrides the default map (Data prep: `tfbs_extract_loci`, `tfbs_prepare_*`, `tfbs_preprocess`; Training: `tfbs_config`, `tfbs_train`, `tfbs_sweep`, `tfbs_validate`, `slurm_*`; Validation: `tfbs_remap_validation`, `tfbs_chipseq_*`, `tfbs_disease_variant_validation`, `tfbs_classify_metrics`; Structure: `tfbs_fetch_structure`, `tfbs_binding_*`; Analysis: everything else). `--labels labels.json`, a JSON object mapping a 1-based index among the tfbs-mcp tool steps (`"3"`; client steps are not counted) or a tool name to a short label, writes that label as the step's `shown_args`, which the renderer prints inside the brackets after the tool name, e.g. `{"tfbs_train": "SLURM", "5": "ref", "6": "alt"}`; an index wins over a tool name, and without `--labels` no step has `shown_args`. The output's `converted_from` block holds the counts above and the client calls. The log records `seconds_to_initialize` and `tools_listed` as null, since a real client's session measures neither, and `client_server_name` is the name the client registered the server under (the `<server>` of `mcp__<server>__<tool>`), not the server's own name.
 
 ## Optional extras
 

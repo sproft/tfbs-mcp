@@ -26,6 +26,18 @@ Usage example:
         --motif-file data/JASPAR/MA1994.1.meme \\
         --foldx-pdb data/structures/repaired/NKX2-1_complex_CAB_Repair.pdb \\
         --peak-confidence 3
+
+The peaks BED needs 3 or more tab-separated columns: chrom, start and end
+are read, plus the 4th column as the confidence count when it is a number
+on every line (the 9-column ChIP-Atlas allintersect format keeps the
+experiment overlap count there); any other columns are ignored.
+--peak-confidence above 1 needs that count on every line: without it the
+pipeline stops and names the first line whose 4th column is not a number.
+The BED and the VCF may each name chromosomes chr1 or 1.  The ClinVar
+VCF must be bgzipped and tabix-indexed (.tbi or .csi next to it).  The
+pipeline exits non-zero with a message when the index or the fimo program
+(needed with --motif-file) is missing, when --model-type names no class in
+tfbs.nn.models, and when no ClinVar variant falls in the peaks.
 """
 
 from __future__ import annotations
@@ -68,60 +80,175 @@ EXCLUDE_SO = {
 # Step 1: BED merging
 # ---------------------------------------------------------------------------
 
-def merge_bed_intervals(bed_path: str, min_confidence: int = 1) -> pd.DataFrame:
-    """Read BED file (with optional 'num' column), merge overlapping intervals."""
-    df = pd.read_csv(bed_path, sep="\t", header=None, comment="#",
-                     names=["chrom", "start", "end", "num"]
-                     if _bed_has_num_column(bed_path) else
-                     ["chrom", "start", "end"])
-    if "num" not in df.columns:
-        df["num"] = 1
+def _confidence(value: str | None) -> float | None:
+    """A BED 4th column as a confidence count, or None when it is not a number."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _read_peaks(bed_path: str) -> tuple[pd.DataFrame, str | None]:
+    """read_peaks_bed, plus why column 4 holds no count (None when it does).
+
+    The reason names the first line whose 4th column is missing or not a
+    number, e.g. "line 2 has 'ID=SRX1;Name=x' in column 4".
+    """
+    rows: list[tuple[str, int, int]] = []
+    counts: list[float | None] = []
+    problem: str | None = None
+    # utf-8-sig: a byte order mark would otherwise become part of the first chrom.
+    with open(bed_path, encoding="utf-8-sig", errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip() or line.startswith(("#", "track", "browser")):
+                continue
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) < 3:
+                parts = line.split()
+            if len(parts) < 3:
+                raise ValueError(f"{bed_path} line {n} has fewer than 3 columns: "
+                                 f"{line.strip()[:80]!r}")
+            try:
+                start, end = int(parts[1]), int(parts[2])
+            except ValueError:
+                raise ValueError(f"{bed_path} line {n}: start and end must be integers: "
+                                 f"{line.strip()[:80]!r}") from None
+            rows.append((parts[0].strip(), start, end))
+            fourth = parts[3].strip() if len(parts) > 3 else None
+            count = _confidence(fourth)
+            counts.append(count)
+            if count is None and problem is None:
+                problem = (f"line {n} has no 4th column" if fourth is None
+                           else f"line {n} has {fourth[:60]!r} in column 4")
+    if not rows or problem is not None:
+        nums: list[float | int] = [1] * len(rows)
+    elif all(float(c).is_integer() for c in counts):
+        nums = [int(c) for c in counts]
+    else:
+        nums = [float(c) for c in counts]
+    df = pd.DataFrame({"chrom": [r[0] for r in rows], "start": [r[1] for r in rows],
+                       "end": [r[2] for r in rows], "num": nums},
+                      columns=["chrom", "start", "end", "num"])
+    return df, problem
+
+
+def read_peaks_bed(bed_path: str) -> pd.DataFrame:
+    """chrom, start, end and num from a BED file with 3 or more columns.
+
+    Only the first three columns are read, plus the 4th as the confidence
+    count num when it is a number on every line (the ChIP-Atlas
+    allintersect format, 9 columns, keeps the experiment overlap count
+    there; a fractional count is kept as it is); otherwise num is 1 for
+    every peak.  Blank, comment (#), track and browser lines are skipped,
+    and a UTF-8 byte order mark is ignored.  Raises ValueError naming the
+    line when a line has fewer than 3 columns or a start or end that is
+    not an integer.
+    """
+    return _read_peaks(bed_path)[0]
+
+
+def merge_bed_intervals(bed_path: str, min_confidence: float = 1) -> pd.DataFrame:
+    """Read a peaks BED (see read_peaks_bed), merge overlapping intervals.
+
+    A merged interval keeps the highest confidence count of its peaks and
+    is kept when that count is at least min_confidence.  With
+    min_confidence above 1 every line needs a number in column 4: otherwise
+    the threshold cannot be applied and ValueError names the first line
+    without one (rather than every peak counting 1 and failing it).
+    """
+    df, problem = _read_peaks(bed_path)
+    if min_confidence > 1 and problem is not None and len(df):
+        raise ValueError(
+            f"{bed_path} {problem}, not a number, so peak confidence >= {min_confidence:g} "
+            "cannot be applied: the confidence filter needs the count (e.g. the ChIP-Atlas "
+            "allintersect experiment count) in column 4 on every line. Use peak confidence "
+            "1 to keep every peak, or pass a BED with the count in column 4.")
     df = df.sort_values(["chrom", "start"]).reset_index(drop=True)
     merged = []
     cur_chrom = cur_start = cur_end = cur_num = None
-    for _, row in df.iterrows():
-        if cur_chrom is None or row["chrom"] != cur_chrom or row["start"] > cur_end:
+    for row in df.itertuples(index=False):
+        if cur_chrom is None or row.chrom != cur_chrom or row.start > cur_end:
             if cur_chrom is not None:
                 merged.append((cur_chrom, cur_start, cur_end, cur_num))
-            cur_chrom = row["chrom"]
-            cur_start = int(row["start"])
-            cur_end = int(row["end"])
-            cur_num = int(row["num"])
+            cur_chrom, cur_start, cur_end, cur_num = row.chrom, int(row.start), int(row.end), row.num
         else:
-            cur_end = max(cur_end, int(row["end"]))
-            cur_num = max(cur_num, int(row["num"]))
+            cur_end = max(cur_end, int(row.end))
+            cur_num = max(cur_num, row.num)
     if cur_chrom is not None:
         merged.append((cur_chrom, cur_start, cur_end, cur_num))
     out = pd.DataFrame(merged, columns=["chrom", "start", "end", "num"])
     return out[out["num"] >= min_confidence].reset_index(drop=True)
 
 
-def _bed_has_num_column(path: str) -> bool:
-    with open(path) as f:
-        for line in f:
-            if line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 4:
-                return True
-            return False
-    return False
+def vcf_index(vcf_path: str) -> Path | None:
+    """The tabix (.tbi) or CSI (.csi) index next to a VCF, or None."""
+    for suffix in (".tbi", ".csi"):
+        index = Path(str(vcf_path) + suffix)
+        if index.is_file():
+            return index
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Step 2: ClinVar variant extraction
 # ---------------------------------------------------------------------------
 
+def contig_candidates(chrom: str) -> list[str]:
+    """The names a BED chromosome may have in a VCF, most likely first.
+
+    chr1 and 1 name the same chromosome (UCSC and NCBI style), and so do
+    chrM and MT.
+    """
+    bare = chrom[3:] if chrom.startswith("chr") else chrom
+    names = [chrom, bare, "chr" + bare]
+    if bare in ("M", "MT"):
+        names += ["MT", "chrM", "M"]
+    return list(dict.fromkeys(n for n in names if n))
+
+
+def vcf_contig(chrom: str, contigs) -> str | None:
+    """The name of the BED chromosome chrom among the VCF's contigs, or None."""
+    for name in contig_candidates(chrom):
+        if name in contigs:
+            return name
+    return None
+
+
+def _fetch_peak(vcf, contigs, chrom: str, start: int, end: int) -> list:
+    """The VCF records in one peak, whichever chromosome naming the VCF uses.
+
+    With ##contig lines in the header the name is looked up there; without
+    them each candidate name is tried and an unknown one (ValueError from
+    pysam) moves on to the next.
+    """
+    names = [vcf_contig(chrom, contigs)] if contigs else contig_candidates(chrom)
+    for name in names:
+        if name is None:
+            continue
+        try:
+            return list(vcf.fetch(name, start, end))
+        except (ValueError, KeyError):
+            continue
+    return []
+
+
 def extract_clinvar_snvs(peaks: pd.DataFrame, clinvar_vcf: str) -> pd.DataFrame:
-    """Find non-coding pathogenic and benign SNVs in the given peaks."""
+    """Find non-coding pathogenic and benign SNVs in the given peaks.
+
+    The BED may name chromosomes chr1 or 1 and the VCF either way too (the
+    ClinVar VCF uses 1, 2, ..., X, MT); see contig_candidates.
+    """
     import pysam
 
     vcf = pysam.VariantFile(clinvar_vcf)
+    contigs = set(vcf.header.contigs)
     hits = []
     for peak in peaks.itertuples():
-        chrom_no_prefix = peak.chrom.replace("chr", "")
         try:
-            for rec in vcf.fetch(chrom_no_prefix, peak.start, peak.end):
+            for rec in _fetch_peak(vcf, contigs, peak.chrom, peak.start, peak.end):
                 if len(rec.ref) != 1 or any(len(a) != 1 for a in rec.alts):
                     continue
                 clnsig = rec.info.get("CLNSIG", ())
@@ -205,8 +332,25 @@ def extract_seq_pair(genome, chrom, pos, ref, alt, half_window):
     return seq, alt_seq
 
 
-def score_with_nn(df: pd.DataFrame, models: dict, genome, window: int = 24, device: str = "cuda") -> pd.DataFrame:
-    """Add NN ΔΔ columns for each model in `models` (name -> path)."""
+def model_class(model_type: str):
+    """The class tfbs.nn.models.<model_type>; SystemExit naming the choices otherwise."""
+    import tfbs.nn.models as models_mod
+
+    cls = getattr(models_mod, model_type, None)
+    if not isinstance(cls, type):
+        known = sorted(n for n in dir(models_mod)
+                       if isinstance(getattr(models_mod, n), type) and not n.startswith("_"))
+        sys.exit(f"--model-type {model_type!r} is not a model class in tfbs.nn.models "
+                 f"(known: {', '.join(known)}).")
+    return cls
+
+
+def score_with_nn(df: pd.DataFrame, models: dict, genome, window: int = 24, device: str = "cuda",
+                  model_type: str = "VCNNBpnet") -> pd.DataFrame:
+    """Add NN ΔΔ columns for each model in `models` (name -> path).
+
+    Every checkpoint is loaded as tfbs.nn.models.<model_type>.
+    """
     half = window // 2
     out_df = df.copy()
     keep_idx = []
@@ -220,17 +364,8 @@ def score_with_nn(df: pd.DataFrame, models: dict, genome, window: int = 24, devi
             keep_idx.append(i)
     out_df = df.iloc[keep_idx].reset_index(drop=True)
 
-    import tfbs.nn.models as models_mod
+    cls = model_class(model_type)
     for name, ckpt_path in models.items():
-        cls_name = "VCNNBpnet"
-        # Try common architectures; default VCNNBpnet
-        for candidate in ("VCNNBpnet", "RNN"):
-            if hasattr(models_mod, candidate):
-                cls_name = candidate
-                break
-        # If the user encoded the model class in the dict somehow, use it
-        # (defaulting to VCNNBpnet for backwards compatibility)
-        cls = getattr(models_mod, cls_name)
         m = cls.load_from_checkpoint(ckpt_path, map_location=device)
         m.eval()
         if hasattr(m, "freeze"):
@@ -379,13 +514,20 @@ def score_with_foldx(df: pd.DataFrame, genome, foldx_pdb: str, n_workers: int = 
 # Step 4: Statistics and plots
 # ---------------------------------------------------------------------------
 
+def method_label(col: str) -> str | None:
+    """The summary label of a score column: NN <name>, FIMO or FoldX; None for others."""
+    if col == "foldx_ddG":
+        return "FoldX"
+    if col == "fimo_dd":
+        return "FIMO"
+    if col.startswith("nn_") and col.endswith("_dd") and len(col) > len("nn__dd"):
+        return "NN " + col[len("nn_"):-len("_dd")]
+    return None
+
+
 def evaluate(df: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
     """Compute per-method AUC and save plots. Returns summary DataFrame."""
-    methods = []
-    for col in df.columns:
-        if col.endswith("_dd") or col == "foldx_ddG":
-            method_name = col.replace("nn_", "NN ").replace("_dd", "").replace("foldx_ddG", "FoldX")
-            methods.append((method_name.strip(), col))
+    methods = [(method_label(col), col) for col in df.columns if method_label(col)]
 
     is_path = (df["label"] == "pathogenic").astype(int).values
     summary = []
@@ -505,24 +647,42 @@ def main(argv=None):
                         help="Window size around variant for NN scoring")
     parser.add_argument("--foldx-workers", type=int, default=16)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model-type", default="VCNNBpnet",
+                        help="Class in tfbs.nn.models every --models checkpoint is loaded as")
     args = parser.parse_args(argv)
+
+    # Checks that need no data come first, so a broken setup fails at once.
+    if vcf_index(args.clinvar_vcf) is None:
+        sys.exit(f"{args.clinvar_vcf} has no tabix index ({args.clinvar_vcf}.tbi or .csi); "
+                 f"without it no variant can be read. Index it with: tabix -p vcf "
+                 f"{args.clinvar_vcf}")
+    if args.motif_file and shutil.which("fimo") is None:
+        from tfbs.pipelines import FIMO_REQUIRED
+        sys.exit(FIMO_REQUIRED)
+    if args.models:
+        model_class(args.model_type)
 
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
     print("=== Step 1: merge peaks ===")
-    peaks = merge_bed_intervals(args.peaks_bed, min_confidence=args.peak_confidence)
+    try:
+        peaks = merge_bed_intervals(args.peaks_bed, min_confidence=args.peak_confidence)
+    except ValueError as exc:
+        sys.exit(f"Cannot read --peaks-bed: {exc}")
     print(f"Peaks at confidence >= {args.peak_confidence}: {len(peaks):,}")
 
     print("\n=== Step 2: extract ClinVar SNVs ===")
     df = extract_clinvar_snvs(peaks, args.clinvar_vcf)
+    if len(df) == 0:
+        sys.exit(f"No ClinVar variants found in the {len(peaks):,} peaks at confidence >= "
+                 f"{args.peak_confidence}. Check that the VCF is indexed and on the same "
+                 "genome build as the peaks and that it holds the BED's chromosomes "
+                 "(chr1 in the BED finds 1 or chr1 in the VCF, and the other way round), "
+                 "and lower --peak-confidence if few peaks pass it.")
     print(f"Variants: {len(df)} ({(df['label']=='pathogenic').sum()} pathogenic, "
           f"{(df['label']=='benign').sum()} benign)")
     df.to_csv(output / "clinvar_snvs.csv", index=False)
-
-    if len(df) == 0:
-        print("No variants found. Exiting.")
-        return
 
     genome = pyfaidx.Fasta(args.genome)
 
@@ -535,7 +695,8 @@ def main(argv=None):
                 continue
             name, path = spec.split("=", 1)
             models[name] = path
-        df = score_with_nn(df, models, genome, window=args.nn_window, device=args.device)
+        df = score_with_nn(df, models, genome, window=args.nn_window, device=args.device,
+                           model_type=args.model_type)
         print(f"After NN scoring: {len(df)} variants")
 
     if args.motif_file:

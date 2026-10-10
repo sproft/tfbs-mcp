@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import warnings
 from collections import deque
@@ -145,22 +146,83 @@ def _resolve_device(device: str | None, slurm_gpu: bool | None = None) -> str:
 # Every MCP tool call passes through the tool manager, so one wrapper there
 # covers all 33 tools (including the FoldX tools registered later).
 # ---------------------------------------------------------------------------
-def _append_call_log(tool: str, arguments: dict[str, Any]) -> None:
-    """Append one JSON line {timestamp, tool, arguments} to $TFBS_CALL_LOG."""
+# A result whose JSON is larger than this is logged as its size and first
+# characters only, so one huge answer cannot swell the log.
+CALL_LOG_MAX_RESULT_BYTES = 1024 * 1024
+CALL_LOG_HEAD_CHARS = 4096
+
+
+def _call_result_text(result: Any) -> str | None:
+    """The text a tool call returned, from any form the tool manager hands back.
+
+    Without conversion a tool returns its own value (a JSON string here);
+    with it, a list of content blocks, or a (content, structured) tuple when
+    the tool has an output schema.
+    """
+    if isinstance(result, tuple) and result:
+        result = result[0]
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (list, tuple)) and result:
+        texts = [getattr(block, "text", None) for block in result]
+        if all(isinstance(t, str) for t in texts):
+            return "\n".join(texts)
+    return None
+
+
+def _call_log_result(result: Any) -> tuple[Any, bool]:
+    """(logged result, is_error) for one tool call's return value.
+
+    The logged result is the parsed JSON, {"text": ...} when the return value
+    is not JSON, or {"truncated": true, "bytes": N, "head": ...} when the
+    returned text exceeds CALL_LOG_MAX_RESULT_BYTES (UTF-8).  The size is
+    checked on the text before it is parsed, so a large answer is never
+    parsed or serialised again just to be cut; its is_error is read from
+    the head (an error answer starts with {"error": ...).
+    """
+    text = _call_result_text(result)
+    if text is None:
+        text = str(result)
+    if len(text) > CALL_LOG_MAX_RESULT_BYTES or (
+            4 * len(text) > CALL_LOG_MAX_RESULT_BYTES
+            and len(text.encode("utf-8")) > CALL_LOG_MAX_RESULT_BYTES):
+        head = text[:CALL_LOG_HEAD_CHARS]
+        is_error = re.match(r'\s*\{\s*"error"\s*:', head) is not None
+        return {"truncated": True, "bytes": len(text.encode("utf-8")), "head": head}, is_error
+    try:
+        parsed: Any = json.loads(text)
+    except ValueError:
+        parsed = {"text": text}
+    is_error = isinstance(parsed, dict) and "error" in parsed
+    return parsed, is_error
+
+
+def _append_call_log(tool: str, arguments: dict[str, Any], started: datetime,
+                     seconds: float, result: Any, is_error: bool) -> None:
+    """Append one JSON line per finished call to $TFBS_CALL_LOG.
+
+    The line holds timestamp (start of the call, UTC), tool, arguments as
+    received, seconds (wall time), is_error and result.  A failure to write
+    is logged as a warning and never reaches the caller.
+    """
     target = os.environ.get(CALL_LOG_ENV, "").strip()
     if not target:
         return
-    record = {
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-        "tool": tool,
-        "arguments": arguments,
-    }
     try:
+        record = {
+            "timestamp": started.isoformat(timespec="milliseconds"),
+            "tool": tool,
+            "arguments": arguments,
+            "seconds": round(seconds, 3),
+            "is_error": bool(is_error),
+            "result": result,
+        }
+        line = json.dumps(record, default=str, ensure_ascii=False) + "\n"
         path = Path(target).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8", newline="\n") as f:
-            f.write(json.dumps(record, default=str) + "\n")
-    except OSError as exc:
+            f.write(line)
+    except Exception as exc:  # logging must never break a tool call
         logger.warning("Could not append to %s (%s): %s", target, CALL_LOG_ENV, exc)
 
 
@@ -200,11 +262,30 @@ async def _call_tool_hook(
     context: Any = None,
     convert_result: bool = False,
 ) -> Any:
-    _append_call_log(name, arguments)
-    with _stdout_to_stderr():
-        return await _tool_manager_call_tool(
-            name, arguments, context=context, convert_result=convert_result,
-        )
+    started = datetime.now(timezone.utc)
+    t0 = time.perf_counter()
+    try:
+        with _stdout_to_stderr():
+            result = await _tool_manager_call_tool(
+                name, arguments, context=context, convert_result=convert_result,
+            )
+    except BaseException as exc:
+        # Logged, then raised unchanged: the MCP layer reports it as before.
+        try:
+            message = f"{type(exc).__name__}: {exc}"
+        except Exception:  # an exception whose __str__ itself raises
+            message = type(exc).__name__
+        _append_call_log(name, arguments, started, time.perf_counter() - t0,
+                         {"error": message}, True)
+        raise
+    seconds = time.perf_counter() - t0
+    if os.environ.get(CALL_LOG_ENV, "").strip():
+        try:
+            logged, is_error = _call_log_result(result)
+        except Exception as exc:  # logging must never break a tool call
+            logged, is_error = {"error": f"result not loggable: {exc}"}, False
+        _append_call_log(name, arguments, started, seconds, logged, is_error)
+    return result
 
 
 mcp._tool_manager.call_tool = _call_tool_hook
@@ -330,13 +411,73 @@ def _pipeline_requirements_error(name: str, tool: str) -> str | None:
     return _error(f"{tool} needs {', '.join(missing)}, which is not installed.", fix)
 
 
-def _run_pipeline(cmd: list[str], cwd: Path, timeout: int, label: str):
-    """Run a pipeline in a subprocess: (CompletedProcess, None) or (None, error JSON)."""
+def _pipeline_popen_kwargs(cwd: Path) -> dict[str, Any]:
+    """Popen arguments of a pipeline run: no stdin, piped UTF-8 output, own process group."""
+    return {
+        "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+        "text": True, "encoding": "utf-8", "errors": "replace", "cwd": str(cwd),
+        "env": {**_pipeline_env(), "PYTHONIOENCODING": "utf-8"}, **_new_process_group(),
+    }
+
+
+def _spawn_pipeline(cmd: list[str], cwd: Path):
+    """Start a pipeline process (tests replace this with a fake process)."""
+    return subprocess.Popen(cmd, **_pipeline_popen_kwargs(cwd))
+
+
+class _PipelineRun:
+    """The process of one direct-mode pipeline run, shared with its worker thread."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.proc = None
+        self.cancelled = False
+
+    def start(self, cmd: list[str], cwd: Path):
+        with self.lock:
+            if self.cancelled:
+                raise subprocess.SubprocessError("cancelled before it started")
+            self.proc = _spawn_pipeline(cmd, cwd)
+            return self.proc
+
+    def cancel(self):
+        """Mark the run cancelled; the process to stop, if it has started."""
+        with self.lock:
+            self.cancelled = True
+            return self.proc
+
+
+def _pipeline_blocking(cmd: list[str], cwd: Path, timeout: int,
+                       run: _PipelineRun) -> subprocess.CompletedProcess:
+    """Run the pipeline to the end (in a worker thread); kills its group on timeout."""
+    proc = run.start(cmd, cwd)
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout,
-            cwd=str(cwd), env=_pipeline_env(),
-        )
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            proc.communicate(timeout=30)
+        except Exception:
+            pass
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout or "", stderr or "")
+
+
+async def _run_pipeline(cmd: list[str], cwd: Path, timeout: int, label: str):
+    """Run a pipeline in a subprocess: (CompletedProcess, None) or (None, error JSON).
+
+    The process runs in a worker thread, so the server keeps answering
+    other calls meanwhile; when the MCP call is cancelled, the pipeline's
+    whole process group (process tree on Windows) is killed.
+    """
+    run = _PipelineRun()
+    try:
+        result = await asyncio.to_thread(_pipeline_blocking, cmd, cwd, timeout, run)
+    except asyncio.CancelledError:
+        proc = run.cancel()
+        if proc is not None:
+            await asyncio.shield(asyncio.to_thread(_stop_process_group, proc))
+        raise
     except subprocess.TimeoutExpired:
         return None, _error(
             f"{label} timed out after {timeout} s.",
@@ -378,6 +519,37 @@ def _resolve_reference(value: str | None, arg: str) -> tuple[Path | None, str | 
             "fix": f"Check the {arg} argument or the {env_var} environment variable.",
         })
     return path, None
+
+
+def _optional_reference(value: str | None, arg: str) -> tuple[Path | None, str | None]:
+    """Like _resolve_reference for data a tool can do without.
+
+    (None, None) when neither the argument nor its environment variable
+    names a file (the step that needs it is skipped); otherwise the result
+    of _resolve_reference, so a configured path that does not exist is
+    still an error.
+    """
+    if not (value or "").strip() and not os.environ.get(REFERENCE_DATA_ENV[arg], "").strip():
+        return None, None
+    return _resolve_reference(value, arg)
+
+
+def _fimo_binary_error(tool: str, skip_hint: str) -> str | None:
+    """Error JSON when the MEME Suite's fimo program is not on PATH, else None.
+
+    The ReMap and ClinVar validation pipelines run fimo for their FIMO leg
+    and, unlike tfbs_fimo, have no tangermeme/memelite fallback.
+    """
+    if shutil.which("fimo") is not None:
+        return None
+    return _error(
+        f"{tool} runs the MEME Suite's fimo program for its FIMO leg, and fimo is "
+        "not on the PATH of the MCP server. This pipeline has no fallback: the "
+        "tangermeme/memelite FIMO reimplementation is used only by tfbs_fimo.",
+        "Install the MEME Suite (https://meme-suite.org/meme/doc/download.html, or "
+        "conda install -c bioconda meme), put its bin directory on the PATH of the "
+        f"MCP server and restart it{skip_hint}.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +862,56 @@ def _tail_file(path: str, n: int = 100) -> str:
 # ---------------------------------------------------------------------------
 def _error(error: str, fix: str, **extra: Any) -> str:
     return json.dumps({"error": error, "fix": fix, **extra})
+
+
+def _available_model_types() -> list[str]:
+    """The model classes of tfbs.nn.models a model_type may name."""
+    _ensure_imports()
+    return sorted(
+        n for n in dir(_models)
+        if isinstance(getattr(_models, n, None), type)
+        and issubclass(getattr(_models, n), _torch.nn.Module)
+        and n != "BaseModel" and not n.startswith("_")
+        and getattr(_models, n).__module__ == _models.__name__
+    )
+
+
+def _model_type_error(model_type: str) -> str | None:
+    """{error, fix} JSON when model_type names no model class in tfbs.nn.models.
+
+    Checked before a pipeline runs or is submitted, so an unknown class
+    fails at once instead of when the SLURM job starts.
+    """
+    _ensure_imports()
+    model_cls = getattr(_models, str(model_type), None)
+    if isinstance(model_cls, type) and issubclass(model_cls, _torch.nn.Module):
+        return None
+    available = _available_model_types()
+    return _error(f"Unknown model_type '{model_type}'.",
+                  f"Use one of: {available}.", available=available)
+
+
+def _mkdir_error(path: Path, param: str = "output_dir") -> str | None:
+    """Create the directory path (and its parents); {error, fix} JSON when that fails.
+
+    Every tool that writes into a directory it was given creates it through
+    this, so a path naming an existing file, or one the server cannot write
+    to, comes back as an error instead of an exception.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if path.exists() and not path.is_dir():
+            reason = "a file of that name already exists"
+        else:
+            reason = exc.strerror or str(exc)
+        return _error(
+            f"Cannot create the directory {path} ({param}): {reason}.",
+            f"Check {param}: it must lead to a directory the server can create and write "
+            "to (an existing directory, or a path that does not exist yet), not to an "
+            "existing file.",
+        )
+    return None
 
 
 def _results_root() -> Path:
@@ -1368,16 +1590,9 @@ async def tfbs_load_model(
                       "that tfbs_config reported.")
 
     model_cls = getattr(_models, model_type, None)
-    if not (isinstance(model_cls, type) and issubclass(model_cls, _torch.nn.Module)):
-        available = sorted(
-            n for n in dir(_models)
-            if isinstance(getattr(_models, n, None), type)
-            and issubclass(getattr(_models, n), _torch.nn.Module)
-            and n != "BaseModel" and not n.startswith("_")
-            and getattr(_models, n).__module__ == _models.__name__
-        )
-        return _error(f"Unknown model_type '{model_type}'.",
-                      f"Use one of: {available}.", available=available)
+    err = _model_type_error(model_type)
+    if err:
+        return err
 
     ckpt = _load_weights_only(path)
     extra: dict[str, Any] = {}
@@ -1778,7 +1993,9 @@ async def tfbs_preprocess(
         out = Path(output_path).expanduser().resolve()
     else:
         out = _results_root() / "tfbs_preprocess" / _digest(sequences, labels, add_rc)
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_path")
+    if mkdir_err:
+        return mkdir_err
     files = {"seqs": str(out / "seqs.pt")}
     _torch.save(X, out / "seqs.pt")
     if y is not None:
@@ -1953,7 +2170,9 @@ async def tfbs_analyze(
                     "hypothetical": hypothetical}
 
     avg = avg.detach().cpu()
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
     attr_file = out / "attributions.pt"
     _torch.save(avg, attr_file)
 
@@ -2082,7 +2301,9 @@ async def tfbs_mutagenesis(
         raw_outputs=raw_outputs,
         device=device,
     )
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
     inline = sequences is not None
     inverse = _inverse_scaling(entry, None)
     scale = _delta_scale(entry) if inverse else 1.0
@@ -2555,7 +2776,9 @@ async def tfbs_fimo(
                 else _results_root() / "fimo" / _digest(
                     [s.upper() for s in sequences], _file_identity(str(motif_path)),
                     float(threshold)))
-    work_dir.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(work_dir, "output_dir")
+    if mkdir_err:
+        return mkdir_err
     fasta_path = work_dir / "input.fasta"
     with open(fasta_path, "w", newline="\n") as f:
         for i, seq in enumerate(sequences):
@@ -2655,7 +2878,9 @@ async def tfbs_server_info() -> str:
         default_partition ($TFBS_SLURM_PARTITION, else "gpu"; used by the
         SLURM tools unless a call passes partition=...), gpu_count,
         default_device, default_batch_size, call_log (the $TFBS_CALL_LOG
-        file, or null), results_dir (where the model-analysis tools write
+        file, or null; when set, every tool call appends one JSON line
+        with its timestamp, tool, arguments, seconds, is_error and result),
+        results_dir (where the model-analysis tools write
         when called without output_dir: <project root>/results for a
         checkout or $TFBS_PROJECT_ROOT, else tfbs_results/ in the server's
         working directory), project_root (working directory of the
@@ -2932,8 +3157,13 @@ async def slurm_logs(
 ) -> str:
     """Read stdout and/or stderr log files for a SLURM job.
 
-    Uses sacct to locate the log file paths, then reads the last
-    ``tail`` lines from each requested file.
+    Finds each log file in this order, taking the first that exists:
+    the StdOut/StdErr path sacct reports (with %j, %x and %% expanded
+    and a relative path joined to the job's WorkDir); the StdOut=/StdErr=
+    path of ``scontrol show job`` (which knows recent jobs only); then
+    <WorkDir>/<JobName>_<job_id>.out (.err for stderr), the names
+    tfbs_train's scripts use.  Then it reads the last ``tail`` lines of
+    each requested file.
 
     Args:
         job_id: The SLURM job ID whose logs to read.
@@ -2941,52 +3171,148 @@ async def slurm_logs(
         tail: Number of lines to read from the end of each log file.
 
     Returns:
-        JSON with job_id, log_paths dict, and the content of requested
-        log files.  Missing files are reported with an error message.
+        JSON with job_id, log_paths ({stdout, stderr}: the file found, or
+        the best candidate when none exists, or null), log_sources (where
+        each path came from: "sacct", "scontrol" or "default name"), and
+        the content of the requested logs.  A file that is not found is
+        reported in place of its content; neither sacct nor scontrol on
+        PATH returns an error.
     """
-    stdout_path = None
-    stderr_path = None
+    if log_type not in ("stdout", "stderr", "both"):
+        return _error(f"Unknown log_type {log_type!r}.",
+                      'Pass log_type "stdout", "stderr" or "both".')
+    sacct, sacct_ok = _sacct_job_fields(job_id)
+    scontrol: dict[str, str] | None = None
+    scontrol_ok = True
 
-    try:
-        sa = subprocess.run(
-            [
-                "sacct", "-j", job_id, "--noheader", "--parsable2",
-                "--format=JobID,WorkDir,StdOut,StdErr",
-            ],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+    log_paths: dict[str, str | None] = {"stdout": None, "stderr": None}
+    log_sources: dict[str, str | None] = {"stdout": None, "stderr": None}
+    for stream, key, suffix in (("stdout", "StdOut", ".out"), ("stderr", "StdErr", ".err")):
+        if log_type not in (stream, "both"):
+            continue
+        candidates: list[tuple[str, Path]] = []
+        path = _slurm_log_path(sacct.get(key), sacct.get("WorkDir"), job_id, sacct.get("JobName"))
+        if path is not None:
+            candidates.append(("sacct", path))
+        if not any(c.is_file() for _, c in candidates):
+            if scontrol is None:
+                scontrol, scontrol_ok = _scontrol_job_fields(job_id)
+            work_dir = scontrol.get("WorkDir") or sacct.get("WorkDir")
+            job_name = scontrol.get("JobName") or sacct.get("JobName")
+            path = _slurm_log_path(scontrol.get(key), work_dir, job_id, job_name)
+            if path is not None:
+                candidates.append(("scontrol", path))
+            if work_dir and job_name:
+                candidates.append(("default name", Path(work_dir) / f"{job_name}_{job_id}{suffix}"))
+        found = next(((src, c) for src, c in candidates if c.is_file()), None)
+        source, path = found or (candidates[0] if candidates else (None, None))
+        log_paths[stream] = str(path) if path is not None else None
+        log_sources[stream] = source
+
+    if not sacct_ok and not scontrol_ok:
+        return _error(
+            "Neither sacct nor scontrol is available (not on PATH, or timed out).",
+            "Run slurm_logs on a cluster login node where sacct or scontrol is on "
+            "PATH, or read the job's --output/--error files directly.",
         )
-        for raw_line in sa.stdout.strip().splitlines():
-            parts = raw_line.split("|")
-            # Filter to main job line (skip .batch / .extern steps)
-            if parts and parts[0].strip() == job_id:
-                stdout_path = parts[2].strip() if len(parts) > 2 else None
-                stderr_path = parts[3].strip() if len(parts) > 3 else None
-                break
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return json.dumps({
-            "error": "sacct not available or timed out",
-            "fix": "Run slurm_logs on a cluster login node where sacct is on "
-                   "PATH, or read the job's --output/--error files directly.",
-        })
 
-    log_paths: dict[str, str | None] = {
-        "stdout": stdout_path,
-        "stderr": stderr_path,
-    }
-    result: dict[str, Any] = {"job_id": job_id, "log_paths": log_paths}
-
-    if log_type in ("stdout", "both") and stdout_path:
-        result["stdout"] = _tail_file(stdout_path, tail)
-    if log_type in ("stderr", "both") and stderr_path:
-        result["stderr"] = _tail_file(stderr_path, tail)
-
-    # Handle case where paths were not found
-    if log_type in ("stdout", "both") and not stdout_path:
-        result["stdout"] = "[stdout path not found in sacct output]"
-    if log_type in ("stderr", "both") and not stderr_path:
-        result["stderr"] = "[stderr path not found in sacct output]"
-
+    result: dict[str, Any] = {"job_id": job_id, "log_paths": log_paths,
+                              "log_sources": log_sources}
+    for stream in ("stdout", "stderr"):
+        if log_type not in (stream, "both"):
+            continue
+        if log_paths[stream]:
+            result[stream] = _tail_file(log_paths[stream], tail)
+        else:
+            result[stream] = f"[{stream} path not found in sacct or scontrol output]"
     return json.dumps(result)
+
+
+def _expand_slurm_pattern(pattern: str, job_id: str, job_name: str | None) -> str:
+    """%j (job ID), %x (job name) and %% in a SLURM --output/--error pattern."""
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        if pattern[i] == "%" and i + 1 < len(pattern):
+            code = pattern[i + 1]
+            if code == "j":
+                out.append(job_id)
+                i += 2
+                continue
+            if code == "x" and job_name:
+                out.append(job_name)
+                i += 2
+                continue
+            if code == "%":
+                out.append("%")
+                i += 2
+                continue
+        out.append(pattern[i])
+        i += 1
+    return "".join(out)
+
+
+def _slurm_log_path(raw: str | None, work_dir: str | None, job_id: str,
+                    job_name: str | None) -> Path | None:
+    """A reported StdOut/StdErr as a path: patterns expanded, relative paths under WorkDir."""
+    raw = (raw or "").strip()
+    if not raw or raw.lower() in ("(null)", "none", "/dev/null"):
+        return None
+    path = Path(_expand_slurm_pattern(raw, job_id, job_name)).expanduser()
+    if not path.is_absolute():
+        if not work_dir:
+            # Relative to a WorkDir nobody reported: resolving it against the
+            # server's own working directory could read an unrelated file.
+            return None
+        path = Path(work_dir) / path
+    return path
+
+
+def _sacct_job_fields(job_id: str) -> tuple[dict[str, str], bool]:
+    """({JobName, WorkDir, StdOut, StdErr}, sacct ran) for the job's main line.
+
+    sacct releases without the StdOut and StdErr fields reject them, so a
+    second query asks for JobName and WorkDir only.
+    """
+    ran = False
+    for fields in (("JobID", "JobName", "WorkDir", "StdOut", "StdErr"),
+                   ("JobID", "JobName", "WorkDir")):
+        try:
+            sa = subprocess.run(
+                ["sacct", "-j", job_id, "--noheader", "--parsable2",
+                 f"--format={','.join(fields)}"],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {}, ran
+        ran = True
+        for raw_line in (sa.stdout or "").strip().splitlines():
+            parts = raw_line.split("|")
+            # The main job line, not its .batch / .extern steps.
+            if parts and parts[0].strip() == job_id:
+                return {f: parts[n].strip() for n, f in enumerate(fields)
+                        if n < len(parts) and n > 0 and parts[n].strip()}, ran
+    return {}, ran
+
+
+def _scontrol_job_fields(job_id: str) -> tuple[dict[str, str], bool]:
+    """({JobName, WorkDir, StdOut, StdErr}, scontrol ran) from ``scontrol show job``."""
+    try:
+        sc = subprocess.run(["scontrol", "show", "job", job_id], capture_output=True,
+                            text=True, stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}, False
+    fields: dict[str, str] = {}
+    text = sc.stdout or ""
+    name = re.search(r"\bJobName=(\S+)", text)
+    if name:
+        fields["JobName"] = name.group(1)
+    for line in text.splitlines():
+        line = line.strip()
+        for key in ("WorkDir", "StdOut", "StdErr"):
+            if line.startswith(key + "="):
+                fields[key] = line[len(key) + 1:].strip()
+    return fields, True
 
 
 # ---------------------------------------------------------------------------
@@ -3144,6 +3470,8 @@ async def tfbs_train(
     extra_args: list[str] | None = None,
     local: bool = False,
     local_timeout: int = 3600,
+    cpus_per_task: int | None = None,
+    mem: str | None = None,
 ) -> str:
     """Train a TFBS model: submit a SLURM job, or train on this machine.
 
@@ -3193,10 +3521,27 @@ async def tfbs_train(
                        its own, and that whole group (the process tree,
                        on Windows) is killed after that, and also when
                        the MCP call is cancelled.
+        cpus_per_task: CPUs the SLURM job requests (config mode,
+                       #SBATCH --cpus-per-task).  Default: the config's
+                       data.num_workers (the DataLoader worker processes;
+                       an extra_args --data.num_workers overrides it)
+                       plus 1 for the main training process, so 24
+                       workers request 25 CPUs.
+        mem: Memory the SLURM job requests (config mode, #SBATCH --mem),
+             a number of at least 1 with an optional K, M, G or T
+             suffix, e.g. "64G" ("0" is refused: SLURM reads --mem=0 as
+             all of the node's memory).
+             Default null: no --mem line, so the cluster's default
+             memory per CPU or node applies.
 
     Returns:
         JSON with mode, job_id, submit_command, and (for config mode)
-        the generated sbatch script content.  Local mode returns mode
+        the generated sbatch script content as generated_script, plus
+        config_path, checkpoint_path (where the job's ModelCheckpoint
+        writes, <dirpath>/<filename>.ckpt from the config, relative
+        paths against the config's directory, which is the job's working
+        directory; null when the config names none), cpus_per_task and
+        mem as requested.  Local mode returns mode
         "local", command (the argv list), exit_code, log_path, log_tail
         (last 20 lines), checkpoint_path and checkpoint_exists (from the
         config's ModelCheckpoint dirpath and filename; true only for a
@@ -3272,6 +3617,37 @@ async def tfbs_train(
         return await _train_locally(config_p, tokens, local_timeout)
     if shutil.which("sbatch") is None:
         return _no_sbatch_for_training()
+    if cpus_per_task is not None and cpus_per_task < 1:
+        return _error(f"cpus_per_task must be at least 1, got {cpus_per_task}.",
+                      "Pass the number of CPUs the job needs, or omit it to use the "
+                      "config's data.num_workers.")
+    mem_match = re.fullmatch(r"(\d+)[KMGTkmgt]?", mem.strip()) if mem is not None else None
+    if mem is not None and (mem_match is None or int(mem_match.group(1)) < 1):
+        return _error(f"Cannot read mem {mem!r}." if mem_match is None
+                      else f"mem must be at least 1, got {mem!r}.",
+                      'Pass a number of at least 1 with an optional K, M, G or T suffix, '
+                      'e.g. "64G", or omit it to leave the memory to the cluster default '
+                      "(--mem=0 would ask SLURM for all of the node's memory).")
+
+    import yaml
+
+    try:
+        with open(config_p, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        return _error(f"Could not read the config {config_p}: {exc}",
+                      "Pass a Lightning CLI YAML config, e.g. from tfbs_config.")
+    config = config if isinstance(config, dict) else {}
+    try:
+        target = _checkpoint_target(config, config_p.parent)
+    except (ValueError, OSError) as exc:
+        return _error(f"The config {config_p} is not a usable Lightning CLI config: {exc}.",
+                      "Write trainer, and the init_args of its ModelCheckpoint, as YAML "
+                      "mappings (key: value), as tfbs_config does.")
+    if cpus_per_task is None:
+        # The DataLoader workers plus the main training process.
+        cpus_per_task = max(0, _config_num_workers(config, tokens) or 0) + 1
+    mem = mem.strip().upper() if mem is not None else None
 
     if job_name is None:
         job_name = f"tfbs_train_{config_p.stem}"
@@ -3287,6 +3663,7 @@ async def tfbs_train(
         sys.executable, "-m", "tfbs.cli.train_cli", "fit", "--config", str(config_p),
         *tokens,
     ])
+    mem_line = f"#SBATCH --mem={mem}\n" if mem else ""
 
     sbatch_content = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
@@ -3296,7 +3673,8 @@ async def tfbs_train(
 #SBATCH --output={job_name}_%j.out
 #SBATCH --error={job_name}_%j.err
 #SBATCH --ntasks=1
-
+#SBATCH --cpus-per-task={cpus_per_task}
+{mem_line}
 {_sbatch_pythonpath_line()}{train_cmd}
 """
 
@@ -3311,7 +3689,30 @@ async def tfbs_train(
     result_dict = json.loads(result)
     result_dict["mode"] = "config"
     result_dict["generated_script"] = sbatch_content
+    result_dict["config_path"] = str(config_p)
+    result_dict["checkpoint_path"] = str(target) if target else None
+    result_dict["cpus_per_task"] = cpus_per_task
+    result_dict["mem"] = mem
     return json.dumps(result_dict)
+
+
+def _config_num_workers(config: dict, tokens: list[str]) -> int | None:
+    """data.num_workers of a Lightning CLI config, as the training run will see it.
+
+    An extra_args --data.num_workers N (or =N) overrides the config's value.
+    None when neither gives an integer.
+    """
+    data = config.get("data")
+    value: Any = data.get("num_workers") if isinstance(data, dict) else None
+    for i, token in enumerate(tokens):
+        if token == "--data.num_workers" and i + 1 < len(tokens):
+            value = tokens[i + 1]
+        elif token.startswith("--data.num_workers="):
+            value = token.split("=", 1)[1]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _argv_tokens(arg: str, posix: bool | None = None) -> tuple[list[str], str | None]:
@@ -3945,7 +4346,9 @@ async def tfbs_validate(
 
     csv_path = (Path(output_file) if output_file
                 else _results_root() / "validation_results.csv").resolve()
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(csv_path.parent, "output_file")
+    if mkdir_err:
+        return mkdir_err
     output_file = str(csv_path)
     log_stem = csv_path.parent / "validate"
 
@@ -4397,7 +4800,9 @@ async def tfbs_config(
         out = Path(output_path).expanduser().resolve()
     else:
         out = _sibling_dir(data / "train", "config") / f"{model_type}.yaml"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out.parent, "output_path")
+    if mkdir_err:
+        return mkdir_err
     with open(out, "w", newline="\n") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -4620,7 +5025,9 @@ async def tfbs_extract_loci(
         )
         if isinstance(peaks, str):
             return peaks
-        out.mkdir(parents=True, exist_ok=True)
+        mkdir_err = _mkdir_error(out, "output_dir")
+        if mkdir_err:
+            return mkdir_err
         X_pos = _one_hot(peaks["seqs"])
         files["sequences"] = str(out / "sequences.pt")
         _torch.save(X_pos, files["sequences"])
@@ -4671,7 +5078,9 @@ async def tfbs_extract_loci(
             result["negatives_path"] = files["negatives"]
 
     if variants:
-        out.mkdir(parents=True, exist_ok=True)
+        mkdir_err = _mkdir_error(out, "output_dir")
+        if mkdir_err:
+            return mkdir_err
         var = _extract_variant_windows(genome, chrom_lengths, variants, in_window)
         manifest = {
             "genome_fasta": str(genome_path),
@@ -5062,6 +5471,9 @@ async def tfbs_prepare_dataset(
         train_idx, test_size=n_val, shuffle=True, random_state=random_seed,
     )
 
+    mkdir_err = _mkdir_error(out_dir, "output_dir")
+    if mkdir_err:
+        return mkdir_err
     files: dict[str, str] = {}
 
     def _save_split(split_name, idx):
@@ -5195,7 +5607,9 @@ async def tfbs_prepare_classification(
     labels = labels[perm]
 
     out = Path(output_dir).expanduser().resolve() if output_dir else _sibling_dir(pos_p, "classification")
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
     _torch.save(seqs, out / "sequences.pt")
     _torch.save(labels, out / "labels.pt")
 
@@ -5310,7 +5724,9 @@ async def tfbs_prepare_regression(
     stats_after = _stats(scores)
 
     out = Path(output_dir).expanduser().resolve() if output_dir else _sibling_dir(seqs_p, "regression")
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
     _torch.save(seqs, out / "sequences.pt")
     _torch.save(scores, out / "labels.pt")
 
@@ -5529,7 +5945,9 @@ async def tfbs_seqlets(
                 matched = []
                 result["annotation_error"] = str(e)
 
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
     table = seqlets[columns].copy()
     if matched:
         table["motif"] = [name or "" for name, _ in matched]
@@ -5697,7 +6115,9 @@ async def tfbs_epistasis(
 
     import csv as _csv
     out = _analysis_dir(output_dir, model_id, "tfbs_epistasis", sequence, pos)
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
     result["output_dir"] = str(out)
     singles_csv = out / "single_mutations.csv"
     with open(singles_csv, "w", newline="") as f:
@@ -5827,7 +6247,9 @@ async def tfbs_conv_filters(
 
     out = _analysis_dir(output_dir, model_id, "tfbs_conv_filters",
                         sequences, top_n_filters, top_k_subsequences)
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
 
     activations: dict[str, Any] = {}
     reads_input: dict[str, bool] = {}
@@ -6269,7 +6691,9 @@ async def tfbs_chipseq_benchmark(
         return err
 
     out = Path(output_dir).resolve()
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
 
     device = _resolve_device(device, slurm_gpu=True if slurm else None)
 
@@ -6318,7 +6742,7 @@ async def tfbs_chipseq_benchmark(
             submit_result["warning"] = ckpt_warning
         return json.dumps(submit_result)
 
-    result, err = _run_pipeline(cmd_parts, project_root, 3600, "Benchmark")
+    result, err = await _run_pipeline(cmd_parts, project_root, 3600, "Benchmark")
     if err:
         return err
 
@@ -6469,7 +6893,9 @@ async def tfbs_chipseq_method_comparison(
         return err
 
     out = Path(output_dir).resolve()
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
 
     device = _resolve_device(device, slurm_gpu=True if slurm else None)
 
@@ -6521,7 +6947,7 @@ async def tfbs_chipseq_method_comparison(
             submit_result["warning"] = ckpt_warning
         return json.dumps(submit_result)
 
-    result, err = _run_pipeline(cmd_parts, project_root, 43200, "Method comparison")
+    result, err = await _run_pipeline(cmd_parts, project_root, 43200, "Method comparison")
     if err:
         return err
     if result.returncode != 0:
@@ -6601,7 +7027,11 @@ async def tfbs_remap_validation(
         output_dir: Where the script writes summary.csv, the two scores
             CSVs, and roc_all_methods.png.
         motif_file: JASPAR / MEME motif file for FIMO. Falls back to
-            $TFBS_MOTIF_FILE.
+            $TFBS_MOTIF_FILE.  The FIMO leg always runs and needs the
+            MEME Suite's fimo program on the server's PATH (also on the
+            compute node for slurm=true); without it the call returns an
+            error before anything runs or is submitted.  The tangermeme
+            fallback of tfbs_fimo does not apply here.
         foldx_pdb: Repaired TF-DNA complex PDB for FoldX scoring.
             Falls back to $TFBS_FOLDX_PDB. Not required when
             skip_foldx is true.
@@ -6611,7 +7041,8 @@ async def tfbs_remap_validation(
         negative_mode: "shuffle" for dinucleotide-shuffled positives or
             "genomic" for length+GC matched random regions.
         datasets: NN dataset names (subdirectories of models_dir).
-        model_type: Model architecture class name.
+        model_type: Model architecture class name in tfbs.nn.models; an
+            unknown one is an error before anything runs or is submitted.
         models_dir: Base checkpoint directory; a relative path resolves
             against the project root (TFBS_PROJECT_ROOT, see
             tfbs_server_info), where the pipeline runs.  Each dataset's
@@ -6673,7 +7104,13 @@ async def tfbs_remap_validation(
         if err:
             return err
 
+    err = _fimo_binary_error("tfbs_remap_validation", "")
+    if err:
+        return err
     err = _pipeline_requirements_error("remap_validation", "tfbs_remap_validation")
+    if err:
+        return err
+    err = _model_type_error(model_type)
     if err:
         return err
     project_root, err = _work_dir()
@@ -6686,7 +7123,9 @@ async def tfbs_remap_validation(
         return err
 
     out = Path(output_dir).resolve()
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
 
     device = _resolve_device(device, slurm_gpu=True if slurm else None)
 
@@ -6746,7 +7185,7 @@ async def tfbs_remap_validation(
             submit_result["warning"] = ckpt_warning
         return json.dumps(submit_result)
 
-    result, err = _run_pipeline(cmd_parts, project_root, 43200, "ReMap validation")
+    result, err = await _run_pipeline(cmd_parts, project_root, 43200, "ReMap validation")
     if err:
         return err
     if result.returncode != 0:
@@ -6818,6 +7257,7 @@ async def tfbs_disease_variant_validation(
     slurm: bool = False,
     partition: str = "compute",
     max_time: str = "06:00:00",
+    model_type: str = "VCNNBpnet",
 ) -> str:
     """Validate TF-binding models against ClinVar disease variants.
 
@@ -6832,21 +7272,43 @@ async def tfbs_disease_variant_validation(
        variants (ROC-AUC, Mann-Whitney U).
 
     Args:
-        peaks_bed: Path to a BED file of TF binding peaks. Accepts the
-            ChIP-Atlas allintersect format (4th column = experiment
-            overlap count) or any BED with 3+ columns.
+        peaks_bed: Path to a BED file of TF binding peaks with 3 or more
+            tab-separated columns.  Only chrom, start and end are read,
+            plus the 4th column as the confidence count when it is a
+            number on every line: the 9-column ChIP-Atlas allintersect
+            format keeps the experiment overlap count there.  Otherwise
+            every peak counts 1.
         output_dir: Directory to write results, plots, and summary CSV.
-        clinvar_vcf: Indexed ClinVar VCF (.vcf.gz with .tbi). Falls
-            back to $TFBS_CLINVAR_VCF.
+        clinvar_vcf: Indexed ClinVar VCF (.vcf.gz with its .tbi, or .csi,
+            next to it). Falls back to $TFBS_CLINVAR_VCF.  Without the
+            index the call returns an error before anything runs.
         genome_fasta: Reference genome FASTA file. Falls back to
             $TFBS_GENOME_FASTA.
         peak_confidence: Minimum value of the BED 4th column to keep
-            (e.g. ChIP-Atlas overlap >= 3). Default 1.
+            (e.g. ChIP-Atlas overlap >= 3). Default 1.  Above 1 every
+            line needs a number in column 4; otherwise the run stops
+            with an error naming the first line without one.
         nn_models: Dict mapping model name to checkpoint path, e.g.
-            {"flank_mean": "/path/to/best_VCNNBpnet.ckpt"}.
-        motif_file: JASPAR / MEME motif file for FIMO scoring.
-        foldx_pdb: Repaired TF-DNA complex PDB for FoldX scoring.
-            FoldX is computationally expensive; consider slurm=true.
+            {"flank_mean": "/path/to/best_VCNNBpnet.ckpt"}.  A relative
+            path resolves against the project root (TFBS_PROJECT_ROOT,
+            see tfbs_server_info); a checkpoint that does not exist, or a
+            name with "=" or whitespace, is an error.  Omitted: no NN leg.
+        model_type: Class in tfbs.nn.models that every nn_models
+            checkpoint is loaded as (default "VCNNBpnet"; e.g. "RNN" or
+            "BPNetReal" for a model trained with that architecture).  An
+            unknown class is an error before anything runs or is
+            submitted.
+        motif_file: JASPAR / MEME motif file for the FIMO leg.  Empty or
+            null uses $TFBS_MOTIF_FILE; when that is unset too, the FIMO
+            leg is skipped.  The FIMO leg needs the MEME Suite's fimo
+            program on the server's PATH (also on the compute node for
+            slurm=true); without it the call returns an error before
+            anything runs or is submitted.  The tangermeme fallback of
+            tfbs_fimo does not apply here.
+        foldx_pdb: Repaired TF-DNA complex PDB for the FoldX leg.  Empty
+            or null uses $TFBS_FOLDX_PDB; when that is unset too, the
+            FoldX leg is skipped.  FoldX is computationally expensive;
+            consider slurm=true.
         nn_window: Window size around the variant for NN scoring
             (default 24, matches model input).
         foldx_workers: Parallel CPU workers for FoldX.
@@ -6862,14 +7324,47 @@ async def tfbs_disease_variant_validation(
         max_time: SLURM wall time (max 48:00:00).
 
     Returns:
-        JSON with output_dir, file list, and (if slurm=true) job_id.
+        JSON with mode, output_dir, clinvar_vcf, nn_models (the name to
+        checkpoint map used, absolute paths), model_type, motif_file and
+        foldx_pdb (the files used, null for a skipped leg), and command.
+        slurm=true adds job_id and expected_summary (the
+        summary_all_methods.csv the job writes).  slurm=false adds files,
+        stdout (its last 1000 characters) and summary, the
+        summary_all_methods.csv read back as a list of {method, auc_abs,
+        auc_raw, mwu_p, n_path, n_benign} (method is "NN <name>", "FIMO"
+        or "FoldX"; a method with fewer than 10 scored variants or one
+        class only has no row).  When no ClinVar variant falls in the
+        peaks the pipeline stops and the call returns an error saying so.
     """
     clinvar_path, err = _resolve_reference(clinvar_vcf, "clinvar_vcf")
     if err:
         return err
+    if not any(Path(str(clinvar_path) + ext).is_file() for ext in (".tbi", ".csi")):
+        return _error(
+            f"The ClinVar VCF has no tabix index: {clinvar_path}.tbi not found.",
+            f"Index it with htslib's tabix (tabix -p vcf {clinvar_path}), or download "
+            "the .tbi that ClinVar publishes next to the VCF, and keep it in the same "
+            "directory. The pipeline reads variants by region and finds none without it.",
+        )
     genome_path, err = _resolve_reference(genome_fasta, "genome_fasta")
     if err:
         return err
+    peaks_path = Path(peaks_bed).expanduser().resolve()
+    if not peaks_path.is_file():
+        return _error(f"peaks_bed not found: {peaks_path}",
+                      "Pass the path of a BED file of TF binding peaks.")
+    motif_path, err = _optional_reference(motif_file, "motif_file")
+    if err:
+        return err
+    foldx_path, err = _optional_reference(foldx_pdb, "foldx_pdb")
+    if err:
+        return err
+    if motif_path is not None:
+        err = _fimo_binary_error(
+            "tfbs_disease_variant_validation",
+            ", or skip the FIMO leg: leave motif_file empty and unset TFBS_MOTIF_FILE")
+        if err:
+            return err
 
     err = _pipeline_requirements_error(
         "disease_variant_validation", "tfbs_disease_variant_validation")
@@ -6879,14 +7374,45 @@ async def tfbs_disease_variant_validation(
     if err:
         return err
 
+    bad_names = [str(n) for n in (nn_models or {})
+                 if not str(n) or "=" in str(n) or any(c.isspace() for c in str(n))]
+    if bad_names:
+        return _error(
+            f"nn_models names that cannot be passed to the pipeline: {bad_names}.",
+            "Use names without '=' or whitespace (the pipeline reads each model as "
+            "name=checkpoint and splits at the first '='), e.g. {\"flank_mean\": "
+            "\"/path/best_VCNNBpnet.ckpt\"}.",
+        )
+    if nn_models:
+        err = _model_type_error(model_type)
+        if err:
+            return err
+
+    models_used: dict[str, str] = {}
+    for name, ckpt in (nn_models or {}).items():
+        ckpt_path = Path(str(ckpt)).expanduser()
+        if not ckpt_path.is_absolute():
+            ckpt_path = project_root / ckpt_path
+        models_used[str(name)] = str(ckpt_path.resolve())
+    missing = {n: p for n, p in models_used.items() if not Path(p).is_file()}
+    if missing:
+        return _error(
+            "nn_models names checkpoints that do not exist: "
+            + ", ".join(f"{n}={p}" for n, p in missing.items()),
+            "Pass existing .ckpt files (absolute, or relative to the project root "
+            "reported by tfbs_server_info), e.g. the checkpoint_path of tfbs_config.",
+        )
+
     out = Path(output_dir).resolve()
-    out.mkdir(parents=True, exist_ok=True)
+    mkdir_err = _mkdir_error(out, "output_dir")
+    if mkdir_err:
+        return mkdir_err
 
     device = _resolve_device(device, slurm_gpu=False if slurm else None)
 
     cmd_parts = [
         *_pipeline_argv("disease_variant_validation"),
-        "--peaks-bed", str(Path(peaks_bed).resolve()),
+        "--peaks-bed", str(peaks_path),
         "--clinvar-vcf", str(clinvar_path),
         "--genome", str(genome_path),
         "--output-dir", str(out),
@@ -6894,17 +7420,26 @@ async def tfbs_disease_variant_validation(
         "--nn-window", str(nn_window),
         "--foldx-workers", str(foldx_workers),
         "--device", device,
+        "--model-type", model_type,
     ]
-    if nn_models:
-        model_args = [f"{name}={ckpt}" for name, ckpt in nn_models.items()]
+    if models_used:
         cmd_parts.append("--models")
-        cmd_parts.extend(model_args)
-    if motif_file:
-        cmd_parts.extend(["--motif-file", str(Path(motif_file).resolve())])
-    if foldx_pdb:
-        cmd_parts.extend(["--foldx-pdb", str(Path(foldx_pdb).resolve())])
+        cmd_parts.extend(f"{name}={ckpt}" for name, ckpt in models_used.items())
+    if motif_path is not None:
+        cmd_parts.extend(["--motif-file", str(motif_path)])
+    if foldx_path is not None:
+        cmd_parts.extend(["--foldx-pdb", str(foldx_path)])
 
     cmd = shlex.join(cmd_parts)
+    used = {
+        "output_dir": str(out),
+        "clinvar_vcf": str(clinvar_path),
+        "nn_models": models_used,
+        "model_type": model_type,
+        "motif_file": str(motif_path) if motif_path is not None else None,
+        "foldx_pdb": str(foldx_path) if foldx_path is not None else None,
+        "command": cmd,
+    }
 
     if slurm:
         sbatch_content = (
@@ -6928,31 +7463,82 @@ async def tfbs_disease_variant_validation(
             working_dir=str(project_root),
         ))
         submit_result["mode"] = "slurm"
-        submit_result["command"] = cmd
-        submit_result["output_dir"] = str(out)
+        submit_result.update(used)
+        submit_result["expected_summary"] = str(out / "summary_all_methods.csv")
         return json.dumps(submit_result)
 
-    result, err = _run_pipeline(cmd_parts, project_root, 14400, "Disease validation")
+    result, err = await _run_pipeline(cmd_parts, project_root, 14400, "Disease validation")
     if err:
         return err
 
     if result.returncode != 0:
+        if "No ClinVar variants found" in result.stderr:
+            return _error(
+                "No ClinVar variant falls in the peaks, so there is nothing to score.",
+                "Check that the ClinVar VCF is on the same genome build as the peaks "
+                "(GRCh38 for hg38 peaks) and that it holds the BED's chromosomes (chr1 "
+                "in the BED finds 1 or chr1 in the VCF, and the other way round); lower "
+                "peak_confidence if few peaks pass it.",
+                stderr=result.stderr[-1500:], stdout=result.stdout[-500:], **used,
+            )
+        if "Cannot read --peaks-bed" in result.stderr:
+            reason = result.stderr.split("Cannot read --peaks-bed:", 1)[1].strip()
+            return _error(
+                f"The peaks BED cannot be used: {reason[:600]}",
+                "Fix the line it names. A peak_confidence above 1 needs the confidence "
+                "count as a number in column 4 on every line; with any other BED pass "
+                "peak_confidence=1.",
+                stderr=result.stderr[-1500:], stdout=result.stdout[-500:], **used,
+            )
         return json.dumps({
             "error": f"Disease validation failed (exit {result.returncode})",
-            "fix": "Read stderr for the cause; a ClinVar VCF without its .tbi "
-                   "index, an nn_models checkpoint that does not exist, or "
-                   "fimo or FoldX not on PATH are the usual ones.",
+            "fix": "Read stderr for the cause; a model_type that does not match the "
+                   "nn_models checkpoints, a peaks BED whose start or end is not an "
+                   "integer, or an out-of-memory error are the usual ones.",
             "stderr": result.stderr[-1500:],
             "stdout": result.stdout[-500:],
+            **used,
         })
 
     files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
     return json.dumps({
         "mode": "direct",
-        "output_dir": str(out),
+        **used,
         "files": files,
+        "summary": _read_disease_summary(out / "summary_all_methods.csv"),
         "stdout": result.stdout[-1000:],
     })
+
+
+def _read_disease_summary(path: Path) -> list[dict[str, Any]] | dict[str, str] | None:
+    """summary_all_methods.csv as [{method, auc_abs, auc_raw, mwu_p, n_path, n_benign}].
+
+    None when the file is missing, {"parse_error": ...} when it cannot be
+    read; a value that is not a finite number becomes null.
+    """
+    if not path.exists():
+        return None
+
+    def number(value: Any, kind):
+        parsed = _as_float(value)
+        return None if parsed is None else kind(parsed)
+
+    try:
+        import csv
+        with open(path, encoding="utf-8", newline="") as f:
+            return [
+                {
+                    "method": row["method"],
+                    "auc_abs": number(row["auc_abs"], float),
+                    "auc_raw": number(row["auc_raw"], float),
+                    "mwu_p": number(row["mwu_p"], float),
+                    "n_path": number(row["n_path"], int),
+                    "n_benign": number(row["n_benign"], int),
+                }
+                for row in csv.DictReader(f)
+            ]
+    except Exception as exc:
+        return {"parse_error": f"{type(exc).__name__}: {exc}"}
 
 
 # ---------------------------------------------------------------------------

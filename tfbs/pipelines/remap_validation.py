@@ -316,6 +316,9 @@ def main(argv=None):
     parser.add_argument("--skip-foldx", action="store_true")
     args = parser.parse_args(argv)
 
+    if shutil.which("fimo") is None:
+        from tfbs.pipelines import FIMO_REQUIRED
+        sys.exit(FIMO_REQUIRED)
     if not args.skip_foldx:
         args.foldx_bin = find_foldx(args.foldx_bin)
         if not args.foldx_bin:

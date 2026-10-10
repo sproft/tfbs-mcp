@@ -10,6 +10,7 @@ import torch
 
 from tfbs.mcp import server
 from tfbs.pipelines import checkpoints as ck
+from tests.fake_pipeline import fake_pipelines
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -150,6 +151,7 @@ def test_a_classifier_from_tfbs_config_is_found_by_the_benchmark(tmp_path, monke
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(server.subprocess, "run", fake_run)
+    fake_pipelines(monkeypatch, fake_run)
     result = run(server.tfbs_chipseq_benchmark(
         intersect_dir=str(tmp_path / "intersect"), output_dir=str(tmp_path / "bench"),
         datasets=["peaks"], model_type="RNN", models_dir="saved_models",
@@ -185,8 +187,9 @@ def bench(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(server.subprocess, "run", fake_run)
+    fake_pipelines(monkeypatch, fake_run)
     monkeypatch.setattr(server.shutil, "which",
-                        lambda name, *a, **k: f"/usr/bin/{name}" if name == "sbatch" else None)
+                        lambda name, *a, **k: f"/usr/bin/{name}" if name in ("sbatch", "fimo") else None)
     return tmp_path, files, calls
 
 
