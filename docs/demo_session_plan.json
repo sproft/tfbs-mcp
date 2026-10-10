@@ -156,6 +156,6 @@
  },
  {
   "role": "llm",
-  "text": "Classifier trained here in 7 s (12 epochs). FLANK scores the sites 1.96, 1.39, 2.61 and -0.69 log2FC; the CACG mutant falls from 1.07 to -0.54 in its window, a 1.6 log2FC loss. 9U19 fetched with its DNA."
+  "text": "Classifier trained here (12 epochs, best val_loss 1.05). FLANK scores the sites 1.96, 1.39, 2.61 and -0.69 log2FC; the CACG mutant falls from 1.07 to -0.54 in its window, a 1.6 log2FC loss. 9U19 fetched with its DNA."
  }
 ]
