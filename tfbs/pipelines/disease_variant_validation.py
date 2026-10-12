@@ -263,7 +263,11 @@ def extract_clinvar_snvs(peaks: pd.DataFrame, clinvar_vcf: str) -> pd.DataFrame:
     for peak in peaks.itertuples():
         try:
             for rec in _fetch_peak(vcf, contigs, peak.chrom, peak.start, peak.end):
-                if len(rec.ref) != 1 or any(len(a) != 1 for a in rec.alts):
+                # ClinVar writes some records with ALT "." (no alternative
+                # allele); pysam gives rec.alts None for them.
+                if not rec.ref or rec.alts is None:
+                    continue
+                if len(rec.ref) != 1 or any(a is None or len(a) != 1 for a in rec.alts):
                     continue
                 clnsig = rec.info.get("CLNSIG", ())
                 clnsig = ",".join(clnsig) if isinstance(clnsig, tuple) else str(clnsig)
@@ -324,19 +328,33 @@ def score_nn(model, sequences, batch_size=512, device="cuda"):
     return np.concatenate(out)
 
 
-def extract_seq_pair(genome, chrom, pos, ref, alt, half_window):
-    """Return (ref_seq, alt_seq) of length 2*half_window centered on the variant.
+def extract_seq_pair(genome, chrom, pos, ref, alt, half_window, length=None):
+    """Return (ref_seq, alt_seq) with the variant at index half_window.
 
-    Returns (None, None) if reference doesn't match the genome or sequence
-    contains ambiguous bases.
+    The window is ``length`` bases long (default 2 * half_window) and starts
+    half_window bases before the variant, so an odd length such as the 11 bp
+    duplex of a crystal structure centres the variant exactly. The genome is
+    looked up under the chromosome names of contig_candidates, so chr1 and 1
+    both work. Returns (None, None) if the reference base does not match the
+    genome, the window is cut short at a contig end, or it contains an
+    ambiguous base.
     """
-    s = pos - 1 - half_window
-    e = s + 2 * half_window
-    try:
-        seq = str(genome[chrom][s:e]).upper()
-    except (KeyError, ValueError):
+    if length is None:
+        length = 2 * half_window
+    if half_window < 0 or half_window >= length:
         return None, None
-    if len(seq) != 2 * half_window:
+    s = pos - 1 - half_window
+    if s < 0:
+        return None, None
+    e = s + length
+    seq = None
+    for name in contig_candidates(chrom):
+        try:
+            seq = str(genome[name][s:e]).upper()
+        except (KeyError, ValueError):
+            continue
+        break
+    if seq is None or len(seq) != length:
         return None, None
     if any(c not in NUC_TO_IDX for c in seq):
         return None, None
@@ -478,16 +496,17 @@ def score_with_foldx(df: pd.DataFrame, genome, foldx_pdb: str, n_workers: int = 
     dna_len = len(ref_fwd)
     half = dna_len // 2
 
-    keep_idx = []
-    ref_seqs, alt_seqs = [], []
-    for i, row in df.iterrows():
+    # Every variant keeps its row: the FoldX columns stay NaN for a variant
+    # whose window cannot be cut, so the NN and FIMO legs are never lost.
+    out_df = df.reset_index(drop=True)
+    ref_seqs, alt_seqs, row_of = [], [], []
+    for i, row in out_df.iterrows():
         rs, as_ = extract_seq_pair(genome, row["chrom"], int(row["pos"]),
-                                   row["ref"], row["alt"], half)
-        if rs is not None and len(rs) == dna_len:
+                                   row["ref"], row["alt"], half, length=dna_len)
+        if rs is not None:
             ref_seqs.append(rs)
             alt_seqs.append(as_)
-            keep_idx.append(i)
-    out_df = df.iloc[keep_idx].reset_index(drop=True)
+            row_of.append(i)
 
     def score_seq(seq):
         mut = []
@@ -510,18 +529,26 @@ def score_with_foldx(df: pd.DataFrame, genome, foldx_pdb: str, n_workers: int = 
         idx, ref, alt = args_tuple
         return idx, score_seq(ref), score_seq(alt)
 
-    from multiprocessing import Pool
+    # A thread pool, not a process pool: each worker only spawns and waits
+    # for a FoldX process, and the closures above cannot be pickled for a
+    # spawned or forkserver child.
+    from multiprocessing.pool import ThreadPool
     items = [(i, ref_seqs[i], alt_seqs[i]) for i in range(len(ref_seqs))]
-    with Pool(n_workers) as pool:
+    with ThreadPool(n_workers) as pool:
         results = list(pool.imap_unordered(process, items, chunksize=1))
 
     by_idx = {idx: (er, ea) for idx, er, ea in results}
-    refs, alts, dds = [], [], []
-    for i in range(len(ref_seqs)):
+    refs = [np.nan] * len(out_df)
+    alts = [np.nan] * len(out_df)
+    dds = [np.nan] * len(out_df)
+    for i, row in enumerate(row_of):
         er, ea = by_idx.get(i, (None, None))
-        refs.append(er if er is not None else np.nan)
-        alts.append(ea if ea is not None else np.nan)
-        dds.append(ea - er if (er is not None and ea is not None) else np.nan)
+        if er is not None:
+            refs[row] = er
+        if ea is not None:
+            alts[row] = ea
+        if er is not None and ea is not None:
+            dds[row] = ea - er
     out_df["foldx_ref_dG"] = refs
     out_df["foldx_alt_dG"] = alts
     out_df["foldx_ddG"] = dds
