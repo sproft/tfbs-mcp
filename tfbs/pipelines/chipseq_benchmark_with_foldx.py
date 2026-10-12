@@ -9,6 +9,16 @@ Uses the same subsample across methods so AUCs are directly comparable.
 
 For NKX2.1 with the 11 bp C+A+B complex:
   ~3 min per FoldX call × 500 seq × 5 TFs / 32 cores ≈ 80 min total.
+
+Checkpoints: --checkpoints NAME=PATH (and the default
+<models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt lookup) take a
+PyTorch Lightning checkpoint or an inference checkpoint such as the NKX2-1
+study's released <models>/flank/vcnnbpnet.pt (Zenodo,
+doi:10.5281/zenodo.21399578); tfbs.nn.loading.load_checkpoint tells them
+apart by content.  Every model is scored by its raw output, so an
+inference checkpoint is scored on the training scale (its scaling block is
+not applied), as a Lightning checkpoint is; a monotone rescaling does not
+change the AUCs.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import auc, roc_curve
 
+from tfbs.nn.loading import load_checkpoint
 from tfbs.pipelines.checkpoints import (
     DEFAULT_SCALING, describe_problems, parse_named_paths, resolve_checkpoints,
 )
@@ -39,6 +50,24 @@ from tfbs.pipelines.checkpoints import (
 NUC_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
 IDX_TO_NUC = ["A", "C", "G", "T"]
 COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
+
+
+def load_model(checkpoint_path, model_type, device="cuda"):
+    """Load a Lightning or an inference checkpoint as tfbs.nn.models.<model_type>.
+
+    The model comes back frozen, in eval mode, on device.  Its scores are
+    raw outputs: the training scale for an inference checkpoint too.
+    """
+    try:
+        model, _ = load_checkpoint(checkpoint_path, model_type, map_location=device)
+    except Exception as exc:
+        # A model_type or arch that does not fit, a bare state_dict, an
+        # unimportable class, a state_dict that does not fit the class or an
+        # unreadable file: one line naming the file, not a traceback.
+        sys.exit(f"Cannot load {checkpoint_path}: {type(exc).__name__}: {exc}")
+    if hasattr(model, "freeze"):
+        model.freeze()
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +280,6 @@ def main(argv=None):
         print(f"{tf}: {len(merged):,} merged regions → {len(seqs)} sequences")
 
     # 2. Load NN models
-    import tfbs.nn.models as models_mod
-    cls = getattr(models_mod, args.model_type)
     loaded = {}
     ckpts, problems = resolve_checkpoints(
         args.models_dir, args.datasets, args.model_type, args.scaling_method,
@@ -261,12 +288,7 @@ def main(argv=None):
     if problems:
         print(f"Skipping NN {describe_problems(problems)}", file=sys.stderr)
     for name, ckpt in ckpts.items():
-        m = cls.load_from_checkpoint(str(ckpt), map_location=args.device)
-        m.eval()
-        if hasattr(m, "freeze"):
-            m.freeze()
-        m = m.to(args.device)
-        loaded[name] = m
+        loaded[name] = load_model(str(ckpt), args.model_type, args.device)
 
     # 3. Score sequences with all methods
     foldx_bin = shutil.which("foldx") or shutil.which("foldx5")

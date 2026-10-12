@@ -38,6 +38,18 @@ VCF must be bgzipped and tabix-indexed (.tbi or .csi next to it).  The
 pipeline exits non-zero with a message when the index or the fimo program
 (needed with --motif-file) is missing, when --model-type names no class in
 tfbs.nn.models, and when no ClinVar variant falls in the peaks.
+
+Checkpoints: --models NAME=PATH takes a PyTorch Lightning checkpoint or an
+inference checkpoint such as the NKX2-1 study's released
+<models>/flank/vcnnbpnet.pt (Zenodo, doi:10.5281/zenodo.21399578), e.g.
+``--models flank=<models>/flank/vcnnbpnet.pt``;
+tfbs.nn.loading.load_checkpoint tells them apart by content, and an
+inference checkpoint whose arch is not --model-type stops the run.  Every
+model is scored by its raw output, so an inference checkpoint is scored
+on the training scale (its scaling block is not applied), as a Lightning
+checkpoint is; a positive rescaling of the ref and alt scores scales
+every |delta-delta| alike, which does not change the AUCs or the
+Mann-Whitney test.
 """
 
 from __future__ import annotations
@@ -61,6 +73,8 @@ import torch
 import torch.nn.functional as F
 from scipy.stats import mannwhitneyu
 from sklearn.metrics import roc_auc_score, roc_curve
+
+from tfbs.nn.loading import load_checkpoint
 
 NUC_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
 COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
@@ -333,23 +347,26 @@ def extract_seq_pair(genome, chrom, pos, ref, alt, half_window):
 
 
 def model_class(model_type: str):
-    """The class tfbs.nn.models.<model_type>; SystemExit naming the choices otherwise."""
-    import tfbs.nn.models as models_mod
+    """The class tfbs.nn.models.<model_type>; SystemExit naming the choices otherwise.
 
-    cls = getattr(models_mod, model_type, None)
-    if not isinstance(cls, type):
-        known = sorted(n for n in dir(models_mod)
-                       if isinstance(getattr(models_mod, n), type) and not n.startswith("_"))
-        sys.exit(f"--model-type {model_type!r} is not a model class in tfbs.nn.models "
-                 f"(known: {', '.join(known)}).")
-    return cls
+    The rule is tfbs.nn.loading.model_class, the one load_checkpoint and
+    the server apply.
+    """
+    from tfbs.nn.loading import model_class as loader_model_class
+
+    try:
+        return loader_model_class(model_type)
+    except ValueError as exc:
+        sys.exit(f"--model-type {exc}")
 
 
 def score_with_nn(df: pd.DataFrame, models: dict, genome, window: int = 24, device: str = "cuda",
                   model_type: str = "VCNNBpnet") -> pd.DataFrame:
     """Add NN ΔΔ columns for each model in `models` (name -> path).
 
-    Every checkpoint is loaded as tfbs.nn.models.<model_type>.
+    Every checkpoint, Lightning or inference, is loaded as
+    tfbs.nn.models.<model_type> through tfbs.nn.loading.load_checkpoint
+    and scored by its raw output.
     """
     half = window // 2
     out_df = df.copy()
@@ -364,13 +381,14 @@ def score_with_nn(df: pd.DataFrame, models: dict, genome, window: int = 24, devi
             keep_idx.append(i)
     out_df = df.iloc[keep_idx].reset_index(drop=True)
 
-    cls = model_class(model_type)
+    model_class(model_type)
     for name, ckpt_path in models.items():
-        m = cls.load_from_checkpoint(ckpt_path, map_location=device)
-        m.eval()
+        try:
+            m, _ = load_checkpoint(ckpt_path, model_type, map_location=device)
+        except Exception as exc:
+            sys.exit(f"Cannot load --models {name}={ckpt_path}: {type(exc).__name__}: {exc}")
         if hasattr(m, "freeze"):
             m.freeze()
-        m = m.to(device)
         ref_scores = score_nn(m, ref_seqs, device=device)
         alt_scores = score_nn(m, alt_seqs, device=device)
         out_df[f"nn_{name}_ref"] = ref_scores

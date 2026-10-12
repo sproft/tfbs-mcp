@@ -11,6 +11,14 @@ scaling_method None means "standardize, else whichever single scaling
 folder holds the model" (a classifier trained with scaling "none" lands
 under ``none/``).  An explicit scaling_method names the one folder to use
 and never falls back to another.
+
+The lookup finds Lightning checkpoints, ``best_<model_type>.ckpt``, only.
+An explicit path (``explicit`` here, ``--checkpoints NAME=PATH`` or
+``--models NAME=PATH`` in the pipelines, ``checkpoints`` or ``nn_models``
+in the MCP tools) may be either format: a PyTorch Lightning checkpoint or
+an inference checkpoint such as the NKX2-1 study's released
+``<models>/flank/vcnnbpnet.pt`` (Zenodo, doi:10.5281/zenodo.21399578).
+tfbs.nn.loading.load_checkpoint tells the two apart by content.
 """
 
 from __future__ import annotations
@@ -58,8 +66,9 @@ def resolve_checkpoints(models_dir: str | Path, datasets: list[str], model_type:
                         ) -> tuple[dict[str, Path], list[dict]]:
     """Resolve every dataset: ({name: path}, problems).
 
-    ``explicit`` maps a dataset name to a checkpoint path and replaces the
-    lookup under models_dir; its names are then the datasets.  Each problem
+    ``explicit`` maps a dataset name to a checkpoint path (either format)
+    and replaces the lookup under models_dir; its names are then the
+    datasets.  Each problem
     is {dataset, expected, candidates} for a dataset that has no single
     checkpoint.
     """

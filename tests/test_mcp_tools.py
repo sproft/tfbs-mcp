@@ -1358,7 +1358,7 @@ def test_startup_preloads_every_native_module_the_tools_import():
     pure = {"importlib.util", "tfbs.configs", "tfbs.pipelines.checkpoints", "tfbs.mcp",
             "ctypes", "msvcrt", "sys", "csv", "bisect", "torch", "torch.nn.functional",
             "tfbs.nn.models", "tfbs.prediction.analysis", "tfbs.mcp.foldx_tools", "shlex",
-            "tfbs.mcp.server"}
+            "tfbs.mcp.server", "tfbs.nn.loading"}
     for path in sources:
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             for fn in ([node] if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else []):

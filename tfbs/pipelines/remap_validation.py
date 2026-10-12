@@ -20,6 +20,16 @@ Outputs:
   - negative_scores.csv: same for matched negatives
   - roc_all_methods.png: ROC curves per method
   - summary.csv: AUCs
+
+Checkpoints: --checkpoints NAME=PATH (and the default
+<models-dir>/<dataset>/<scaling>/best_<model-type>.ckpt lookup) take a
+PyTorch Lightning checkpoint or an inference checkpoint such as the NKX2-1
+study's released <models>/flank/vcnnbpnet.pt (Zenodo,
+doi:10.5281/zenodo.21399578); tfbs.nn.loading.load_checkpoint tells them
+apart by content.  Every model is scored by its raw output, so an
+inference checkpoint is scored on the training scale (its scaling block is
+not applied), as a Lightning checkpoint is; a monotone rescaling does not
+change the AUCs.
 """
 
 import argparse
@@ -46,16 +56,25 @@ from tfbs.pipelines.chipseq_benchmark_with_foldx import (
     score_foldx_batch,
 )
 
-import tfbs.nn.models as models
+from tfbs.nn.loading import load_checkpoint
 
 
 def load_model(checkpoint_path, model_type, device="cuda"):
-    model_cls = getattr(models, model_type)
-    model = model_cls.load_from_checkpoint(checkpoint_path, map_location=device)
-    model.eval()
+    """Load a Lightning or an inference checkpoint as tfbs.nn.models.<model_type>.
+
+    The model comes back frozen, in eval mode, on device.  Its scores are
+    raw outputs: the training scale for an inference checkpoint too.
+    """
+    try:
+        model, _ = load_checkpoint(checkpoint_path, model_type, map_location=device)
+    except Exception as exc:
+        # A model_type or arch that does not fit, a bare state_dict, an
+        # unimportable class, a state_dict that does not fit the class or an
+        # unreadable file: one line naming the file, not a traceback.
+        sys.exit(f"Cannot load {checkpoint_path}: {type(exc).__name__}: {exc}")
     if hasattr(model, "freeze"):
         model.freeze()
-    return model.to(device)
+    return model
 
 
 def find_foldx(explicit=None):

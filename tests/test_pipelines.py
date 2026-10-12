@@ -707,13 +707,11 @@ def test_validate_run_saves_the_metrics_trainer_test_reports(tmp_path, monkeypat
         def setup(self, stage=None):
             pass
 
-    class Model:
-        @classmethod
-        def load_from_checkpoint(cls, **kw):
-            return cls()
+    loads = []
 
-        def eval(self):
-            return self
+    def load_checkpoint(path, model_type=None, map_location="cpu", **kw):
+        loads.append((path, model_type, kw.get("overrides")))
+        return object(), None
 
     class Trainer:
         def __init__(self, **kw):
@@ -723,13 +721,15 @@ def test_validate_run_saves_the_metrics_trainer_test_reports(tmp_path, monkeypat
             return [{"test_loss": 0.2, "test_acc": 0.75, "test_auc": 0.85}]
 
     monkeypatch.setattr(validate, "TFBSDataModule", DM)
-    monkeypatch.setattr(validate, "get_model_class", lambda name: Model)
+    monkeypatch.setattr(validate, "load_checkpoint", load_checkpoint)
     monkeypatch.setattr(validate.pl, "Trainer", Trainer)
     args = _args(tmp_path, checkpoint_path="x.ckpt", batch_size=8, num_workers=0,
                  preprocess=False)
     validate.run(args)
     row = _csv_rows(tmp_path / "results.csv")[0]
     assert (row["test_loss"], row["test_acc"], row["test_auc"]) == ("0.2", "0.75", "0.85")
+    # The shared loader gets the model class and the input length the data has.
+    assert loads == [("x.ckpt", "VCNNBpnet", {"input_length": 24})]
 
 
 def test_validate_writes_lf_line_endings_on_append_and_rewrite(tmp_path):

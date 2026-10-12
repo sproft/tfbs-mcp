@@ -331,14 +331,27 @@ def test_readme_lists_every_setup_flag():
 def test_readme_states_the_checkpoint_convention():
     readme = _doc("README.md")
     assert "/standardize/best_<model_type>.ckpt`" not in readme
-    # The validation tasks name the checkpoint and say the released .pt files cannot be used.
-    assert readme.count("the released `.pt` models cannot be used here") == 2
+    # The validation and benchmark tasks take the released .pt models and name one.
+    assert "cannot be used here" not in readme
+    # Said once, in the first of the three tasks; the other two name both formats.
+    assert readme.count("the released `.pt` models can be used here as they are") == 1
+    for section in ("### Validate a model against ReMap",
+                    "### Check ClinVar disease variants in your TF's peaks",
+                    "### Benchmark against other TFs on ChIP-Atlas"):
+        task = readme.split(section)[1].split("###")[0]
+        prompt = task.split("Say to Claude:")[1].split("What happens")[0]
+        assert r"\<models>/flank/vcnnbpnet.pt" in prompt, section
+        assert "(model type VCNNBpnet)" in prompt and ".ckpt" in task, section
+    table = readme.split("## What you can do")[1].split("## Installation")[0]
+    assert table.count("the released models or one I trained") == 3
     guide = _doc("docs/development.md")
     assert "checkpoint_path" in guide and "--checkpoints NAME=PATH" in guide
     # The lookup convention and its rules moved from the README to the developer guide.
     assert "<models_dir>/<dataset>/<scaling_method>/best_<model_type>.ckpt" in guide
     assert "The lookup is all-or-nothing" in guide
-    assert "the released `vcnnbpnet.pt` files are read by `tfbs_load_model`" in guide
+    assert "Two checkpoint formats are accepted" in guide
+    assert "`tfbs.nn.loading.load_checkpoint`" in guide and "<models>/flank/vcnnbpnet.pt" in guide
+    assert "these pipelines load checkpoints with lightning" not in guide.lower()
 
 
 def test_docs_do_not_say_a_clone_is_needed_for_the_validation_tools():
@@ -376,7 +389,8 @@ def test_no_dashes_in_changed_text():
                  "docs/install-windows.md", "docs/troubleshooting.md", "docs/tools.md",
                  "tfbs/mcp/server.py",
                  "tfbs/mcp/foldx_tools.py", "tfbs/pipelines/checkpoints.py",
-                 "tfbs/pipelines/validate.py", "tfbs/configs/models/FlexibleMLP.yaml"):
+                 "tfbs/pipelines/validate.py", "tfbs/configs/models/FlexibleMLP.yaml",
+                 "tfbs/nn/loading.py", "tests/test_shared_loader.py"):
         text = (REPO / name).read_text(encoding="utf-8")
         assert chr(0x2014) not in text and chr(0x2013) not in text, name
 
