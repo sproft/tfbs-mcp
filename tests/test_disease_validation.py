@@ -6,6 +6,7 @@ pipeline tests stub the ClinVar reader (pysam), FIMO and FoldX.
 import asyncio
 import csv
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -558,6 +559,60 @@ def test_extraction_skips_records_without_an_alt_allele(monkeypatch):
     hits = dv.extract_clinvar_snvs(peaks, "clinvar.vcf.gz")
     assert hits["pos"].tolist() == [150, 160]
     assert hits["label"].tolist() == ["pathogenic", "benign"]
+
+
+class _Genome(dict):
+    """A pyfaidx-like genome: genome[name][s:e] gives a sequence slice."""
+
+
+def test_extract_seq_pair_cuts_an_odd_window_centred_on_the_variant():
+    genome = _Genome({"chr1": "ACGTACGTAC" + "T" + "GCATGCATGC"})  # variant T at 0-based 10
+    ref, alt = dv.extract_seq_pair(genome, "chr1", 11, "T", "G", half_window=5, length=11)
+    assert ref == "CGTACTGCATG"
+    assert alt == "CGTACGGCATG"
+
+
+def test_extract_seq_pair_default_length_is_twice_half_window_and_tries_both_contig_names():
+    genome = _Genome({"1": "ACGTACGTACTGCATGCATGCATG"})
+    ref, alt = dv.extract_seq_pair(genome, "chr1", 11, "T", "G", half_window=5)
+    assert len(ref) == 10 and ref[5] == "T" and alt[5] == "G"
+    assert dv.extract_seq_pair(genome, "chr1", 11, "A", "G", half_window=5) == (None, None)
+    assert dv.extract_seq_pair(genome, "chr9", 11, "T", "G", half_window=5) == (None, None)
+
+
+def test_foldx_leg_scores_an_eleven_bp_duplex_and_keeps_every_row(monkeypatch):
+    """The 11 bp crystal duplex needs an 11 bp window; unscorable rows stay with NaN."""
+    import multiprocessing
+    from tfbs.mcp import foldx_tools
+
+    genome = _Genome({"chr1": "ACGTACGTAC" + "T" + "GCATGCATGC" + "A" * 30})
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/foldx" if name == "foldx" else None)
+    monkeypatch.setattr(foldx_tools, "_parse_dna_from_pdb", lambda pdb: {"C": "GGTCAAGTGTT", "D": "AACACTTGACC"})
+    monkeypatch.setattr(foldx_tools, "_build_foldx_mutation_string", lambda ref, seq, chain: "GA1T;")
+    monkeypatch.setattr(foldx_tools, "_run_foldx_energy", lambda binary, pdb, wd, ms: -7.5 if ms else -8.0)
+
+    class _SerialPool:
+        def __init__(self, n):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def imap_unordered(self, fn, items, chunksize=1):
+            return [fn(item) for item in items]
+
+    monkeypatch.setattr(multiprocessing, "Pool", _SerialPool)
+    df = pd.DataFrame([
+        {"chrom": "chr1", "pos": 11, "ref": "T", "alt": "G", "label": "pathogenic", "nn_m_dd": 0.5},
+        {"chrom": "chr1", "pos": 2, "ref": "C", "alt": "A", "label": "benign", "nn_m_dd": 0.1},  # window runs off the contig start
+    ])
+    out = dv.score_with_foldx(df, genome, "complex_Repair.pdb", n_workers=1)
+    assert len(out) == 2, "no row may be dropped"
+    assert out.loc[0, "foldx_ddG"] == pytest.approx(0.5)
+    assert np.isnan(out.loc[1, "foldx_ddG"]) and out.loc[1, "nn_m_dd"] == pytest.approx(0.1)
 
 
 def test_no_variant_messages_do_not_claim_the_vcf_may_use_any_names(files, tmp_path, monkeypatch):
