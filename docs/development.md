@@ -42,6 +42,10 @@ The MCP tools resolve data, checkpoints and results against `TFBS_PROJECT_ROOT`,
 export TFBS_PROJECT_ROOT=/mnt/lab/tfbs
 ```
 
+### Where the tools find checkpoints
+
+`TFBS_PROJECT_ROOT` is the directory holding `data/`, `saved_models/` and `results/`. The benchmark and validation tools run from it, so a relative `models_dir`, such as their default `saved_models_final`, is looked up there. A dataset's checkpoint is `<models_dir>/<dataset>/<scaling_method>/best_<model_type>.ckpt`, the layout `tfbs_config` trains to, with `scaling_method` defaulting to `standardize`; when `scaling_method` is not given and that file is missing, the one `<dataset>/*/best_<model_type>.ckpt` is used if there is exactly one, with a warning in the result. An explicit `scaling_method` never falls back to another folder, and the tools also take explicit `checkpoints` (`tfbs_disease_variant_validation` takes `nn_models`). The lookup is all-or-nothing: if any dataset has no single checkpoint, or the class a checkpoint was saved with cannot be imported from the project root, nothing runs. Without the variable the server uses the repository root when it runs from a clone, and otherwise the directory it was started in; `tfbs_server_info` reports the one in use as `project_root`. These pipelines load checkpoints with Lightning, so give them a `.ckpt` from training; the released `vcnnbpnet.pt` files are read by `tfbs_load_model`.
+
 The `tfbs_train` tool submits the training to SLURM by default. With `local=true` it runs `python -m tfbs.cli.train_cli fit --config <config> --data.num_workers 0` on the server's machine instead, from the config's directory, and blocks until training ends (at most `local_timeout` seconds, default 3600), so it is meant for small datasets and laptops. Its output goes to `<config stem>_train.log` next to the config. The trainer runs in a process group of its own, and the whole group is killed when `local_timeout` runs out or the MCP call is cancelled. The result reports the checkpoint and, from the `metrics.csv` this run's CSVLogger wrote (every `tfbs_config` config without `wandb_project` has one, under the checkpoint directory), the validation metrics of the best epoch of this run, the one with the lowest `val_loss` that ModelCheckpoint keeps, with `best_epoch` and `epochs_run`. `metrics` is null, with a `note` saying why, when the config has no CSVLogger or the run wrote no fresh `metrics.csv`; `val_auc` is null, with a note, when the validation split holds a single class. Retraining into the same folder overwrites `best_<model_type>.ckpt`.
 
 A SLURM job from a config (`config_path` without `local`) runs the same trainer from the config's directory. Its generated script requests `--cpus-per-task` from `cpus_per_task`, by default the config's `data.num_workers` plus 1 for the main training process (25 for the 24 workers of a `tfbs_config` config; an `extra_args` `--data.num_workers N` overrides the worker count), and writes a `--mem` line only when `mem` is given (e.g. `"64G"`; at least 1, since SLURM reads `--mem=0` as all of the node's memory), so otherwise the cluster's default memory applies. The result names `config_path` and `checkpoint_path`, where the job's ModelCheckpoint will write, derived from the config as in local mode; after the job, `slurm_logs` finds its `<job name>_<job id>.out` and `.err` in the config's directory even when sacct reports them as relative or unexpanded patterns. A relative path reported without a WorkDir is skipped rather than read from the server's own working directory.
@@ -54,7 +58,7 @@ The six tools that run a longer job (`tfbs_validate`, `tfbs_sweep`, `tfbs_chipse
 python -m tfbs.pipelines.remap_validation --help
 ```
 
-In direct mode (`slurm=false`) the benchmark and validation tools run the module in a worker thread, so the server keeps answering other calls while it runs, and a cancelled call kills the module's whole process group (the process tree on Windows). `remap_validation`, and `disease_variant_validation` when it has a motif file, run the MEME Suite's `fimo` program, which must be on PATH; the tools check for it before they run or submit anything. The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working, including `main(args)` with an `argparse.Namespace` for `validate` and `run_sweep`.
+In direct mode (`slurm=false`) the benchmark and validation tools run the module in a worker thread, so the server keeps answering other calls while it runs, and a cancelled call kills the module's whole process group (the process tree on Windows). `remap_validation`, `chipseq_benchmark_with_foldx` (behind `tfbs_chipseq_method_comparison`), and `disease_variant_validation` when it has a motif file, run the MEME Suite's `fimo` program, which must be on PATH (it has no native Windows build, see [install-windows.md](install-windows.md#tools-that-need-wsl)); the tools check for it before they run or submit anything. The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working, including `main(args)` with an `argparse.Namespace` for `validate` and `run_sweep`.
 
 ## Prediction
 
@@ -78,7 +82,7 @@ The server imports PyTorch, Lightning, scikit-learn, captum, tangermeme and the 
 
 ## Recording a session
 
-`scripts/record_demo_session.py` (in a clone; it is not installed) starts `tfbs-mcp` over the stdio protocol as an AI app does, runs a plan of user messages, the assistant's stated plan and tool calls, and writes every call's arguments, full result and wall time to a JSON log, together with the seconds from launch to the server's first answer. The application note's Figure 2 is the session log recorded this way with the released FLANK checkpoint (doi:10.5281/zenodo.21399578) and the bundled demo data, so no part of it is typed in by hand.
+`scripts/record_demo_session.py` (in a clone; it is not installed) starts `tfbs-mcp` over the stdio protocol as an AI app does, runs a plan of user messages, the assistant's stated plan and tool calls, and writes every call's arguments, full result and wall time to a JSON log, together with the seconds from launch to the server's first answer. The startup time quoted in the README was measured this way. The application note's Figure 2 is the session log recorded this way with the released FLANK checkpoint (doi:10.5281/zenodo.21399578) and the bundled demo data, so no part of it is typed in by hand.
 
 The demo directory is found with `python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())"`. Asking `tfbs.data.demo` itself does not work: it is a namespace package (it has no `__init__.py`), so its `__file__` is `None`.
 
@@ -147,7 +151,7 @@ The install command in the README already includes everything the server needs. 
 | `genomics` | pyfaidx, tangermeme, pysam (Linux and macOS; Windows has no pysam wheel) | reading a genome FASTA (`tfbs_extract_loci`, the benchmark and validation tools); pysam reads the ClinVar VCF in `tfbs_disease_variant_validation`, which therefore needs Linux, macOS or WSL |
 | `viz` | captum, tangermeme, logomaker, seaborn | attribution, mutagenesis, seqlets; tangermeme also brings its FIMO reimplementation (memelite, numba-based, shipped with tangermeme 1.x) that `tfbs_fimo` uses when the MEME Suite's `fimo` binary is not on PATH (its result says `"backend": "memelite"`, `"tangermeme"` for the `tangermeme.tools.fimo` of older releases, or `"meme"`) |
 | `tracking` | wandb | `tfbs_sweep`, and Weights & Biases logging during training |
-| `foldx` | pyBigWig | the bigWig track of `tfbs_binding_scan`; not FoldX itself, see [Adding your data](../README.md#adding-your-data) in the README |
+| `foldx` | pyBigWig | the bigWig track of `tfbs_binding_scan`; not FoldX itself, see [Compute structure-based binding energy](../README.md#compute-structure-based-binding-energy) in the README |
 | `equinet` | equirc | the `EquiNet` architecture only |
 | `dev` | pytest | running the test suite (also needs `mcp` and `viz`) |
 | `all` | all of the above | |
@@ -215,6 +219,11 @@ scripts/                  Repo-only scripts (not installed by pip)
 
 docs/development.md       This page
 docs/other-clients.md     Setup for AI apps other than Claude
+docs/install-windows.md   The Windows differences in the installation
+docs/troubleshooting.md   Symptoms, causes and fixes
+docs/tools.md             All 33 tools by layer, one line each
+docs/figure1.png          The task figure at the top of the README
+docs/architecture.png     The layer diagram on docs/tools.md
 docs/demo_session_plan.json The plan behind the application note's Figure 2
 tests/                    pytest suite
 ```

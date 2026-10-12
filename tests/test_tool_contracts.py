@@ -303,14 +303,16 @@ def _doc(name):
     return " ".join((REPO / name).read_text(encoding="utf-8").split())
 
 
-def test_readme_troubleshooting_quotes_the_fimo_error_the_tool_returns():
-    readme = _doc("README.md")
-    assert "fails with `FileNotFoundError`" not in readme
-    assert server._FIMO_MISSING["error"] in readme
+def test_troubleshooting_quotes_the_fimo_error_the_tool_returns():
+    # The troubleshooting table moved from the README to docs/troubleshooting.md.
+    guide = _doc("docs/troubleshooting.md")
+    assert "fails with `FileNotFoundError`" not in guide
+    assert server._FIMO_MISSING["error"] in guide
+    assert "docs/troubleshooting.md" in _doc("README.md")
 
 
 def test_docs_say_where_the_clinvar_tool_runs():
-    for name in ("README.md", "docs/development.md"):
+    for name in ("README.md", "docs/development.md", "docs/install-windows.md"):
         text = _doc(name)
         assert "Linux, macOS or WSL" in text, name
         assert "no pysam wheel" in text or "no Windows wheel" in text, name
@@ -328,10 +330,15 @@ def test_readme_lists_every_setup_flag():
 
 def test_readme_states_the_checkpoint_convention():
     readme = _doc("README.md")
-    assert "<models_dir>/<dataset>/<scaling_method>/best_<model_type>.ckpt" in readme
     assert "/standardize/best_<model_type>.ckpt`" not in readme
+    # The validation tasks name the checkpoint and say the released .pt files cannot be used.
+    assert readme.count("the released `.pt` models cannot be used here") == 2
     guide = _doc("docs/development.md")
     assert "checkpoint_path" in guide and "--checkpoints NAME=PATH" in guide
+    # The lookup convention and its rules moved from the README to the developer guide.
+    assert "<models_dir>/<dataset>/<scaling_method>/best_<model_type>.ckpt" in guide
+    assert "The lookup is all-or-nothing" in guide
+    assert "the released `vcnnbpnet.pt` files are read by `tfbs_load_model`" in guide
 
 
 def test_docs_do_not_say_a_clone_is_needed_for_the_validation_tools():
@@ -347,8 +354,11 @@ def test_docs_say_where_fetched_structures_go_and_how_long_startup_takes():
     assert "are in `<results>/structures/<id>/`" in readme
     startup = ("about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one "
                "Windows 10 machine with a CPU build of PyTorch)")
-    assert readme.count(startup) == 2
-    for name in ("README.md", "docs/development.md", "docs/other-clients.md"):
+    # Once in step 4 of the README, once in the timeout row of the troubleshooting page.
+    assert readme.count(startup) == 1
+    assert _doc("docs/troubleshooting.md").count(startup) == 1
+    for name in ("README.md", "docs/development.md", "docs/other-clients.md",
+                 "docs/troubleshooting.md"):
         text = _doc(name)
         assert startup in text and "8.5 seconds" not in text, name
 
@@ -362,11 +372,72 @@ def test_developer_guide_orders_the_ci_steps_as_the_workflow_does():
 
 
 def test_no_dashes_in_changed_text():
-    for name in ("README.md", "docs/development.md", "tfbs/mcp/server.py",
+    for name in ("README.md", "docs/development.md", "docs/other-clients.md",
+                 "docs/install-windows.md", "docs/troubleshooting.md", "docs/tools.md",
+                 "tfbs/mcp/server.py",
                  "tfbs/mcp/foldx_tools.py", "tfbs/pipelines/checkpoints.py",
                  "tfbs/pipelines/validate.py", "tfbs/configs/models/FlexibleMLP.yaml"):
         text = (REPO / name).read_text(encoding="utf-8")
         assert chr(0x2014) not in text and chr(0x2013) not in text, name
+
+
+def test_tool_list_page_matches_the_registered_tools():
+    """docs/tools.md has one row per tool, with its description's first paragraph."""
+    import re
+
+    import tfbs.mcp.foldx_tools  # noqa: F401  (registers the structure-based tools)
+
+    page = (REPO / "docs" / "tools.md").read_text(encoding="utf-8")
+    rows = dict(re.findall(r"^\| `([a-z_]+)` \| (.+?) \| \[", page, flags=re.M))
+    tools = {t.name: t.description for t in asyncio.run(server.mcp.list_tools())}
+    assert set(rows) == set(tools) and len(rows) == 33
+    for name, description in tools.items():
+        first = " ".join(inspect.cleandoc(description).split("\n\n")[0].split())
+        assert rows[name] == first, name
+
+
+def test_readme_links_to_files_that_exist():
+    import re
+
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    targets = re.findall(r"\]\(((?:docs/|LICENSE)[^)#]*)", readme)
+    assert "docs/figure1.png" in targets and "docs/tools.md" in targets
+    for target in targets:
+        assert (REPO / target).is_file(), target
+    # The layer diagram moved from the top of the README to the tool list.
+    assert "](architecture.png)" in (REPO / "docs" / "tools.md").read_text(encoding="utf-8")
+    assert (REPO / "docs" / "architecture.png").is_file()
+
+
+def test_docs_name_every_pipeline_that_needs_the_fimo_program():
+    """The three pipelines that run fimo are named wherever the docs list them."""
+    for name in ("docs/troubleshooting.md", "docs/install-windows.md"):
+        text = _doc(name)
+        for tool in ("tfbs_remap_validation", "tfbs_chipseq_method_comparison",
+                     "tfbs_disease_variant_validation"):
+            assert tool in text, (name, tool)
+    assert "These three pipelines run the `fimo` program itself" in _doc("docs/troubleshooting.md")
+    assert "Every other tool runs natively" in _doc("docs/install-windows.md")
+
+
+def test_troubleshooting_quotes_the_bed_errors_the_tool_returns(tmp_path):
+    """A ChIP-Atlas track line and a column-name header give the two quoted errors."""
+    pytest.importorskip("pyfaidx")
+    from tfbs.mcp.cli import demo_dir
+
+    genome = str(demo_dir() / "demo_genome.fa")
+    track = tmp_path / "chipatlas.bed"
+    track.write_text('track name="NKX2-1 (@ All cell types) 100" gffTags="on"\n'
+                     "demo_chr8\t100\t300\tID=SRX1\t223\t.\t100\t300\t0,227,255\n")
+    header = tmp_path / "header.bed"
+    header.write_text("chrom\tstart\tend\ndemo_chr8\t100\t300\n")
+    guide = _doc("docs/troubleshooting.md")
+    for bed, quoted in ((track, "Error tokenizing data. C error: Expected 1 fields in line 2, saw 9"),
+                        (header, "Non-integer start or end in")):
+        result = json.loads(asyncio.run(server.tfbs_extract_loci(
+            bed_path=str(bed), genome_fasta=genome, output_dir=str(tmp_path / bed.stem))))
+        assert quoted in result["error"], result
+        assert quoted in guide
 
 
 # ---------------------------------------------------------------------------
