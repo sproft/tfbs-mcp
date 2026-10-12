@@ -34,6 +34,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from tfbs.bedio import BedReadError, read_bed
 from tfbs.mcp.cli import SETUP_VARIABLES
 
 logger = logging.getLogger(__name__)
@@ -5009,7 +5010,10 @@ async def tfbs_extract_loci(
     base other than A/C/G/T, one-hot encodes the rest (N, 4, in_window)
     and optionally keeps a continuous score column for regression.
     Standard BED (3+ columns) and ChIP-Atlas aggregated BED (9 columns,
-    MACS2 score in column 5) both work.
+    MACS2 score in column 5) both work.  Blank lines and lines that start
+    with #, track or browser are skipped; a # inside a line is data (such
+    as "Catalog#: ..." in column 4 of a ChIP-Atlas BED), so the columns
+    after it are kept.
 
     Negatives (negatives=...): written to <output_dir>/negatives/
     sequences.pt, ready for tfbs_prepare_classification(positive_path=
@@ -5256,10 +5260,21 @@ async def tfbs_extract_loci(
 
 def _extract_bed_windows(bed, genome, chrom_lengths, in_window, max_sequences,
                          score_column, random_seed) -> dict[str, Any] | str:
-    """Windows centred on the BED intervals; an error JSON string on failure."""
+    """Windows centred on the BED intervals; an error JSON string on failure.
+
+    Blank lines and lines starting with #, track or browser are skipped
+    (tfbs.bedio); a "#" inside a line, such as "Catalog#: ..." in column 4
+    of a ChIP-Atlas BED, is data.  gzip, bzip2, xz, single-file zip and
+    zstd files are decompressed; one that cannot be gives its own error.
+    """
     try:
-        bed_df = _pd.read_csv(bed, sep="\t", header=None, comment="#")
-    except (_pd.errors.EmptyDataError, _pd.errors.ParserError, UnicodeDecodeError) as exc:
+        bed_df = read_bed(bed)
+    except BedReadError as exc:
+        return _error(f"Could not read BED file {bed}: {exc.reason}",
+                      "Decompress the file yourself (gunzip, bunzip2, xz -d, unzip or "
+                      "zstd -d) and pass the plain BED file. If that fails too, the file "
+                      "is damaged: download it again.")
+    except (_pd.errors.EmptyDataError, _pd.errors.ParserError, OSError) as exc:
         return _error(f"Could not read BED file {bed}: {exc}",
                       "Pass a tab-separated BED file with chrom, start and end columns.")
     if bed_df.shape[1] < 3:
@@ -5271,7 +5286,8 @@ def _extract_bed_windows(bed, genome, chrom_lengths, in_window, max_sequences,
         ends = bed_df.iloc[:, 2].astype(int).to_numpy()
     except (ValueError, TypeError) as exc:
         return _error(f"Non-integer start or end in {bed}: {exc}",
-                      "Remove header lines that do not start with #, and check columns 2 and 3.")
+                      "Remove header lines that do not start with #, track or browser, "
+                      "and check columns 2 and 3.")
     num_input = len(bed_df)
 
     scores_raw = None

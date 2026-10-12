@@ -74,6 +74,7 @@ import torch.nn.functional as F
 from scipy.stats import mannwhitneyu
 from sklearn.metrics import roc_auc_score, roc_curve
 
+from tfbs.bedio import numbered_bed_lines
 from tfbs.nn.loading import load_checkpoint
 
 NUC_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
@@ -114,29 +115,28 @@ def _read_peaks(bed_path: str) -> tuple[pd.DataFrame, str | None]:
     rows: list[tuple[str, int, int]] = []
     counts: list[float | None] = []
     problem: str | None = None
-    # utf-8-sig: a byte order mark would otherwise become part of the first chrom.
-    with open(bed_path, encoding="utf-8-sig", errors="replace") as f:
-        for n, line in enumerate(f, 1):
-            if not line.strip() or line.startswith(("#", "track", "browser")):
-                continue
-            parts = line.rstrip("\r\n").split("\t")
-            if len(parts) < 3:
-                parts = line.split()
-            if len(parts) < 3:
-                raise ValueError(f"{bed_path} line {n} has fewer than 3 columns: "
-                                 f"{line.strip()[:80]!r}")
-            try:
-                start, end = int(parts[1]), int(parts[2])
-            except ValueError:
-                raise ValueError(f"{bed_path} line {n}: start and end must be integers: "
-                                 f"{line.strip()[:80]!r}") from None
-            rows.append((parts[0].strip(), start, end))
-            fourth = parts[3].strip() if len(parts) > 3 else None
-            count = _confidence(fourth)
-            counts.append(count)
-            if count is None and problem is None:
-                problem = (f"line {n} has no 4th column" if fourth is None
-                           else f"line {n} has {fourth[:60]!r} in column 4")
+    # n counts every line of the file; blank, #, track and browser lines are
+    # skipped (tfbs.bedio, utf-8-sig so a byte order mark is not part of the
+    # first chrom).
+    for n, line in numbered_bed_lines(bed_path):
+        parts = line.split("\t")
+        if len(parts) < 3:
+            parts = line.split()
+        if len(parts) < 3:
+            raise ValueError(f"{bed_path} line {n} has fewer than 3 columns: "
+                             f"{line.strip()[:80]!r}")
+        try:
+            start, end = int(parts[1]), int(parts[2])
+        except ValueError:
+            raise ValueError(f"{bed_path} line {n}: start and end must be integers: "
+                             f"{line.strip()[:80]!r}") from None
+        rows.append((parts[0].strip(), start, end))
+        fourth = parts[3].strip() if len(parts) > 3 else None
+        count = _confidence(fourth)
+        counts.append(count)
+        if count is None and problem is None:
+            problem = (f"line {n} has no 4th column" if fourth is None
+                       else f"line {n} has {fourth[:60]!r} in column 4")
     if not rows or problem is not None:
         nums: list[float | int] = [1] * len(rows)
     elif all(float(c).is_integer() for c in counts):
@@ -157,9 +157,11 @@ def read_peaks_bed(bed_path: str) -> pd.DataFrame:
     allintersect format, 9 columns, keeps the experiment overlap count
     there; a fractional count is kept as it is); otherwise num is 1 for
     every peak.  Blank, comment (#), track and browser lines are skipped,
-    and a UTF-8 byte order mark is ignored.  Raises ValueError naming the
-    line when a line has fewer than 3 columns or a start or end that is
-    not an integer.
+    a UTF-8 byte order mark is ignored, and a gzip, bzip2, xz, zip (one
+    file) or zstd compressed file is read like a plain one (tfbs.bedio).
+    Raises ValueError naming the line when a line has fewer than 3 columns
+    or a start or end that is not an integer, and tfbs.bedio.BedReadError
+    (an OSError) for a compressed file that cannot be decompressed.
     """
     return _read_peaks(bed_path)[0]
 
