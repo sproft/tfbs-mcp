@@ -76,7 +76,7 @@ To talk to the server without Claude, use the MCP Inspector:
 npx -y @modelcontextprotocol/inspector "$(which tfbs-mcp)"
 ```
 
-The reference-data variables (`TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE`, `TFBS_FOLDX_PDB`, `TFBS_CLINVAR_VCF`, `TFBS_PROJECT_ROOT`) are read from the server's environment, so export them in the shell before starting the Inspector.
+The reference-data variables (`TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE`, `TFBS_FOLDX_PDB`, `TFBS_CLINVAR_VCF`, `TFBS_PROJECT_ROOT`) are read from the server's environment, so export them in the shell before starting the Inspector. `tfbs_server_info` reports the four reference files as `reference_files`, one entry per variable with `path` (the value, expanded and made absolute as the tools resolve it, or null when unset) and `exists` (whether that path exists, null when unset), so calling it in the Inspector shows whether the server sees them; `TFBS_PROJECT_ROOT` it reports as `project_root`.
 
 The server imports PyTorch, Lightning, scikit-learn, captum, tangermeme and the genomics libraries before it answers the first message, so starting it takes about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one Windows 10 machine with a CPU build of PyTorch) and every tool call answers at once afterwards. This is required on Windows: a native extension imported for the first time after the stdio loop has started never finishes loading there. A tool that adds a function-level import of a library with native code must add it to `_NATIVE_MODULES` in `tfbs/mcp/server.py`; a test checks this.
 

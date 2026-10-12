@@ -23,7 +23,7 @@ Load models, score sequences, explain predictions and scan for motifs.
 | `tfbs_classify_metrics` | Compute ROC-AUC and PR-AUC from positive and negative score lists. | [Compute classification metrics for your own scores](../README.md#compute-classification-metrics-for-your-own-scores) |
 | `tfbs_fimo` | Run FIMO motif scanning on DNA sequences. | [Scan sequences for a motif](../README.md#scan-sequences-for-a-motif) |
 | `tfbs_list_models` | List all TFBS models currently loaded in the server. | [Step 4: Test it](../README.md#step-4-test-it) |
-| `tfbs_server_info` | Show the server's runtime environment and auto-detected defaults. | [Step 4: Test it](../README.md#step-4-test-it) |
+| `tfbs_server_info` | Show the server's runtime environment, defaults and registered reference files. | [Step 4: Test it](../README.md#step-4-test-it) |
 
 ## SLURM management (5 tools)
 

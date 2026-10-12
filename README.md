@@ -11,6 +11,7 @@ tfbs-mcp lets you analyse transcription factor (TF) binding sites by asking Clau
 | I want to ... | Besides the install I need | Go to |
 |---|---|---|
 | try it without downloading anything | nothing | [Try it with the bundled example](#try-it-with-the-bundled-example) |
+| register my files by telling Claude where they are | Claude Code; the files on my disk | [Tell Claude where your files are](#tell-claude-where-your-files-are) |
 | score sequences or ChIP-seq peaks with the published NKX2-1 model | the released models (30 MB); a genome for peaks | [Score sequences or peaks](#score-sequences-or-peaks-with-the-released-nkx2-1-models) |
 | find out whether a variant changes binding | a model and a genome | [Check what a variant does](#check-what-a-variant-does) |
 | get ROC-AUC and PR-AUC for scores from any tool | nothing | [Compute classification metrics](#compute-classification-metrics-for-your-own-scores) |
@@ -147,7 +148,7 @@ Setup is complete. Pick a task from [What you can do](#what-you-can-do). A tool 
 
 ## What do you want to do?
 
-Each task says what you need, what to type into Claude's chat, what happens and what you get. Replace the parts in `<angle brackets>` with your own paths. A genome, motif or ClinVar file you registered (see [Registering your data](#registering-your-data)) need not be named in the prompt; a path in the prompt always wins. A loaded model stays loaded until Claude restarts the server, so later prompts can refer to it by its name. The tool names in parentheses are only for reference ([all tools](docs/tools.md)).
+Each task says what you need, what to type into Claude's chat, what happens and what you get. Replace the parts in `<angle brackets>` with your own paths. A genome, motif or ClinVar file you registered (see [Tell Claude where your files are](#tell-claude-where-your-files-are)) need not be named in the prompt; a path in the prompt always wins. A loaded model stays loaded until Claude restarts the server, so later prompts can refer to it by its name. The tool names in parentheses are only for reference ([all tools](docs/tools.md)).
 
 ### Try it with the bundled example
 
@@ -168,8 +169,23 @@ Each task says what you need, what to type into Claude's chat, what happens and 
   > Download into <~/tfbs-data>: hg38.fa.gz from UCSC (then gunzip it); the ChIP-Atlas NKX2-1 peaks https://chip-atlas.dbcls.jp/data/hg38/assembled/Oth.ALL.10.NKX2-1.AllCell.bed without its first (track) line; the JASPAR motif https://jaspar.elixir.no/api/v1/matrix/MA1994.1.meme; the GRCh38 clinvar.vcf.gz from NCBI with its .tbi index; and the released NKX2-1 models https://zenodo.org/api/records/21399578/files/sproft/nkx2-1-tfbs-variants-v1.0.0.zip/content, unzipped. Then run `tfbs-mcp --setup --non-interactive` with `--genome`, `--motif` and `--clinvar` set to those files, replace my Claude Code registration of `tfbs` with the `claude mcp add` command it prints, and tell me where the models are.
 
   For the ReMap check, add *and the ReMap 2022 NKX2-1 peaks https://remap.univ-amu.fr/storage/remap2022/hg38/MACS2/TF/NKX2-1/remap2022_NKX2-1_nr_macs2_hg38_v1_0.bed.gz, gunzipped*. The ChIP-Atlas file holds the peaks of all NKX2-1 experiments at MACS2 q < 1e-10 (`10`); `05` and `20` in the name give 1e-5 and 1e-20.
-- **What happens:** Claude downloads and unpacks the files with its shell, runs `tfbs-mcp --setup --non-interactive` (which asks nothing and only prints), then `claude mcp remove tfbs --scope user` and the printed `claude mcp add` line. Claude's shell finds `tfbs-mcp` only if you started `claude` with the environment active; otherwise give it the path that `tfbs-mcp --check` prints.
-- **You get:** `hg38.fa`, the peak BED, `MA1994.1.meme`, `clinvar.vcf.gz` with its `.tbi`, and the models folder, with the first three registered as `TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE` and `TFBS_CLINVAR_VCF`. Restart Claude Code so the server starts with them. Each setup run replaces the whole registration, see [Registering your data](#registering-your-data).
+- **What happens:** Claude downloads and unpacks the files with its shell, runs `tfbs-mcp --setup --non-interactive` (which asks nothing and only prints), then replaces the registration with the printed `claude mcp add` line, as [Tell Claude where your files are](#tell-claude-where-your-files-are) describes; that section also covers adding the FoldX structure or a project folder later.
+- **You get:** `hg38.fa`, the peak BED, `MA1994.1.meme`, `clinvar.vcf.gz` with its `.tbi`, and the models folder, with the first three registered as `TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE` and `TFBS_CLINVAR_VCF`. Restart Claude Code so the server starts with them.
+
+### Tell Claude where your files are
+
+[Get the data with Claude's help](#get-the-data-with-claudes-help) already registers the genome, motif and ClinVar file. Use this section to add, change or check registrations, such as a FoldX structure or your project folder, so that later prompts need not name them.
+
+- **You need:** Claude Code, and the files on your disk. Claude's shell finds `tfbs-mcp` when you started `claude` with the environment active; otherwise give Claude the path that `tfbs-mcp --check` prints.
+- **Say to Claude**, one request at a time:
+  - *Register several files at once:* My reference genome is at <~/tfbs-data/hg38.fa>, the NKX2-1 motif at <~/tfbs-data/MA1994.1.meme> and ClinVar at <~/tfbs-data/clinvar.vcf.gz>; my project folder is <~/tfbs-project>. Register them by running `tfbs-mcp --setup --non-interactive` with those paths as flags, replace my Claude Code registration of tfbs with the `claude mcp add` command it prints, and tell me to restart.
+  - *Add one file later*, for example the repaired structure from [the structure task](#compute-structure-based-binding-energy): Read the current registration with `claude mcp get tfbs`, then run `tfbs-mcp --setup --non-interactive` with the registered paths plus `--foldx-pdb` <~/tfbs-data/3RKQ_Repair.pdb>, replace my Claude Code registration of tfbs with the `claude mcp add` command it prints, keeping any other variable the old registration had, and tell me to restart.
+  - *Check what is registered:* Call tfbs_server_info and tell me which reference files the tfbs server sees and whether each exists.
+- **What happens:**
+  - To register, Claude runs `tfbs-mcp --setup --non-interactive` in its shell with the flags for your files (`--genome`, `--motif`, `--clinvar`, `--foldx-pdb`, `--project-root`). That form asks nothing and only prints; a path that does not exist stops it with an error naming the flag. Claude then runs `claude mcp remove tfbs --scope user` and the printed `claude mcp add tfbs --scope user --env KEY=VALUE ... -- "<path>"` line, and tells you to restart Claude Code (`/exit`, then `claude`), because the server reads the paths when it starts.
+  - Because [each setup run replaces the whole registration](#registering-your-data), Claude adds a file by passing the registered paths again with the new one, and puts a variable that setup does not ask for, such as `TFBS_SLURM_PARTITION`, back into the `--env` list of the printed line.
+  - To check, Claude calls `tfbs_server_info`. This works in Claude Desktop's chat too, which cannot run shell commands; there you register by running `tfbs-mcp --setup` in a terminal and replacing the `tfbs` entry with the printed block, as [Registering your data](#registering-your-data) explains.
+- **You get:** after the restart, the files registered as `TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE`, `TFBS_CLINVAR_VCF`, `TFBS_FOLDX_PDB` and `TFBS_PROJECT_ROOT`. The check lists the four reference files under `reference_files`, each with its path as the tools resolve it (null when none is registered) and whether that path exists, and the project folder as `project_root`. When no project folder is registered, `project_root` shows the fallback (the repository root in a clone, else the server's working directory). A file that no longer exists is the one to register again.
 
 ### Score sequences or peaks with the released NKX2-1 models
 
@@ -285,7 +301,7 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 Each input is optional; register the ones your tasks need, so prompts need not name them. Register in one of two ways:
 
 - **In your own terminal**, with the environment active: `tfbs-mcp --setup`. It asks for each path (Enter skips one; a path that does not exist is asked again), prints the Claude Code command and the Claude Desktop block with your paths filled in, and, when the `claude` command is on your PATH, asks `Register with Claude Code now? [y/N]`. For Claude Desktop, replace the `tfbs` entry in **Settings > Developer > Edit Config** with the printed block, then quit and reopen the app.
-- **Through Claude Code**, for files already on your disk. Say: *Register my files with tfbs: genome \</path/hg38.fa>, motif \</path/MA1994.1.meme>. Run `tfbs-mcp --setup --non-interactive` with those flags, replace the tfbs registration with the `claude mcp add` command it prints, and tell me to restart.*
+- **Through Claude Code**: tell Claude where the files are, see [Tell Claude where your files are](#tell-claude-where-your-files-are).
 
 **Each run replaces the whole registration** with the paths given in that run, so name every path again, e.g. `--genome ... --motif ... --clinvar ... --foldx-pdb ...`, and add any variable you set by hand (such as `TFBS_SLURM_PARTITION`) again. `claude mcp get tfbs` shows what is registered now. Restart Claude Code (`/exit`, then `claude`) after a change.
 
@@ -299,13 +315,7 @@ Each input is optional; register the ones your tasks need, so prompts need not n
 | Model checkpoint | prediction, interpretation, validation and benchmarks | the released NKX2-1 models (doi:10.5281/zenodo.21399578), or one you train | none; name it in your prompt |
 | Project directory | training, benchmark and validation tools | any directory; it holds `data/`, `saved_models/` and `results/` ([details](docs/development.md#where-the-tools-find-checkpoints)). Unset: the repository root in a clone, else the server's working directory | `TFBS_PROJECT_ROOT` |
 
-Flags prefill answers, so you are not asked for those variables: `--genome PATH`, `--motif PATH`, `--clinvar PATH`, `--foldx-pdb PATH`, `--project-root PATH`. A prefilled path is still checked. `--demo` prefills `--genome` and `--motif` with the bundled example data. `--non-interactive` asks nothing: it uses only the flags, never offers to register, and just prints both forms. For example:
-
-```bash
-tfbs-mcp --setup --genome /data/hg38/hg38.fa --motif /data/JASPAR/MA1994.1.meme --non-interactive
-```
-
-Then run `claude mcp remove tfbs --scope user` and the printed `claude mcp add` line. Claude Code keeps the variables in the user-scope `tfbs` entry of `~/.claude.json` (do not edit that file by hand), Claude Desktop in the `env` block of the `tfbs` entry.
+Flags prefill answers, so you are not asked for those variables: `--genome PATH`, `--motif PATH`, `--clinvar PATH`, `--foldx-pdb PATH`, `--project-root PATH`. A prefilled path is still checked. `--demo` prefills `--genome` and `--motif` with the bundled example data. `--non-interactive` asks nothing: it uses only the flags, never offers to register, and only prints. For example, `tfbs-mcp --setup --genome /data/hg38/hg38.fa --motif /data/JASPAR/MA1994.1.meme --non-interactive` prints both forms for a genome and a motif. Then replace the registration with the printed `claude mcp add` line, removing the old entry first as [By hand](#by-hand) shows. Claude Code keeps the variables in the user-scope `tfbs` entry of `~/.claude.json` (do not edit that file by hand), Claude Desktop in the `env` block of the `tfbs` entry.
 
 ### By hand
 

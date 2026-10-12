@@ -34,6 +34,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from tfbs.mcp.cli import SETUP_VARIABLES
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -509,8 +511,11 @@ def _resolve_reference(value: str | None, arg: str) -> tuple[Path | None, str | 
     if not raw:
         return None, json.dumps({
             "error": f"No {what} configured.",
-            "fix": f"Pass {arg}=/path/to/file, or set {env_var} in the 'env' "
-                   f"block of your MCP client config.",
+            "fix": f"Pass {arg}=/path/to/file, or register it as {env_var}: run "
+                   f"`{_setup_command(env_var)}` (with the flags of the files "
+                   f"already registered, since each run replaces the whole "
+                   f"registration), apply the Claude Code command or Claude "
+                   f"Desktop block it prints, and restart the client.",
         })
     path = Path(raw).expanduser().resolve()
     if not path.exists():
@@ -519,6 +524,35 @@ def _resolve_reference(value: str | None, arg: str) -> tuple[Path | None, str | 
             "fix": f"Check the {arg} argument or the {env_var} environment variable.",
         })
     return path, None
+
+
+def _setup_command(env_var: str) -> str:
+    """The ``tfbs-mcp --setup`` call that registers ``env_var``, for fix texts."""
+    flag = next(v.flag for v in SETUP_VARIABLES if v.env == env_var)
+    return f"tfbs-mcp --setup --non-interactive {flag} /path/to/file"
+
+
+def _reference_files() -> dict[str, dict]:
+    """The registered reference files, as tfbs_server_info reports them.
+
+    One entry per reference variable (TFBS_GENOME_FASTA, TFBS_MOTIF_FILE,
+    TFBS_CLINVAR_VCF, TFBS_FOLDX_PDB): ``path`` is the variable's value
+    expanded and made absolute the way the tools resolve it, or None when it
+    is unset or empty; ``exists`` says whether that path exists, the same
+    check the tools make, and is None when no path is set.
+    """
+    files: dict[str, dict] = {}
+    for arg in ("genome_fasta", "motif_file", "clinvar_vcf", "foldx_pdb"):
+        raw = os.environ.get(REFERENCE_DATA_ENV[arg], "").strip()
+        path, exists = None, None
+        if raw:
+            try:
+                resolved = Path(raw).expanduser().resolve()
+                path, exists = str(resolved), resolved.exists()
+            except (OSError, RuntimeError, ValueError):
+                path, exists = raw, False
+        files[REFERENCE_DATA_ENV[arg]] = {"path": path, "exists": exists}
+    return files
 
 
 def _optional_reference(value: str | None, arg: str) -> tuple[Path | None, str | None]:
@@ -2850,13 +2884,26 @@ async def tfbs_list_models() -> str:
     },
 )
 async def tfbs_server_info() -> str:
-    """Show the server's runtime environment and auto-detected defaults.
+    """Show the server's runtime environment, defaults and registered reference files.
 
     Reports whether the server is running inside a SLURM job, how many
     GPUs are visible, the default device and batch size, the default SLURM
-    partition, and the torch version and CUDA status.  The server imports
+    partition, the reference files registered for the server (genome,
+    motif, ClinVar VCF and FoldX structure) and whether each exists, and
+    the torch version and CUDA status.  The server imports
     PyTorch and the other native libraries at startup, so every call,
     this one included, answers at once.
+
+    To register or change the reference files and the project folder, run
+    `tfbs-mcp --setup --non-interactive` in a shell with the flags
+    --genome, --motif, --clinvar, --foldx-pdb and --project-root.  It
+    asks nothing, checks each path and prints the `claude mcp add` command
+    for Claude Code and the env block for Claude Desktop.  Each run
+    replaces the whole registration, so pass the paths already registered
+    too (`claude mcp get tfbs` shows them), and keep any other variable
+    such as TFBS_SLURM_PARTITION.  For Claude Code, run
+    `claude mcp remove tfbs --scope user`, then the printed command; the
+    server reads the paths when it starts, so restart the client.
 
     Returns:
         JSON with on_slurm, slurm_job_id, slurm_partition (partition of the
@@ -2872,7 +2919,15 @@ async def tfbs_server_info() -> str:
         working directory), project_root (working directory of the
         validation and benchmark pipelines, against which their relative
         models_dir resolves: $TFBS_PROJECT_ROOT, else the checkout, else the
-        server's working directory), loaded_models, torch_version,
+        server's working directory; it shows that fallback when
+        TFBS_PROJECT_ROOT is unset), reference_files (one entry per
+        reference variable, TFBS_GENOME_FASTA, TFBS_MOTIF_FILE,
+        TFBS_CLINVAR_VCF and TFBS_FOLDX_PDB, each {"path": the registered
+        path, expanded and made absolute as the tools resolve it, or null,
+        "exists": whether that path exists, null when no path is set}; the
+        tools that read a variable fall back to it when a call passes no
+        path),
+        loaded_models, torch_version,
         cuda_version (CUDA version of the PyTorch build, null for CPU
         builds) and cuda_available, plus cuda_device_name and
         cuda_device_count when CUDA is available.
@@ -2887,6 +2942,7 @@ async def tfbs_server_info() -> str:
     info["call_log"] = os.environ.get(CALL_LOG_ENV, "").strip() or None
     info["results_dir"] = str(_results_root())
     info["project_root"] = str(_project_root())
+    info["reference_files"] = _reference_files()
     info["torch_version"] = _torch.__version__
     info["cuda_version"] = _torch.version.cuda
     info["cuda_available"] = _torch.cuda.is_available()
