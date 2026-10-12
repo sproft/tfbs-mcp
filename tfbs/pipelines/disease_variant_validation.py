@@ -529,9 +529,12 @@ def score_with_foldx(df: pd.DataFrame, genome, foldx_pdb: str, n_workers: int = 
         idx, ref, alt = args_tuple
         return idx, score_seq(ref), score_seq(alt)
 
-    from multiprocessing import Pool
+    # A thread pool, not a process pool: each worker only spawns and waits
+    # for a FoldX process, and the closures above cannot be pickled for a
+    # spawned or forkserver child.
+    from multiprocessing.pool import ThreadPool
     items = [(i, ref_seqs[i], alt_seqs[i]) for i in range(len(ref_seqs))]
-    with Pool(n_workers) as pool:
+    with ThreadPool(n_workers) as pool:
         results = list(pool.imap_unordered(process, items, chunksize=1))
 
     by_idx = {idx: (er, ea) for idx, er, ea in results}

@@ -582,7 +582,6 @@ def test_extract_seq_pair_default_length_is_twice_half_window_and_tries_both_con
 
 def test_foldx_leg_scores_an_eleven_bp_duplex_and_keeps_every_row(monkeypatch):
     """The 11 bp crystal duplex needs an 11 bp window; unscorable rows stay with NaN."""
-    import multiprocessing
     from tfbs.mcp import foldx_tools
 
     genome = _Genome({"chr1": "ACGTACGTAC" + "T" + "GCATGCATGC" + "A" * 30})
@@ -595,20 +594,8 @@ def test_foldx_leg_scores_an_eleven_bp_duplex_and_keeps_every_row(monkeypatch):
     monkeypatch.setattr(foldx_tools, "_run_foldx_energy",
                         lambda binary, pdb, wd, ms: -8.0 if ms and "XT6" in ms else -7.5)
 
-    class _SerialPool:
-        def __init__(self, n):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def imap_unordered(self, fn, items, chunksize=1):
-            return [fn(item) for item in items]
-
-    monkeypatch.setattr(multiprocessing, "Pool", _SerialPool)
+    # The real thread pool runs here: the fakes above are module attributes
+    # that worker threads share, which a process pool could not pickle.
     df = pd.DataFrame([
         {"chrom": "chr1", "pos": 11, "ref": "T", "alt": "G", "label": "pathogenic", "nn_m_dd": 0.5},
         {"chrom": "chr1", "pos": 2, "ref": "C", "alt": "A", "label": "benign", "nn_m_dd": 0.1},  # window runs off the contig start
