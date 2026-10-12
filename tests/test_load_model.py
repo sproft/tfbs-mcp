@@ -2,6 +2,7 @@
 and tfbs_predict returning scores in the original label units."""
 import asyncio
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -119,6 +120,8 @@ def strict(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(tmp_path / "pkgs"))
     for key in ("strictshim", "strictshim.models"):
         monkeypatch.delitem(sys.modules, key, raising=False)
+    # A model class is one defined in tfbs.nn.models under its own name.
+    monkeypatch.setattr(StrictLoader, "__module__", server._models.__name__)
     monkeypatch.setattr(server._models, "StrictLoader", StrictLoader, raising=False)
     monkeypatch.setattr(StrictLoader, "calls", 0)
     yield
@@ -521,6 +524,33 @@ def test_inference_checkpoint_errors_are_json(tmp_path):
     assert "lm_inf" not in server._model_registry
 
 
+def test_a_bare_state_dict_or_a_corrupt_file_is_a_json_error(tmp_path):
+    bare = tmp_path / "weights.pt"
+    torch.save(_tiny_vcnn().state_dict(), bare)
+    corrupt = tmp_path / "corrupt.pt"
+    corrupt.write_bytes(b"not a checkpoint")
+    empty = tmp_path / "empty.ckpt"
+    empty.write_bytes(b"")
+    for path, expected in ((bare, "is a bare state_dict"), (corrupt, "is not a PyTorch checkpoint"),
+                           (empty, "is not a PyTorch checkpoint")):
+        result = _load_vcnn(path, model_id="lm_badfile")
+        assert expected in result["error"] and str(path) in result["error"], result
+        assert "{arch, hyper_parameters, state_dict}" in result["fix"]
+        assert "pytorch-lightning_version" not in json.dumps(result)
+        assert "weights_only" not in json.dumps(result)
+    assert "lm_badfile" not in server._model_registry
+
+
+def test_a_helper_class_is_not_a_model_type(tmp_path):
+    ckpt = _save_ckpt(tmp_path / "best.ckpt")
+    result = run(server.tfbs_load_model("lm_base", str(ckpt), "BaseModel", device="cpu"))
+    assert result["error"] == "Unknown model_type 'BaseModel'."
+    assert "BaseModel" not in result["available"] and "SimpleCNN" in result["available"]
+    from tfbs.nn.loading import model_class_names
+
+    assert result["available"] == model_class_names()
+
+
 def test_lightning_checkpoints_report_their_format(tmp_path):
     ckpt = _save_ckpt(tmp_path / "best.ckpt")
     assert _load(ckpt)["checkpoint_format"] == "lightning"
@@ -532,7 +562,9 @@ def test_load_model_description_names_both_formats():
     assert "doi:10.5281/zenodo.21399578" in doc and "Lightning checkpoint" in doc
 
 
-RELEASED_FLANK = Path("D:/claude_code/nkx2-1-tfbs-variants/models/flank/vcnnbpnet.pt")
+# The released models: a folder holding <library>/vcnnbpnet.pt, as in test_shared_loader.
+RELEASED_FLANK = Path(os.environ.get("TFBS_RELEASED_MODELS")
+                      or "D:/claude_code/nkx2-1-tfbs-variants/models") / "flank" / "vcnnbpnet.pt"
 
 
 @pytest.mark.skipif(not RELEASED_FLANK.is_file(), reason="the released NKX2-1 checkpoints are not on this machine")

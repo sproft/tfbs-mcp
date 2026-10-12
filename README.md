@@ -1,12 +1,40 @@
 # tfbs-mcp
 
-A Python library and Model Context Protocol (MCP) server for transcription factor binding site analysis. The library packages neural network architectures, ChIP-seq data pipelines, attribution and motif analysis, and structure-based binding-energy scoring. The MCP server exposes 33 of these operations as tools that Claude can call directly, so Claude can compose a full TFBS analysis from a natural-language goal.
+tfbs-mcp lets you analyse transcription factor (TF) binding sites by asking Claude in plain language. Ask whether a variant weakens binding, train a binding-site model on your ChIP-seq peaks, see which bases a model relies on, compute the binding energy of a TF-DNA crystal structure, or test a model against ReMap peaks and ClinVar variants, head to head with motif scanning (FIMO) and structure-based energy (FoldX). Claude chooses the steps, runs them on your computer (or on a SLURM cluster) and answers with the numbers.
 
-This page explains how to install the server and connect it to Claude. The Python library, model training, the test suite and the project layout are described in [docs/development.md](docs/development.md). AI apps other than Claude are covered in [docs/other-clients.md](docs/other-clients.md).
+![What you ask, what Claude runs and what you get, for five typical questions](docs/figure1.png)
+
+*Figure 1. Five typical questions. You type the question into Claude's chat; Claude chains the tfbs-mcp tools on your own files and answers with the result. Each question has its own section under [What do you want to do?](#what-do-you-want-to-do)*
+
+## What you can do
+
+| I want to ... | Besides the install I need | Go to |
+|---|---|---|
+| try it without downloading anything | nothing | [Try it with the bundled example](#try-it-with-the-bundled-example) |
+| register my files by telling Claude where they are | Claude Code; the files on my disk | [Tell Claude where your files are](#tell-claude-where-your-files-are) |
+| score sequences or ChIP-seq peaks with the published NKX2-1 model | the released models (30 MB); a genome for peaks | [Score sequences or peaks](#score-sequences-or-peaks-with-the-released-nkx2-1-models) |
+| find out whether a variant changes binding | a model and a genome | [Check what a variant does](#check-what-a-variant-does) |
+| get ROC-AUC and PR-AUC for scores from any tool | nothing | [Compute classification metrics](#compute-classification-metrics-for-your-own-scores) |
+| train a binding-site classifier on my ChIP-seq peaks | a peak BED and a genome; a SLURM cluster for large sets | [Train your own classifier](#train-your-own-classifier-from-chip-seq-peaks) |
+| see which bases drive a prediction, or which motifs a model learned | a model | [Understand what a model learned](#understand-what-a-model-learned) |
+| scan sequences for a known motif | a motif file | [Scan sequences for a motif](#scan-sequences-for-a-motif) |
+| get my TF's structure on DNA and its binding energy | FoldX, internet | [Structure-based binding energy](#compute-structure-based-binding-energy) |
+| test a model on ReMap peaks against FIMO and FoldX | the released models or one I trained, ReMap BED, genome, motif, MEME Suite, FoldX | [Validate against ReMap](#validate-a-model-against-remap) |
+| test whether a model separates pathogenic from benign ClinVar variants | the released models or one I trained, ClinVar, peaks, genome; Linux, macOS or WSL | [Check ClinVar variants](#check-clinvar-disease-variants-in-your-tfs-peaks) |
+| compare a model's scores on the peaks of several TFs | ChIP-Atlas intersection files, genome, the released models or one I trained | [Benchmark on ChIP-Atlas](#benchmark-against-other-tfs-on-chip-atlas) |
+| run the long jobs on an HPC cluster | SLURM | [Run on a SLURM cluster](#run-on-a-slurm-cluster) |
+
+[Get the data with Claude's help](#get-the-data-with-claudes-help) downloads the genome, peaks, motif, ClinVar and the released models with one prompt.
+
+**An example.** With the bundled demo registered and the released models downloaded, you type:
+
+> Load the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt (model type VCNNBpnet) and tell me whether the variant demo_chr8:830:T>G weakens NKX2-1 binding. Compare the 24 bp reference and variant windows centred on it, cut from the registered genome.
+
+Claude answers along these lines: *Yes. The predicted binding falls from 1.07 to -0.54 log2 fold change, a loss of 1.6, so binding at the variant site is predicted to be about 3 times weaker. The change turns the CAAG core of the motif (read on the minus strand) into CACG.* To get there it loaded the model, cut the reference and variant windows from the demo genome, scored both and compared them. To run this yourself: install (below), run `tfbs-mcp --setup --demo` ([details](#try-it-with-the-bundled-example)), download the released models ([link](#score-sequences-or-peaks-with-the-released-nkx2-1-models)), then paste the prompt with your models folder in place of `<models>`.
 
 ## Installation
 
-Setup takes about 20 minutes, most of it waiting for PyTorch to download. The commands are written for Linux. macOS uses the same commands. Windows differs in two places, listed under [Windows](#windows) at the end of this section.
+Setup takes about 20 minutes, most of it waiting for PyTorch to download. The commands are written for Linux. macOS uses the same commands. Windows differs in a few places, described in [docs/install-windows.md](docs/install-windows.md).
 
 ### What you need
 
@@ -22,18 +50,14 @@ Setup takes about 20 minutes, most of it waiting for PyTorch to download. The co
 
 ### Step 1: Create an environment
 
-An environment is a private folder for this project's Python packages, so the install cannot break anything else on your computer.
-
-With micromamba:
+An environment is a private folder for this project's Python packages, so the install cannot break anything else on your computer. With micromamba:
 
 ```bash
 micromamba create -n tfbs-mcp python=3.13 -c conda-forge
 micromamba activate tfbs-mcp
 ```
 
-Your prompt now starts with `(tfbs-mcp)`, which means the environment is active. In a new terminal window, run the `micromamba activate` line again before using `pip` or `tfbs-mcp`.
-
-If `micromamba activate` instead says the shell is not initialised, run the `micromamba shell init` command it suggests, open a new terminal, and run the activate line again. This happens once, right after installing micromamba.
+Your prompt now starts with `(tfbs-mcp)`, which means the environment is active. In a new terminal window, run the `micromamba activate` line again before using `pip` or `tfbs-mcp`. If `micromamba activate` instead says the shell is not initialised, run the `micromamba shell init` command it suggests, open a new terminal, and run the activate line again.
 
 With venv instead (Python 3.10 to 3.13 must already be installed):
 
@@ -50,9 +74,7 @@ Here the prompt starts with `(tfbs-env)`, and the `source` line is the one to re
 pip install "tfbs-mcp[mcp,genomics,viz] @ git+https://github.com/sproft/tfbs-mcp.git"
 ```
 
-This downloads PyTorch, roughly 2 to 3 GB, and can take 5 to 20 minutes. It is not stuck.
-
-Then check the installation:
+This downloads PyTorch, roughly 2 to 3 GB, and can take 5 to 20 minutes. It is not stuck. Then check the installation:
 
 ```bash
 tfbs-mcp --check
@@ -61,27 +83,19 @@ tfbs-mcp --check
 A working install ends like this (the paths will be your own):
 
 ```
-tfbs-mcp installation check
-
   [ok  ] Python 3.13.12
-  [ok  ] mcp 1.30.0
   [ok  ] server loads, 33 tools registered
   [ok  ] PyTorch 2.14.0
-  [ok  ] tangermeme 1.5.0
-  [ok  ] 6 training and validation pipelines and 13 model templates installed
-  [note] pyBigWig not installed: the bigWig track of tfbs_binding_scan needs it (pip install "tfbs-mcp[foldx]")
+  ...
   [note] wandb not installed: tfbs_sweep needs it (pip install "tfbs-mcp[tracking]")
   [ok  ] executable: /home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp
 
 Everything needed is installed. Connect the server with ONE of these:
-...
 ```
 
-If a line says `FAIL`, it also says how to fix it. A `note` line names an optional extra that one tool needs; every other tool works without it, and you can add the extra later with the `pip install` command shown. The command then prints the exact setup text for step 3, with the path to your installation already filled in.
+If a line says `FAIL`, it also says how to fix it. A `note` line names an optional extra that one tool needs; you can add it later with the `pip install` command shown. The command then prints the exact setup text for step 3, with the path to your installation filled in.
 
 ### Step 3: Connect Claude
-
-Use the part for the app you have.
 
 **Claude Code.** With the environment still active, run:
 
@@ -89,13 +103,7 @@ Use the part for the app you have.
 claude mcp add tfbs --scope user -- "$(which tfbs-mcp)"
 ```
 
-This does the same as the `claude mcp add` line that `tfbs-mcp --check` printed; either one works. Then list the servers:
-
-```bash
-claude mcp list
-```
-
-The list should contain `tfbs` with a connected status. Inside a Claude Code session, `/mcp` shows the same.
+This does the same as the `claude mcp add` line that `tfbs-mcp --check` printed. Then `claude mcp list` should list `tfbs` with a connected status; inside a Claude Code session, `/mcp` shows the same.
 
 **Claude Desktop.** Open **Settings > Developer > Edit Config**. This opens `claude_desktop_config.json`, and creates it if it does not exist yet. Paste the block that `tfbs-mcp --check` printed; it looks like this:
 
@@ -110,282 +118,225 @@ The list should contain `tfbs` with a connected status. Inside a Claude Code ses
 }
 ```
 
-Use the block from `--check` rather than this example, because it contains your real path. If the file already contains `"mcpServers"`, add only the `"tfbs": {...}` entry inside it, with a comma after the previous entry. Save, then quit Claude Desktop completely (closing the window is not enough) and open it again.
-
-You never start the server by hand. From now on, Claude starts it in the background whenever it needs a tool.
+Use the block from `--check` rather than this example, because it contains your real path. If the file already contains `"mcpServers"`, add only the `"tfbs": {...}` entry inside it, with a comma after the previous entry. Save, then quit Claude Desktop completely (closing the window is not enough) and open it again. You never start the server by hand: from now on, Claude starts it in the background whenever it needs a tool.
 
 ### Step 4: Test it
 
-Start Claude. For Claude Code, run this in the terminal:
-
-```bash
-claude
-```
-
-For Claude Desktop, open the app.
-
-Now type the following line into Claude's chat, the box where you normally write to Claude. It is a message for Claude, not a shell command. If you paste it into the terminal instead, the shell answers with something like `Command 'Check' not found`.
+Start Claude: `claude` in the terminal for Claude Code, or open the Claude Desktop app. Type the following line into Claude's chat, the box where you normally write to Claude. It is a message for Claude, not a shell command; pasted into the terminal, the shell answers with something like `Command 'Check' not found`.
 
 > Check the TFBS server environment. Is it running on SLURM, does it see a GPU, and what models are loaded?
 
-Claude calls the tools `tfbs_server_info` and `tfbs_list_models`, which need no data files, and summarises what they return. The reply should contain these points:
+The reply should say: **SLURM: No** (unless you are on an HPC cluster); the **GPU count and default device**, for example 0 GPUs and device `cpu` with batch size 64 (fine: the tools work on the CPU); **Models loaded: None** (expected until you load one); and the PyTorch version. The server loads PyTorch and its other libraries when it starts, which takes about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one Windows 10 machine with a CPU build of PyTorch); after that every call answers immediately. On a computer with an NVIDIA GPU but a CPU-only PyTorch build the device is `cpu`.
 
-- **SLURM: No.** Correct unless you are running on an HPC cluster with the SLURM scheduler.
-- **GPU count and default device.** For example 1 GPU and device `cuda` with batch size 512, or 0 GPUs and device `cpu` with batch size 64. Both are fine: the tools work on the CPU.
-- **Models loaded: None.** Expected. No model is loaded until you load one with `tfbs_load_model`.
-- **The PyTorch version and whether CUDA is available.** The server loads PyTorch and all its other native libraries when it starts. From launch to the first answer this takes about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one Windows 10 machine with a CPU build of PyTorch), timed over the stdio protocol with `scripts/record_demo_session.py`. After that every call answers immediately.
+### Step 5: First things to try
 
-The device is detected from the environment (SLURM variables, `CUDA_VISIBLE_DEVICES` or `nvidia-smi`) and checked against PyTorch at startup, so on a computer with an NVIDIA GPU but a CPU-only PyTorch build the answer says `cpu`.
+These need nothing but the install. Type them into Claude's chat.
 
-If something goes wrong in a tool, the error comes back as a normal answer such as `{"error": "...", "fix": "..."}`, not as a crash. If an answer looks wrong, ask Claude to show the raw tool response.
+> My tool scored five known binding sites 0.9, 0.8, 0.7, 0.6 and 0.55, and five non-sites 0.3, 0.2, 0.4, 0.1 and 0.65. How well does it separate them? Give ROC-AUC and PR-AUC.
 
-### Step 5: Use it
-
-Everything in this step is typed into Claude's chat, like the test prompt above.
-
-**Without any data.** These prompts work with nothing but the install:
-
-> One-hot encode these two 16 bp sequences and add their reverse complements: AAACACTTGAGGCAAA and TTTGCCTCAAGTGTTT.
-
-Claude calls `tfbs_preprocess` and reports a tensor of shape `[4, 4, 16]` for 4 sequences: the two inputs plus their reverse complements. The first sequence contains `CACTTGA`, the core of the NKX2-1 motif, and the second is its reverse complement.
-
-> Compute ROC-AUC and PR-AUC for a classifier that scored the positive examples 0.9, 0.8, 0.7, 0.6 and the negative examples 0.3, 0.2, 0.4, 0.1.
-
-Claude calls `tfbs_classify_metrics` and reports ROC-AUC 1.0 and PR-AUC 1.0, because every positive scores above every negative.
+Claude reports ROC-AUC 0.92 and PR-AUC 0.92: the one non-site at 0.65 outscores two sites. This works for scores from any tool, see [Compute classification metrics](#compute-classification-metrics-for-your-own-scores).
 
 > Download PDB entry 3RKQ, an NKX2-5 homeodomain bound to DNA, from RCSB and tell me where the file was saved.
 
-Claude calls `tfbs_fetch_structure` with the PDB id `3RKQ`, downloads the structure from RCSB into `<results>/structures/3RKQ/`, where `<results>` is the `results_dir` that `tfbs_server_info` reports, and returns the path. This is the one prompt here that needs internet access, and it writes a file.
+Claude downloads the crystal structure into `<results>/structures/3RKQ/`, where `<results>` is the server's `results_dir` (Claude can tell you which), and says that it contains DNA. This needs internet access. With FoldX installed, [the structure task](#compute-structure-based-binding-energy) computes its binding energy.
 
-> Check the TFBS server environment again. Which device and batch size will it use for predictions?
+> Turn AAACACTTGAGGCAAA and TTTGCCTCAAGTGTTT into the one-hot format the models read, with their reverse complements.
 
-Claude calls `tfbs_server_info` once more and reports the default device and batch size the prediction tools use when a call does not set them, together with the PyTorch version and whether CUDA is available.
+Claude writes a tensor of 4 sequences (the two inputs and their reverse complements) of 16 positions each and says where it is. You need this only to feed sequences to your own scripts or training runs; the scoring tools encode sequences themselves.
 
-Setup is complete. The remaining tools need reference files such as a genome, which you can add at any time; see [Adding your data](#adding-your-data), which starts with a bundled example that needs no download. The full list of tools is under [Available tools](#available-tools).
+Setup is complete. Pick a task from [What you can do](#what-you-can-do). A tool that fails answers with `{"error": "...", "fix": "..."}` rather than crashing; ask Claude to show the raw tool response if an answer looks wrong. Problems and their fixes: [docs/troubleshooting.md](docs/troubleshooting.md) (the most common, `tfbs` showing a red X or `failed` in `/mcp`, means the server crashed at startup: run `tfbs-mcp --check` and fix its `FAIL` line). Windows: [docs/install-windows.md](docs/install-windows.md).
 
-### Windows
+## What do you want to do?
 
-The steps above work in Windows PowerShell with two differences. The micromamba install guide linked above covers Windows as well; once micromamba is installed, the `micromamba` lines in step 1 are the same.
+Each task says what you need, what to type into Claude's chat, what happens and what you get. Replace the parts in `<angle brackets>` with your own paths. A genome, motif or ClinVar file you registered (see [Tell Claude where your files are](#tell-claude-where-your-files-are)) need not be named in the prompt; a path in the prompt always wins. A loaded model stays loaded until Claude restarts the server, so later prompts can refer to it by its name. The tool names in parentheses are only for reference ([all tools](docs/tools.md)).
 
-Creating and activating a venv (step 1) uses `python` instead of `python3` and a different activation line:
+### Try it with the bundled example
 
-```powershell
-cd $HOME
-python -m venv tfbs-env
-tfbs-env\Scripts\Activate.ps1
-```
+- **You need:** nothing beyond the install. The package ships a 10 kb slice of chromosome 8 around the thyroglobulin promoter (a classic NKX2-1 target), the JASPAR `MA1994.1` NKX2-1 motif and `demo_peaks.bed`, four NKX2-1 sites in the slice. Register the genome and motif once, in one of two ways:
+  - **In your own terminal**, with the environment active: `tfbs-mcp --setup --demo`. It asks for the other paths (press Enter to skip each), offers to register with Claude Code when the `claude` command is on your PATH, and prints the path of `demo_peaks.bed`.
+  - **Through Claude Code**, which cannot answer setup's questions itself. Say: *Run `tfbs-mcp --setup --demo --non-interactive`, replace my Claude Code registration of tfbs with the `claude mcp add` command it prints, and tell me the path of demo_peaks.bed.*
 
-If PowerShell says `Activate.ps1 cannot be loaded because running scripts is disabled`, run the following once, answer `Y`, and activate again:
+  Then restart Claude Code (`/exit`, then `claude`). For Claude Desktop, replace the `tfbs` entry in its config with the printed block, then quit and reopen the app. If the path was not printed, `python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())"` prints the demo folder.
+- **Say to Claude:**
+  > Extract 200 bp sequences around every peak in \<the demo_peaks.bed path> and tell me how many were extracted. Then scan GGGCTCCTCACTTGACCTTTGCTG, the centre of the second peak, for the NKX2-1 motif with FIMO.
+- **What happens:** Claude cuts a 200 bp window around each peak from the demo genome and encodes it (`tfbs_extract_loci`), then scans the sequence with the registered motif (`tfbs_fimo`), using the MEME Suite's `fimo` program when it is installed and tangermeme's FIMO reimplementation otherwise.
+- **You get:** 4 windows in `sequences.pt`, with `regions.bed` and `scores.pt` (the motif scores from column 5 of the BED), and one FIMO hit: `CTCACTTGACCTT` on the plus strand, positions 7 to 19, p = 4e-5. It contains the NKX2-1 core `CACTTGA` and lies about 4.2 kb upstream of the thyroglobulin start. Next, download the released models and ask the [example question](#what-you-can-do) above.
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-```
+### Get the data with Claude's help
 
-Connecting Claude Code (step 3) uses the PowerShell way of finding the executable:
+- **You need:** Claude Code and about 5 GB of disk. The downloads run in Claude Code's own shell, not in tfbs-mcp; Claude Desktop cannot run shell commands, so there you download the files from the links under [Registering your data](#registering-your-data). FoldX needs a licence registration, so you always download it yourself.
+- **Say to Claude:**
+  > Download into <~/tfbs-data>: hg38.fa.gz from UCSC (then gunzip it); the ChIP-Atlas NKX2-1 peaks https://chip-atlas.dbcls.jp/data/hg38/assembled/Oth.ALL.10.NKX2-1.AllCell.bed without its first (track) line; the JASPAR motif https://jaspar.elixir.no/api/v1/matrix/MA1994.1.meme; the GRCh38 clinvar.vcf.gz from NCBI with its .tbi index; and the released NKX2-1 models https://zenodo.org/api/records/21399578/files/sproft/nkx2-1-tfbs-variants-v1.0.0.zip/content, unzipped. Then run `tfbs-mcp --setup --non-interactive` with `--genome`, `--motif` and `--clinvar` set to those files, replace my Claude Code registration of `tfbs` with the `claude mcp add` command it prints, and tell me where the models are.
 
-```powershell
-claude mcp add tfbs --scope user -- (Get-Command tfbs-mcp).Source
-```
+  For the ReMap check, add *and the ReMap 2022 NKX2-1 peaks https://remap.univ-amu.fr/storage/remap2022/hg38/MACS2/TF/NKX2-1/remap2022_NKX2-1_nr_macs2_hg38_v1_0.bed.gz, gunzipped*. The ChIP-Atlas file holds the peaks of all NKX2-1 experiments at MACS2 q < 1e-10 (`10`); `05` and `20` in the name give 1e-5 and 1e-20.
+- **What happens:** Claude downloads and unpacks the files with its shell, runs `tfbs-mcp --setup --non-interactive` (which asks nothing and only prints), then replaces the registration with the printed `claude mcp add` line, as [Tell Claude where your files are](#tell-claude-where-your-files-are) describes; that section also covers adding the FoldX structure or a project folder later.
+- **You get:** `hg38.fa`, the peak BED, `MA1994.1.meme`, `clinvar.vcf.gz` with its `.tbi`, and the models folder, with the first three registered as `TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE` and `TFBS_CLINVAR_VCF`. Restart Claude Code so the server starts with them.
 
-In `claude_desktop_config.json`, every backslash in a Windows path is written twice, as in `C:\\Users\\you\\...`. The blocks printed by `tfbs-mcp --check` and `tfbs-mcp --setup` already have them, so paste those rather than typing a path.
+### Tell Claude where your files are
 
-One tool needs Linux, macOS or WSL: `tfbs_disease_variant_validation` reads the ClinVar VCF with pysam, which has no Windows wheel, so the `genomics` extra leaves pysam out on Windows and `tfbs-mcp --check` prints a note about it. Run that tool under WSL (<https://learn.microsoft.com/windows/wsl/install>) if you need it on a Windows computer.
+[Get the data with Claude's help](#get-the-data-with-claudes-help) already registers the genome, motif and ClinVar file. Use this section to add, change or check registrations, such as a FoldX structure or your project folder, so that later prompts need not name them.
 
-### Troubleshooting
+- **You need:** Claude Code, and the files on your disk. Claude's shell finds `tfbs-mcp` when you started `claude` with the environment active; otherwise give Claude the path that `tfbs-mcp --check` prints.
+- **Say to Claude**, one request at a time:
+  - *Register several files at once:* My reference genome is at <~/tfbs-data/hg38.fa>, the NKX2-1 motif at <~/tfbs-data/MA1994.1.meme> and ClinVar at <~/tfbs-data/clinvar.vcf.gz>; my project folder is <~/tfbs-project>. Register them by running `tfbs-mcp --setup --non-interactive` with those paths as flags, replace my Claude Code registration of tfbs with the `claude mcp add` command it prints, and tell me to restart.
+  - *Add one file later*, for example the repaired structure from [the structure task](#compute-structure-based-binding-energy): Read the current registration with `claude mcp get tfbs`, then run `tfbs-mcp --setup --non-interactive` with the registered paths plus `--foldx-pdb` <~/tfbs-data/3RKQ_Repair.pdb>, replace my Claude Code registration of tfbs with the `claude mcp add` command it prints, keeping any other variable the old registration had, and tell me to restart.
+  - *Check what is registered:* Call tfbs_server_info and tell me which reference files the tfbs server sees and whether each exists.
+- **What happens:**
+  - To register, Claude runs `tfbs-mcp --setup --non-interactive` in its shell with the flags for your files (`--genome`, `--motif`, `--clinvar`, `--foldx-pdb`, `--project-root`). That form asks nothing and only prints; a path that does not exist stops it with an error naming the flag. Claude then runs `claude mcp remove tfbs --scope user` and the printed `claude mcp add tfbs --scope user --env KEY=VALUE ... -- "<path>"` line, and tells you to restart Claude Code (`/exit`, then `claude`), because the server reads the paths when it starts.
+  - Because [each setup run replaces the whole registration](#registering-your-data), Claude adds a file by passing the registered paths again with the new one, and puts a variable that setup does not ask for, such as `TFBS_SLURM_PARTITION`, back into the `--env` list of the printed line.
+  - To check, Claude calls `tfbs_server_info`. This works in Claude Desktop's chat too, which cannot run shell commands; there you register by running `tfbs-mcp --setup` in a terminal and replacing the `tfbs` entry with the printed block, as [Registering your data](#registering-your-data) explains.
+- **You get:** after the restart, the files registered as `TFBS_GENOME_FASTA`, `TFBS_MOTIF_FILE`, `TFBS_CLINVAR_VCF`, `TFBS_FOLDX_PDB` and `TFBS_PROJECT_ROOT`. The check lists the four reference files under `reference_files`, each with its path as the tools resolve it (null when none is registered) and whether that path exists, and the project folder as `project_root`. When no project folder is registered, `project_root` shows the fallback (the repository root in a clone, else the server's working directory). A file that no longer exists is the one to register again.
 
-In most cases, run `tfbs-mcp --check` in the activated environment first. It names the problem.
+### Score sequences or peaks with the released NKX2-1 models
 
-| What you see | Why | Fix |
-|---|---|---|
-| `Command 'Check' not found`, `Check: command not found` or `The term 'Check' is not recognized` | The test prompt from step 4 was typed into the terminal instead of Claude's chat | Start Claude (`claude` in the terminal, or open Claude Desktop) and type the prompt into the chat |
-| `No module named 'mcp.server.fastmcp'`, or `tfbs-mcp: mcp 2.x is installed` | mcp 2 renamed the API this server uses | `pip install "mcp>=1.28,<2"` in the same environment |
-| `tfbs` shows a red X or `failed` in `/mcp`, or reconnecting gives `-32000` | The server crashed at startup | Run `tfbs-mcp --check`; fix the `FAIL` line |
-| pip fails on `pybigtools` with `Failed to build a native library through cargo` | Python 3.14, which one dependency (pybigtools) cannot be built for yet | Recreate the environment with Python 3.13 |
-| `No matching distribution found for torch` | An old Linux system (glibc older than 2.28, e.g. CentOS 7 or RHEL 7), where current PyTorch does not install | Use Python 3.11 and update pip (`pip install -U pip`); check glibc with `ldd --version` |
-| `tfbs-mcp: command not found` / `The term 'tfbs-mcp' is not recognized` | The environment is not active | Run the activation line from step 1 |
-| `Cannot find command 'git'` during `pip install` | pip needs git to fetch the package from GitHub | Install git (see [What you need](#what-you-need)) and run the install command again |
-| `tfbs` missing from Claude Desktop, no error | The config file is not valid JSON, usually a single backslash or a trailing comma | Paste the block from `tfbs-mcp --check` again |
-| Works in the terminal, not in the app | The config uses the bare name `tfbs-mcp` instead of the full path | Use the path that `tfbs-mcp --check` prints |
-| `{"error": "No reference genome FASTA configured."}` | The tool needs data you have not supplied | See [Adding your data](#adding-your-data) |
-| `Compressed FASTA is only supported in BGZF format` | The genome is a plain gzip file; `hg38.fa.gz` from UCSC is one | `gunzip hg38.fa.gz` and register the uncompressed `hg38.fa` |
-| `{"error": "tfbs_remap_validation runs the MEME Suite's fimo program for its FIMO leg, and fimo is not on the PATH of the MCP server. ..."}` (or the same from `tfbs_disease_variant_validation`) | These two pipelines run the `fimo` program itself; the tangermeme fallback is used only by `tfbs_fimo` | Install the MEME Suite (<https://meme-suite.org/meme/doc/download.html>, or `conda install -c bioconda meme`) and put its `bin` directory on the PATH of the MCP server (and of the compute nodes for `slurm=true`); then restart Claude. For the ClinVar check you can instead leave `motif_file` empty with `TFBS_MOTIF_FILE` unset, which skips its FIMO leg |
-| `{"error": "fimo not found on PATH, and no FIMO reimplementation (tangermeme or memelite) to fall back on"}` from `tfbs_fimo` | Neither the MEME Suite's `fimo` program nor tangermeme is available to the server. With tangermeme installed (the `viz` and `genomics` extras bring it), `tfbs_fimo` uses tangermeme's FIMO reimplementation (memelite, numba-based, shipped with tangermeme 1.x) and reports `"backend": "memelite"` | `pip install "tfbs-mcp[viz]"` in the server's environment, or install the MEME Suite (see [Adding your data](#adding-your-data)); then restart Claude |
-| Claude Code times out while the server starts | The server loads PyTorch and its other libraries before it answers, which takes about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one Windows 10 machine with a CPU build of PyTorch); a slow disk or antivirus scanning the environment can stretch that past the client's limit | Set `MCP_TIMEOUT=60000` before starting `claude` |
+- **You need:** the NKX2-1 study's released checkpoints (doi:10.5281/zenodo.21399578, <https://doi.org/10.5281/zenodo.21399578>): download `nkx2-1-tfbs-variants-v1.0.0.zip` (30 MB) and unzip it, or let Claude do it (previous section). Its `models/` folder holds `core/`, `flank/` and `all/`, each with a `vcnnbpnet.pt`. They load directly with `tfbs_load_model` and model type `VCNNBpnet`, their label scaling included, and the ReMap, ClinVar and ChIP-Atlas tasks below take them as they are. The three were trained on EMSA-seq libraries of an NKX2-1 site in its thyroglobulin-promoter context that vary the 4 bp core (CORE), the 10 bp flanks (FLANK) or all 14 bp (ALL); FLANK generalises best and is the one the study recommends. Scoring peaks also needs a registered genome.
+- **Say to Claude:**
+  > Load the released NKX2-1 model \<models>/flank/vcnnbpnet.pt as "flank" (model type VCNNBpnet) and score these 24 bp sequences: GGGCTCCTCACTTGACCTTTGCTG, <more 24 bp sequences>.
 
-## Adding your data
+  > Cut 24 bp windows centred on every peak in <peaks.bed> from the registered genome and score them all with the flank model.
 
-You do not need any of this to finish setup: steps 1 to 5 above are complete without it. Five tools work with nothing but the install (`tfbs_server_info`, `tfbs_list_models`, `tfbs_preprocess`, `tfbs_classify_metrics`, and `tfbs_fetch_structure`, which needs internet). Each tool group below needs one input. Get it from the link in the table, then run `tfbs-mcp --setup` once: it prints the Claude Code command and the Claude Desktop block with your paths filled in, and can run the Claude Code command for you.
+  For a model you trained, say *Load my checkpoint <path/to/best_VCNNBpnet.ckpt> as "mine" (model type VCNNBpnet)* and score with "mine".
+- **What happens:** Claude loads the model with its scaling (`tfbs_load_model`) and scores the sequences (`tfbs_predict`). For a BED it first cuts the 24 bp windows from the genome (`tfbs_extract_loci`). The models score 24 bp, the length of the library construct they were trained on (6 + 14 + 4 bp); to find the best site inside wider peaks, ask for 200 bp windows scored in sliding-window mode.
+- **You get:** one score per sequence, in input order (for a BED, in the order of `regions.bed` in the extraction folder). The released models score in log2 fold change of EMSA-seq enrichment: higher means stronger predicted binding, and a difference of 1 is a 2-fold difference. On the four demo peaks FLANK gives 1.96, 1.39, 2.61 and -0.69. A classifier you trained scores from 0 (no site) to 1 (site).
 
-### Try it first with the bundled example
+### Check what a variant does
 
-The package ships a 10 kb slice of human chromosome 8 around the thyroglobulin promoter (thyroglobulin is the classic NKX2-1 target; the study's EMSA-seq libraries were anchored on the NKX2-1 site of its rat promoter), a BED file with four NKX2-1 motif hits in that slice, and the JASPAR `MA1994.1` motif. Register them with:
+- **You need:** a model loaded as above and a registered genome of the same build as the variant. A variant is written `chrom:pos:REF>ALT` with a 1-based position.
+- **Say to Claude:**
+  > With the flank model, score the variant demo_chr8:830:T>G: extract the 24 bp reference and alternative windows centred on it from the registered genome and compare their scores.
+- **What happens:** Claude cuts the reference window from the genome, checks that the genome base equals REF, builds the variant window, scores both and subtracts (`tfbs_extract_loci` with `variants`, `tfbs_predict` twice).
+- **You get:** two scores and their difference, with `ref_sequences.pt`, `alt_sequences.pt` and `variants.json` (window coordinates and sequences). With the demo genome this variant falls from 1.07 to -0.54, a loss of 1.6 log2 fold change. A REF that does not match the genome, usually a different genome build, is listed under `ref_mismatches` instead of being scored.
 
-```bash
-tfbs-mcp --setup --demo
-```
+### Compute classification metrics for your own scores
 
-It prints the path of the demo BED file. Then, in Claude's chat:
+- **You need:** scores for known positives and known negatives, from tfbs-mcp or any other tool.
+- **Say to Claude:**
+  > Compute ROC-AUC and PR-AUC for a method that scored the positives <0.9, 0.8, ...> and the negatives <0.3, 0.2, ...>.
 
-> Extract 200 bp sequences around every peak in <the demo_peaks.bed path it printed> and save the tensors to /tmp/tfbs-demo.
+  In Claude Code you can name a file instead (*the scores in <scores.tsv>, column 2, with the label in column 3*); Claude reads it and passes the two lists.
+- **What happens:** Claude passes both lists to `tfbs_classify_metrics`. When there are more negatives than positives, it draws as many negatives as positives at random, so both classes weigh the same; say "use all negatives" to keep them all.
+- **You get:** ROC-AUC, PR-AUC, the two counts, and the points of both curves.
 
-Claude calls `tfbs_extract_loci` on the bundled slice and reports four 200 bp sequences, one-hot encoded as a tensor of shape `[4, 4, 200]`. Then:
+### Train your own classifier from ChIP-seq peaks
 
-> Scan the sequence CTCACTTGACCTT for the NKX2-1 motif with FIMO.
+- **You need:** a BED of ChIP-seq peaks for your TF (ChIP-Atlas) and a registered genome. A laptop is enough for a few thousand windows (add "use at most 5000 peaks" to subsample a large file); larger sets go to a SLURM cluster.
+- **Say to Claude:**
+  > Train an NKX2-1 binding-site classifier on the ChIP-Atlas peaks in <peaks.bed>. Use 24 bp windows centred on the peaks as positives and GC-matched genomic windows from the registered reference genome as negatives. Build the train, validation and test split, write the training config for the VCNNBpnet architecture, and train it here on this computer. Report the numbers of positives and negatives, the split sizes, the validation metrics and the checkpoint.
 
-That 13-mer is the strongest match in the slice, about 4.2 kb upstream of the thyroglobulin transcription start, so `tfbs_fimo` reports a hit. Where the files come from and how they were cut is documented in `tfbs/data/demo/README.md` in the repository. When you have your own data, run `tfbs-mcp --setup` again without `--demo`; it replaces the registration.
+  GC-matched negatives are random genome windows with the same GC content as the peaks, so the model cannot tell the classes apart by base composition alone. VCNNBpnet is the architecture of the published models; the others are listed in [docs/development.md](docs/development.md#available-model-architectures). For a cluster, replace "train it here on this computer" with "submit the training as a SLURM job on the \<partition> partition with 64 GB of memory" and follow the job as in [Run on a SLURM cluster](#run-on-a-slurm-cluster). For a model that predicts peak strength instead of yes or no, say "train a regression model on the peak signal in column 5" instead of asking for negatives.
+- **What happens:** Claude cuts the windows and draws one GC-matched negative per peak (`tfbs_extract_loci`), labels positives 1 and negatives 0 (`tfbs_prepare_classification`), splits 64/16/20 into train, validation and test (`tfbs_prepare_dataset`), writes the config (`tfbs_config`) and trains, waiting at most an hour (`tfbs_train`).
+- **You get:** the `<name>_loci_24bp_gc/`, `<name>_24bp_gc_classification/` and `<name>_24bp_gc_dataset/` folders next to the BED, the config, the checkpoint `saved_models/<name>_24bp_gc/none/best_VCNNBpnet.ckpt` under the project root, and the validation accuracy and AUC of the best epoch. Test-split metrics: on a cluster, ask Claude to validate the checkpoint on the test split as a SLURM job (`tfbs_validate`); without one, in Claude Code, say *Load the checkpoint as "mine", score \<dataset>/test/seqs.pt, read the labels from \<dataset>/test/labels.pt with Python, and compute ROC-AUC and PR-AUC.*
 
-### Your own data
+### Understand what a model learned
 
-| What it enables | What you need | Where to get it | Variable |
+- **You need:** a loaded model (released or your own). For motif names, a MEME motif file such as JASPAR.
+- **Say to Claude**, one question at a time:
+  - *Which bases drive the score?* With the flank model, compute DeepLiftShap attributions and an in-silico mutagenesis map for GGGCTCCTCACTTGACCTTTGCTG, and list the five most important positions. (Attributions split the score among the bases by comparing with shuffled copies of the sequence; mutagenesis changes every base to each other base and records the score change.)
+  - *Does the motif raise the score anywhere?* With the flank model, measure how much inserting CACTTGA into 100 random backgrounds changes the prediction.
+  - *Which motifs did the model learn, and do they match JASPAR?* With the flank model, call seqlets in \<sequences> and match them against \<JASPAR.meme> with TOMTOM; also turn the first-layer filters into motifs. (Seqlets are short stretches with high attribution.)
+  - *Do two positions act together?* With the flank model, compute pairwise epistasis for GGGCTCCTCACTTGACCTTTGCTG and list the strongest interactions.
+- **What happens:** `tfbs_analyze` and `tfbs_mutagenesis`, `tfbs_marginalize`, `tfbs_seqlets` and `tfbs_conv_filters`, `tfbs_epistasis`, in the order of the questions.
+- **You get:** a summary in Claude's reply (top positions, the mean effect of the motif in score units, matched motif names, the strongest pairs), and the full results as files in `<results>/<model id>/<tool name>/<digest>/` unless you name a folder: `attributions.pt` and `ism_scores.pt` (4 x length per sequence), `seqlets.tsv`, `filters.meme`, `epistasis_matrix.csv`. The tools draw no plots; in Claude Code, ask *Plot attributions.pt as a sequence logo with logomaker and save it as a PNG* (logomaker comes with the `viz` extra).
+
+### Scan sequences for a motif
+
+- **You need:** a MEME-format motif file, registered as `TFBS_MOTIF_FILE` or named in the prompt. The MEME Suite is optional here.
+- **Say to Claude:**
+  > Scan these sequences for the NKX2-1 motif with FIMO at p < 1e-4: <sequence 1>, <sequence 2>.
+- **What happens:** Claude scans both strands with the MEME Suite's `fimo` program when it is on the PATH, otherwise with tangermeme's FIMO reimplementation (`tfbs_fimo`; `backend` in the result says which).
+- **You get:** up to 500 hits in the reply, lowest p-value first, each with sequence, 1-based start and end, strand, score, p-value and matched site, and all hits in a TSV file.
+
+### Compute structure-based binding energy
+
+- **You need:** internet access, and FoldX, a separately licensed program. Install it once: register at <https://foldxsuite.crg.eu/> (free for academic use), unpack the download, rename the program (its name carries a date) to `foldx` (`foldx.exe` on Windows), run `chmod +x foldx` on Linux and macOS, and move it into the folder of the `tfbs-mcp` executable that `tfbs-mcp --check` prints. Claude Code started in the activated environment then finds it; for Claude Desktop see the FoldX row of [docs/troubleshooting.md](docs/troubleshooting.md). Check it with the first prompt below. The genome scan also needs the `foldx` extra (`pip install "tfbs-mcp[foldx]"`) and a genome FASTA.
+- **Say to Claude:**
+  > Find an experimental structure of NKX2-1 bound to DNA and tell me its protein and DNA chains.
+
+  > Fetch PDB entry <3RKQ> and compute its protein-DNA binding energy with FoldX, repairing it first, with protein chain <A> and DNA chains <C,D>. Then scan <chr:start-end> of the genome <hg38.fa> with the repaired structure, with a step of 5 bp, and give me the bigWig.
+- **What happens:** Claude searches the PDB for entries with protein and DNA, or downloads the one you name (`tfbs_fetch_structure`); an AlphaFold DB model is the fallback but has no DNA and cannot be scored. Claude Code reads the chain IDs from the downloaded file; in Claude Desktop, the entry's page on rcsb.org lists them (3RKQ: protein A and B, DNA C and D, the defaults). FoldX then repairs the structure and computes the protein-DNA interaction energy (`tfbs_binding_energy`). The scan places each genome window's sequence on the structure's DNA and scores it (`tfbs_binding_scan`); the scan does not use registered files, so its prompt always names the genome and the repaired structure. A FoldX run takes minutes, so keep the region short or add "as a SLURM job".
+- **You get:** the repaired `<id>_Repair.pdb` (the file to register as `TFBS_FOLDX_PDB`), the interaction energy and its parts in kcal/mol, and a bigWig with the lowest energy per window. More negative means stronger binding.
+
+### Validate a model against ReMap
+
+- **You need:** a model: a released NKX2-1 model (a `vcnnbpnet.pt`, see [Score sequences or peaks](#score-sequences-or-peaks-with-the-released-nkx2-1-models)) or one you trained (a `.ckpt`, see [Train your own classifier](#train-your-own-classifier-from-chip-seq-peaks)); the released `.pt` models can be used here as they are. Also the ReMap 2022 non-redundant BED for your TF (<https://remap.univ-amu.fr/>; experiment count in column 5), the MEME Suite's `fimo` program on the PATH (no fallback here; on Windows this needs WSL, see [docs/install-windows.md](docs/install-windows.md)), FoldX with a repaired PDB, and a registered genome and motif.
+- **Say to Claude:**
+  > Validate the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt (model type VCNNBpnet) against ReMap 2022: use the NKX2-1 peaks in <remap.bed> (experiment count in column 5) with dinucleotide-shuffled negatives, and compare it head to head with FIMO and FoldX using the registered motif, structure and genome, writing to \<project>/results/remap_nkx2-1. Run it directly rather than as a SLURM job, score this checkpoint and not the study's saved models, and report the ROC-AUC of each method with the numbers of positives and negatives.
+
+  For a model you trained, name its `.ckpt` (e.g. <path/to/best_VCNNBpnet.ckpt>) instead.
+- **What happens:** Claude runs `tfbs_remap_validation`: up to 500 peaks seen in at least 4 experiments are the positives, shuffled copies of them (same dinucleotide content, motifs destroyed) the negatives. The network scores the best 24 bp stretch of each region, FIMO scans the region and FoldX scores its 11 bp centre. Without "run it directly" it becomes a SLURM job; Claude then reports a job ID, and later you ask it to read `summary.csv`. Add "skip FoldX" for a quick run. The network's scores are its raw outputs, for the released models in their standardized training scale; the ROC-AUC is the same in either scale.
+- **You get:** `summary.csv`, two score tables and `roc_all_methods.png` in the output folder; when run directly, the reply holds the ROC-AUC of each method with the numbers of positives and negatives.
+
+### Check ClinVar disease variants in your TF's peaks
+
+- **You need:** a model, a released NKX2-1 `vcnnbpnet.pt` or a `.ckpt` you trained, the indexed ClinVar VCF (`clinvar.vcf.gz` with its `.tbi`), a peak BED and a registered genome; optionally a motif (with the `fimo` program) and a repaired PDB. Linux, macOS or WSL, because pysam has no Windows wheel.
+- **Say to Claude:**
+  > Run the ClinVar disease-variant check on the peaks in <peaks.bed> with the registered ClinVar file, motif and genome, scoring the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt as "flank" (model type VCNNBpnet), writing to \<project>/results/clinvar_nkx2-1. Report for each method the ROC-AUC for separating pathogenic from benign variants, with the variant counts.
+
+  For a model you trained, name its `.ckpt` (e.g. <path/to/best_VCNNBpnet.ckpt>) instead.
+- **What happens:** Claude runs `tfbs_disease_variant_validation`: it takes the non-coding pathogenic and benign single-base ClinVar variants inside the peaks, scores both alleles with the model, with FIMO and with FoldX (when a structure is registered), and tests whether the size of the change separates pathogenic from benign. Always name the checkpoint; without it no network is scored. It runs directly unless you ask for a SLURM job.
+- **You get:** `summary_all_methods.csv` and plots in the output folder, and per method in the reply: `auc_abs` (ROC-AUC of the size of the change, ignoring its direction), `auc_raw` (the same with the signed change), `mwu_p` (Mann-Whitney U p-value for the size of the change) and the counts `n_path` and `n_benign`. A method with fewer than 10 scored variants, or with only pathogenic or only benign ones, has no row.
+
+### Benchmark against other TFs on ChIP-Atlas
+
+- **You need:** a folder with one intersection file per TF, named `<TF>.allintersect.bed`: the output of `bedtools multiinter -header` over that TF's per-experiment ChIP-Atlas peak files (a header line, then chrom, start, end, the number of experiments, ...). Also a registered genome and a model: a released NKX2-1 `vcnnbpnet.pt` or a `.ckpt` you trained. The method comparison also needs a motif, the `fimo` program (WSL on Windows), FoldX and a repaired PDB.
+- **Say to Claude:**
+  > Benchmark the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt as "flank" (model type VCNNBpnet) on the ChIP-Atlas intersection files in \<folder>: NKX2-1 as the positive TF against GATA1, MYOD1, NKX2-5 and RXRA, writing to \<project>/results/chipseq_benchmark.
+
+  For a model you trained, name its `.ckpt` (e.g. <path/to/best_VCNNBpnet.ckpt>) instead.
+- **What happens:** Claude scores the peaks of every TF and asks whether the score separates NKX2-1 peaks from each other TF's peaks, at experiment-count cutoffs 1, 3, 5 and 8, and whether it rises with the number of experiments (`tfbs_chipseq_benchmark`). Ask for "the head-to-head comparison with FIMO and FoldX" to run the same task on 500 peaks per TF with all three methods (`tfbs_chipseq_method_comparison`), as a SLURM job by default, because FoldX makes it take hours.
+- **You get:** `classification_cutoff_results.csv`, `classification_vs_negatives.csv`, `regression_results.csv` and ROC and regression plots; the comparison writes `auc_summary.csv`, `auc_pivot.csv` and `roc_by_neg_tf.png`.
+
+### Run on a SLURM cluster
+
+- **You need:** Claude Code started on a machine where `sbatch`, `squeue` and `sacct` work, such as a login node; `fimo` and FoldX on a filesystem the compute nodes see. GPU jobs go to the partition named in the prompt, else to the registered default, else to `gpu`. To register a default, together with the [other variables](#registering-your-data) of your registration, run `claude mcp remove tfbs --scope user`, then `claude mcp add tfbs --scope user --env TFBS_SLURM_PARTITION=<gpu partition> TFBS_GENOME_FASTA=<hg38.fa> -- "$(which tfbs-mcp)"`. If your cluster requires an account, add `SBATCH_ACCOUNT=<account>` to that `--env` list; `sbatch` reads it from the environment.
+- **Say to Claude:**
+  > Train an NKX2-1 binding-site classifier on the ChIP-Atlas peaks in <peaks.bed> with 24 bp windows and GC-matched negatives from the registered genome, using the VCNNBpnet architecture, and submit the training as a SLURM job on the \<partition> partition with 64 GB of memory. Report the job ID.
+
+  > How is job \<job id> doing? If it has finished, show me the end of its log.
+- **What happens:** Claude prepares the data on the machine where Claude Code runs and submits the training (`tfbs_train`), then asks the scheduler about the job (`slurm_status`) and reads its log (`slurm_logs`). Claude does not check back by itself: ask again later. `tfbs_validate`, `tfbs_sweep` (with `wandb login`) and the validation tools submit jobs the same way, and Claude can cancel a job.
+- **You get:** the job ID, then its state, elapsed time and exit code, and the last 100 lines of the error log. If a job failed, ask "Why did the job fail?" and Claude reads the log.
+
+## Registering your data
+
+Each input is optional; register the ones your tasks need, so prompts need not name them. Register in one of two ways:
+
+- **In your own terminal**, with the environment active: `tfbs-mcp --setup`. It asks for each path (Enter skips one; a path that does not exist is asked again), prints the Claude Code command and the Claude Desktop block with your paths filled in, and, when the `claude` command is on your PATH, asks `Register with Claude Code now? [y/N]`. For Claude Desktop, replace the `tfbs` entry in **Settings > Developer > Edit Config** with the printed block, then quit and reopen the app.
+- **Through Claude Code**: tell Claude where the files are, see [Tell Claude where your files are](#tell-claude-where-your-files-are).
+
+**Each run replaces the whole registration** with the paths given in that run, so name every path again, e.g. `--genome ... --motif ... --clinvar ... --foldx-pdb ...`, and add any variable you set by hand (such as `TFBS_SLURM_PARTITION`) again. `claude mcp get tfbs` shows what is registered now. Restart Claude Code (`/exit`, then `claude`) after a change.
+
+| Input | Used by | Where to get it | Variable |
 |---|---|---|---|
-| Sequence extraction and the ChIP-seq benchmarks (`tfbs_extract_loci`, `tfbs_chipseq_benchmark`, ...) | A reference genome FASTA, uncompressed (hg38 is about 3 GB uncompressed) | hg38 from UCSC: <https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz> (just under 1 GB), then `gunzip hg38.fa.gz`. Register the resulting `hg38.fa`; the server writes an index next to it on first use. NCBI Datasets offers the same assembly (GRCh38.p14, <https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000001405.40/>); note that NCBI names sequences by accession (`NC_000008.11`, not `chr8`), and the chromosome names in your BED files must match the record names in whichever FASTA you register | `TFBS_GENOME_FASTA` |
-| Peaks to extract from or train on | A BED file of ChIP-seq peaks for your transcription factor | ChIP-Atlas: <https://chip-atlas.org/> | none; name the file in your prompt |
-| Motif scanning (`tfbs_fimo`) | A MEME-format motif file. The tool runs the MEME Suite's `fimo` program when it is on your PATH and otherwise tangermeme's FIMO reimplementation (memelite, numba-based, shipped with tangermeme 1.x), which the install already includes, so the MEME Suite is optional for `tfbs_fimo`. The FIMO legs of `tfbs_remap_validation` (always) and `tfbs_disease_variant_validation` (when it has a motif file) run the `fimo` program itself and have no such fallback: without `fimo` on the server's PATH they return an error before anything runs or is submitted | MEME Suite: <https://meme-suite.org/meme/doc/download.html>. Motif: JASPAR `MA1994.1` (NKX2-1) from <https://jaspar.elixir.no/api/v1/matrix/MA1994.1.meme>, licensed CC BY 4.0 (<https://creativecommons.org/licenses/by/4.0/>) | `TFBS_MOTIF_FILE` |
-| Structure-based scoring (`tfbs_binding_energy`, `tfbs_binding_scan`) | **FoldX**, a separately licensed program (free for academic use after registration; the `foldx` pip extra installs pyBigWig, not FoldX), plus a repaired TF-DNA complex PDB | FoldX from the FoldX Suite site: <https://foldxsuite.crg.eu/>. PDB: `tfbs_fetch_structure` downloads one from RCSB, for example <https://www.rcsb.org/structure/3RKQ>; `tfbs_binding_energy` runs FoldX `RepairPDB` on it with its `repair` option and returns the repaired file as `repaired_structure_path`, the file to give `tfbs_binding_scan` and `TFBS_FOLDX_PDB` | `TFBS_FOLDX_PDB` |
-| Disease-variant validation (`tfbs_disease_variant_validation`) | An indexed ClinVar VCF: `clinvar.vcf.gz` and its `.tbi` index side by side | NCBI, GRCh38: <https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz> (about 200 MB) and <https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz.tbi>. Both are refreshed regularly, so sizes change | `TFBS_CLINVAR_VCF` |
-| Prediction and attribution (`tfbs_predict`, `tfbs_analyze`, `tfbs_mutagenesis`, ...) | A trained model checkpoint; none ship with the package. The NKX2-1 study's released checkpoints (`vcnnbpnet.pt` for the core, flank and all libraries, doi:10.5281/zenodo.21399578) load directly with `tfbs_load_model` and `model_type="VCNNBpnet"`, their label scaling included. `tfbs_predict` reports scores in the original label units with the training run's `scaling_params.json`, which `tfbs_load_model` finds next to the checkpoint, in the training data directory the checkpoint records, or in the study layout `<models_dir>/scaling_params/`, or takes as `data_path` | Train one on peaks from ChIP-Atlas (<https://chip-atlas.org/>) following [Training](docs/development.md#training) | none; load it with `tfbs_load_model` |
-| `slurm_*` tools, and any `slurm=true` option | An HPC cluster running the SLURM scheduler; `tfbs_train` also trains on your own computer with `local=true`, which blocks until training ends and suits small datasets | Your cluster's documentation; the scheduler itself is at <https://slurm.schedmd.com/> | none |
-| Training, benchmark and validation tools (`tfbs_train`, `tfbs_sweep`, `tfbs_validate`, `tfbs_chipseq_benchmark`, ...) | A directory for your datasets, checkpoints and results. The code these tools run is installed with the package. `tfbs_sweep` also needs the `tracking` extra and `wandb login`; `tfbs_disease_variant_validation` needs pysam, which the `genomics` extra installs on Linux and macOS (Windows has no pysam wheel: use WSL) | Any directory you choose | `TFBS_PROJECT_ROOT` |
+| Reference genome FASTA, uncompressed (hg38 is about 3 GB) | extraction, negatives, variants, benchmarks and validation | UCSC: <https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz>, then `gunzip hg38.fa.gz`. Chromosome names in your BED files must match the FASTA (NCBI's GRCh38 names chromosome 8 `NC_000008.11`, not `chr8`) | `TFBS_GENOME_FASTA` |
+| ChIP-seq peaks (BED) | extraction and training | ChIP-Atlas: <https://chip-atlas.org/> | none; name the file in your prompt |
+| MEME-format motif | `tfbs_fimo` and the FIMO legs | JASPAR `MA1994.1` (NKX2-1): <https://jaspar.elixir.no/api/v1/matrix/MA1994.1.meme> (CC BY 4.0). The validation pipelines also need the MEME Suite's `fimo`: <https://meme-suite.org/meme/doc/download.html> | `TFBS_MOTIF_FILE` |
+| Repaired TF-DNA complex PDB | the FoldX legs | the PDB from `tfbs_fetch_structure`, repaired by `tfbs_binding_energy` ([FoldX](#compute-structure-based-binding-energy)) | `TFBS_FOLDX_PDB` |
+| Indexed ClinVar VCF | `tfbs_disease_variant_validation` | NCBI, GRCh38: <https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz> (about 200 MB) and <https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz.tbi>, side by side | `TFBS_CLINVAR_VCF` |
+| Model checkpoint | prediction, interpretation, validation and benchmarks | the released NKX2-1 models (doi:10.5281/zenodo.21399578), or one you train | none; name it in your prompt |
+| Project directory | training, benchmark and validation tools | any directory; it holds `data/`, `saved_models/` and `results/` ([details](docs/development.md#where-the-tools-find-checkpoints)). Unset: the repository root in a clone, else the server's working directory | `TFBS_PROJECT_ROOT` |
 
-`TFBS_PROJECT_ROOT` is the directory holding `data/`, `saved_models/` and `results/`. The benchmark and validation tools run from it, so a relative `models_dir`, such as their default `saved_models_final`, is looked up there. A dataset's checkpoint is `<models_dir>/<dataset>/<scaling_method>/best_<model_type>.ckpt`, the layout `tfbs_config` trains to, with `scaling_method` defaulting to `standardize`; when `scaling_method` is not given and that file is missing, the one `<dataset>/*/best_<model_type>.ckpt` is used if there is exactly one, with a warning in the result. An explicit `scaling_method` never falls back to another folder, and the tools also take explicit `checkpoints`. The lookup is all-or-nothing: if any dataset has no single checkpoint, or the class a checkpoint was saved with cannot be imported from the project root, nothing runs. Without the variable the server uses the repository root when it runs from a clone, and otherwise the directory it was started in; `tfbs_server_info` reports the one in use as `project_root`. The example configs and the `tfbs_config` tool are described under [Training](docs/development.md#training).
+Flags prefill answers, so you are not asked for those variables: `--genome PATH`, `--motif PATH`, `--clinvar PATH`, `--foldx-pdb PATH`, `--project-root PATH`. A prefilled path is still checked. `--demo` prefills `--genome` and `--motif` with the bundled example data. `--non-interactive` asks nothing: it uses only the flags, never offers to register, and only prints. For example, `tfbs-mcp --setup --genome /data/hg38/hg38.fa --motif /data/JASPAR/MA1994.1.meme --non-interactive` prints both forms for a genome and a motif. Then replace the registration with the printed `claude mcp add` line, removing the old entry first as [By hand](#by-hand) shows. Claude Code keeps the variables in the user-scope `tfbs` entry of `~/.claude.json` (do not edit that file by hand), Claude Desktop in the `env` block of the `tfbs` entry.
 
-Any tool argument you pass explicitly overrides these variables. If neither is set, the tool tells you which argument and which variable would fix it.
+### By hand
 
-### Registering the paths with tfbs-mcp --setup
+This is what `--setup` writes. For Claude Code, first `claude mcp remove tfbs --scope user` (adding a name that already exists is an error), then `claude mcp add tfbs --scope user --env TFBS_GENOME_FASTA=/data/hg38/hg38.fa TFBS_MOTIF_FILE=/data/JASPAR/MA1994.1.meme -- "$(which tfbs-mcp)"`. For Claude Desktop, add to the `tfbs` entry of the config file, after `"args": []` and a comma: `"env": {"TFBS_GENOME_FASTA": "/data/hg38/hg38.fa", "TFBS_MOTIF_FILE": "/data/JASPAR/MA1994.1.meme"}`. On Windows, see [docs/install-windows.md](docs/install-windows.md) for the PowerShell form of these commands.
 
-Run this once in the activated environment, after downloading what you need:
-
-```bash
-tfbs-mcp --setup
-```
-
-What it does:
-
-- It asks for each of the five variables in turn, one question per variable. Press Enter to skip one.
-
-  | Variable | What it asks for |
-  |---|---|
-  | `TFBS_GENOME_FASTA` | reference genome FASTA (an existing file) |
-  | `TFBS_MOTIF_FILE` | MEME-format motif file (an existing file) |
-  | `TFBS_CLINVAR_VCF` | indexed ClinVar VCF, the `.vcf.gz` file (an existing file; a missing `.tbi` next to it gives a warning, not an error) |
-  | `TFBS_FOLDX_PDB` | repaired TF-DNA PDB (an existing file) |
-  | `TFBS_PROJECT_ROOT` | directory holding `data/`, `saved_models/` and `results/` (an existing directory) |
-
-- A path that does not exist is reported and the question is asked again; Enter skips it.
-- It then prints both setup forms with the chosen variables filled in and the skipped ones left out: the Claude Code command, `claude mcp add tfbs --scope user --env KEY=VALUE [KEY2=VALUE2 ...] -- "<absolute path of tfbs-mcp>"`, and the Claude Desktop JSON block, whose `tfbs` entry gains an `"env"` object listing the variables (no `"env"` when nothing was set).
-- If the `claude` command is on your PATH, it asks `Register with Claude Code now? [y/N]`. Answer `y` and it runs `claude mcp remove tfbs --scope user` (a failure because `tfbs` was not registered yet is ignored), then the `claude mcp add` command, and reports success or the error. Answer `N`, or run it on a computer without `claude`, and it only prints.
-- It never edits `claude_desktop_config.json`. For Claude Desktop, open **Settings > Developer > Edit Config**, replace the earlier `tfbs` entry with the printed block, save, then quit and reopen the app.
-
-Flags prefill answers, so you are not asked for those variables: `--genome PATH`, `--motif PATH`, `--clinvar PATH`, `--foldx-pdb PATH`, `--project-root PATH`. A prefilled path is still checked. `--demo` prefills `--genome` and `--motif` with the bundled example data (see [Try it first with the bundled example](#try-it-first-with-the-bundled-example)). `--non-interactive` asks nothing at all: it uses only the flags, never offers to register, and just prints both forms. For example:
-
-```bash
-tfbs-mcp --setup --genome /data/hg38/hg38.fa --motif /data/JASPAR/MA1994.1.meme --non-interactive
-```
-
-Run `--setup` again whenever a path changes. The `remove` step replaces the earlier registration, so nothing accumulates. Restart Claude Code afterwards; Claude Desktop needs the edited config and a full quit and reopen.
-
-Where the variables end up: for Claude Code, in the user-scope `tfbs` entry of `~/.claude.json` (`claude mcp get tfbs` shows it; the file also holds your sign-in, so do not edit it by hand). For Claude Desktop, in the `env` block of the `tfbs` entry in `claude_desktop_config.json`. Claude passes them to the server's environment every time it starts it.
-
-### Setting the variables by hand
-
-If you would rather not use `--setup`, this is what it writes.
-
-Claude Code (the `remove` comes first because adding a name that already exists at the same scope is an error):
-
-```bash
-claude mcp remove tfbs --scope user
-claude mcp add tfbs --scope user --env TFBS_GENOME_FASTA=/data/hg38/hg38.fa TFBS_MOTIF_FILE=/data/JASPAR/MA1994.1.meme -- "$(which tfbs-mcp)"
-```
-
-Claude Desktop, in the `tfbs` entry of the config file:
-
-```json
-{
-  "mcpServers": {
-    "tfbs": {
-      "command": "/home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp",
-      "args": [],
-      "env": {
-        "TFBS_GENOME_FASTA": "/data/hg38/hg38.fa",
-        "TFBS_MOTIF_FILE": "/data/JASPAR/MA1994.1.meme"
-      }
-    }
-  }
-}
-```
-
-One more variable is optional and not asked by `--setup`; add it to the `--env` list or the `env` block the same way:
+Two more variables are optional and not asked by `--setup`; add them to the `--env` list or the `env` block the same way:
 
 | Variable | What it does |
 |---|---|
+| `TFBS_SLURM_PARTITION` | default partition of the GPU jobs (`tfbs_train`, `tfbs_validate`, `tfbs_sweep`, the benchmark and ReMap tools); unset, `gpu`. `tfbs_server_info` reports it as `default_partition` |
 | `TFBS_CALL_LOG` | path of a JSON Lines file. When set, every tool call appends one line after it returns, holding the arguments and the result: `timestamp` (start of the call, UTC), `tool`, `arguments` as received, `seconds` (wall time), `is_error` and `result` (the tool's JSON answer; one larger than 1 MB is stored as its size and first 4096 characters). A call that fails is logged too. Unset, nothing is written. `tfbs_server_info` reports the file in use as `call_log` |
-
-### Example prompts once your data is registered
-
-With a genome FASTA registered and a BED file of peaks on disk:
-
-> Extract 200 bp sequences centred on every peak in /data/peaks/nkx2-1.bed and save the tensors to /data/tensors/nkx2-1.
-
-Claude calls `tfbs_extract_loci`, reads the genome from `TFBS_GENOME_FASTA`, writes `sequences.pt` (and `scores.pt` when the BED file has a score column) and `regions.bed` into the output folder, and reports the tensor shape, how many peaks were extracted and the paths it wrote. Without an output folder the tool uses `nkx2-1_loci_200bp/` next to the BED file (the window, and `_gc` or `_shuffled` when negatives are drawn, are part of the name, so another window never overwrites it), and the data tools after it name their outputs from that (`nkx2-1_200bp_classification/`, `nkx2-1_200bp_dataset/`), so a chain of calls needs no file names.
-
-> Extract 24 bp windows around the peaks in /data/peaks/nkx2-1.bed with GC-matched negatives, and build a classification dataset.
-
-Claude calls `tfbs_extract_loci` with `negatives="gc_matched"`, which samples one genomic window per peak with the same length and GC content (away from the peaks, without N) into `negatives/sequences.pt`, then `tfbs_prepare_classification` and `tfbs_prepare_dataset` on the paths it returned.
-
-With the JASPAR motif `MA1994.1` (NKX2-1) registered as the motif file:
-
-> Scan the sequence AAACACTTGAGGCAAA for the NKX2-1 motif with FIMO.
-
-Claude calls `tfbs_fimo`, which scans the sequence with `TFBS_MOTIF_FILE` (with the `fimo` program when the MEME Suite is installed, otherwise with tangermeme's FIMO reimplementation (memelite, numba-based, shipped with tangermeme 1.x); `backend` says which) and returns the matches with position, strand, score, p-value and the matched site.
 
 ## Uninstall
 
-Remove the server from Claude. For Claude Code:
+Remove the server from Claude Code with `claude mcp remove tfbs --scope user`. For Claude Desktop, open **Settings > Developer > Edit Config**, delete the `"tfbs": {...}` entry from `"mcpServers"` (and the comma that separated it from a neighbouring entry), save, then quit and reopen the app.
 
-```bash
-claude mcp remove tfbs --scope user
-```
-
-For Claude Desktop, open **Settings > Developer > Edit Config**, delete the `"tfbs": {...}` entry from `"mcpServers"` (and the comma that separated it from a neighbouring entry), save, then quit and reopen the app.
-
-Remove the package:
-
-```bash
-pip uninstall tfbs-mcp
-```
-
-Or remove the whole environment instead. With micromamba, deactivate it first, because an active environment cannot be removed:
-
-```bash
-micromamba deactivate
-micromamba env remove -n tfbs-mcp
-```
-
-With venv, delete the folder:
-
-```bash
-rm -rf ~/tfbs-env
-```
-
-Finally, delete the data files you downloaded for [Adding your data](#adding-your-data) (the genome, motif, ClinVar and PDB files) if you no longer need them. Structures fetched by `tfbs_fetch_structure` without an output folder are in `<results>/structures/<id>/`, where `<results>` is the `results_dir` that `tfbs_server_info` reports; the repaired copies that `tfbs_binding_energy` keeps are saved there too.
-
-## Available tools
-
-The 33 tools are organized into six layers:
-
-| Layer | Tools | Examples |
-|---|---|---|
-| Inference | 10 | `tfbs_predict`, `tfbs_analyze` (DeepLiftShap), `tfbs_mutagenesis`, `tfbs_fimo` |
-| SLURM management | 5 | `slurm_submit`, `slurm_status`, `slurm_logs` |
-| Training | 4 | `tfbs_config`, `tfbs_train`, `tfbs_sweep`, `tfbs_validate` |
-| Data pipeline | 7 | `tfbs_extract_loci`, `tfbs_prepare_dataset`, `tfbs_seqlets`, `tfbs_epistasis` |
-| Structure-based | 3 | `tfbs_fetch_structure`, `tfbs_binding_energy`, `tfbs_binding_scan` |
-| Validation and comparison | 4 | `tfbs_chipseq_benchmark`, `tfbs_chipseq_method_comparison`, `tfbs_remap_validation`, `tfbs_disease_variant_validation` |
+Remove the package with `pip uninstall tfbs-mcp`, or remove the whole environment instead. With micromamba, run `micromamba deactivate` first, because an active environment cannot be removed, then `micromamba env remove -n tfbs-mcp`. With venv, delete the folder: `rm -rf ~/tfbs-env`. Finally, delete the data files you downloaded (the genome, motif, ClinVar, model and PDB files) if you no longer need them. Structures fetched by `tfbs_fetch_structure` without an output folder are in `<results>/structures/<id>/`, where `<results>` is the `results_dir` that `tfbs_server_info` reports; the repaired copies that `tfbs_binding_energy` keeps are saved there too.
 
 ## Further documentation
 
-- [docs/development.md](docs/development.md): the Python library, training and prediction commands, running the server by hand, optional extras, model architectures, project structure, and the test suite.
-- [docs/other-clients.md](docs/other-clients.md): connecting AI apps other than Claude.
+[docs/tools.md](docs/tools.md) lists all 33 tools in their six layers, with the architecture diagram. [docs/install-windows.md](docs/install-windows.md) covers the Windows differences and the tools that need WSL, [docs/troubleshooting.md](docs/troubleshooting.md) symptoms, causes and fixes, [docs/other-clients.md](docs/other-clients.md) AI apps other than Claude, and [docs/development.md](docs/development.md) the Python library, the training and prediction commands, running the server by hand, the optional extras, the model architectures, the project structure and the test suite.
 
 ## Citation
 

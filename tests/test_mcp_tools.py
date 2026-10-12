@@ -1346,6 +1346,55 @@ def test_server_info_reports_cuda_version_and_default_partition(monkeypatch):
     assert "cuda_available" in fresh and "torch_loaded" not in fresh
 
 
+def test_server_info_reports_registered_reference_files(monkeypatch, tmp_path):
+    """reference_files gives each reference variable's path and whether it exists."""
+    from tfbs.mcp import server
+
+    genome = tmp_path / "hg38.fa"
+    genome.write_text(">chr1\nACGT\n")
+    missing = tmp_path / "MA1994.1.meme"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TFBS_GENOME_FASTA", "hg38.fa")  # relative, as a user might
+    monkeypatch.setenv("TFBS_MOTIF_FILE", str(missing))
+    monkeypatch.delenv("TFBS_CLINVAR_VCF", raising=False)
+    monkeypatch.setenv("TFBS_FOLDX_PDB", "   ")  # blank counts as unset
+
+    info = json.loads(asyncio.run(server.tfbs_server_info()))
+    files = info["reference_files"]
+    assert list(files) == ["TFBS_GENOME_FASTA", "TFBS_MOTIF_FILE",
+                           "TFBS_CLINVAR_VCF", "TFBS_FOLDX_PDB"]
+    # Reported as the tools resolve it: expanded and absolute.
+    assert files["TFBS_GENOME_FASTA"] == {"path": str(genome.resolve()), "exists": True}
+    assert files["TFBS_MOTIF_FILE"] == {"path": str(missing.resolve()), "exists": False}
+    assert files["TFBS_CLINVAR_VCF"] == {"path": None, "exists": None}
+    assert files["TFBS_FOLDX_PDB"] == {"path": None, "exists": None}
+    # The existing fields are still there.
+    for key in ("on_slurm", "default_partition", "call_log", "results_dir",
+                "project_root", "loaded_models", "torch_version", "cuda_available"):
+        assert key in info, key
+    assert "reference_files" in server.tfbs_server_info.__doc__
+    # The description tells Claude how to register files.
+    assert "tfbs-mcp --setup --non-interactive" in server.tfbs_server_info.__doc__
+
+
+@pytest.mark.parametrize("arg", ["genome_fasta", "motif_file", "clinvar_vcf", "foldx_pdb"])
+def test_missing_reference_fix_names_the_setup_flag(monkeypatch, arg):
+    """The fix for an unconfigured reference file names the setup call that registers it."""
+    from tfbs.mcp import server
+    from tfbs.mcp.cli import SETUP_VARIABLES
+
+    env_var = server.REFERENCE_DATA_ENV[arg]
+    monkeypatch.delenv(env_var, raising=False)
+    path, err = server._resolve_reference(None, arg)
+    assert path is None
+    payload = json.loads(err)
+    flag = next(v.flag for v in SETUP_VARIABLES if v.env == env_var)
+    assert payload["error"].startswith("No ")
+    assert f"Pass {arg}=" in payload["fix"]
+    assert f"tfbs-mcp --setup --non-interactive {flag} /path/to/file" in payload["fix"]
+    assert "replaces the whole registration" in payload["fix"]
+
+
 def test_startup_preloads_every_native_module_the_tools_import():
     """main() imports these before the stdio loop; a tool importing more would hang on Windows."""
     from tfbs.mcp import server
@@ -1358,7 +1407,7 @@ def test_startup_preloads_every_native_module_the_tools_import():
     pure = {"importlib.util", "tfbs.configs", "tfbs.pipelines.checkpoints", "tfbs.mcp",
             "ctypes", "msvcrt", "sys", "csv", "bisect", "torch", "torch.nn.functional",
             "tfbs.nn.models", "tfbs.prediction.analysis", "tfbs.mcp.foldx_tools", "shlex",
-            "tfbs.mcp.server"}
+            "tfbs.mcp.server", "tfbs.nn.loading"}
     for path in sources:
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             for fn in ([node] if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else []):

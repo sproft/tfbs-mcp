@@ -11,6 +11,14 @@ in the same directory and swapped in with os.replace, so a reader never sees a
 half-written CSV.  Neither path locks the file: concurrent jobs should write
 separate output files (one per job) and merge them afterwards, because a row
 another job appends during a rewrite is lost.
+
+--checkpoint_path takes a PyTorch Lightning checkpoint or an inference
+checkpoint such as the NKX2-1 study's released <models>/flank/vcnnbpnet.pt
+(Zenodo, doi:10.5281/zenodo.21399578); tfbs.nn.loading.load_checkpoint
+tells them apart by content.  Either way the model is a tfbs LightningModule
+that trainer.test() evaluates against the labels as --scaling_method scales
+them, so an inference checkpoint is scored on the training scale (its
+scaling block is not applied), as a Lightning checkpoint is.
 """
 import argparse
 import csv
@@ -23,6 +31,7 @@ import pytorch_lightning as pl
 import torch
 
 from tfbs.dataloaders.SeqDataset import TFBSDataModule
+from tfbs.nn.loading import load_checkpoint
 import tfbs.nn.models as models
 
 
@@ -137,21 +146,19 @@ def run(args):
         return
 
     # 2. Load Model from Checkpoint
-    model_class = get_model_class(args.model_name)
+    get_model_class(args.model_name)
     print(f"Loading model '{args.model_name}' from checkpoint: {args.checkpoint_path}")
 
-    # Use load_from_checkpoint. This automatically reads all hyperparameters 
-    # (including input_length, classify, learning_rate) saved in the checkpoint file.
-    # We pass the class reference but the actual parameters are loaded from the file.
+    # load_checkpoint reads a Lightning checkpoint through load_from_checkpoint
+    # and rebuilds an inference checkpoint from its hyper_parameters; either
+    # way all hyperparameters (input_length, classify, ...) come from the file.
+    # input_length is passed explicitly in case the checkpoint was trained
+    # with a different sequence length than what is inferred now, though
+    # usually it should match.  The model comes back in evaluation mode.
     try:
-        model = model_class.load_from_checkpoint(
-            checkpoint_path=args.checkpoint_path,
-            # We explicitly pass input_length in case the checkpoint was trained 
-            # with a different sequence length than what is inferred now, 
-            # though usually it should match.
-            input_length=input_length 
-        )
-        model.eval() # Set model to evaluation mode
+        model, _ = load_checkpoint(args.checkpoint_path, args.model_name,
+                                   map_location="cpu",
+                                   overrides={"input_length": input_length})
     except Exception as e:
         print(f"Failed to load model from checkpoint: {e}")
         print("Check if the checkpoint file exists and if the model class matches the one used during training.")
@@ -189,7 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
     
     # Required arguments
     parser.add_argument('--checkpoint_path', type=str, required=True,
-                        help='Path to the model checkpoint file (.ckpt).')
+                        help='Path to the model checkpoint: a Lightning .ckpt or an '
+                             'inference checkpoint such as a released vcnnbpnet.pt.')
     parser.add_argument('--model_name', type=str, default='FlexibleMLP',
                         help='The name of the model class used during training (e.g., FlexibleMLP, CNN, BPNet).')
     parser.add_argument('--output_file', type=str, required=True,

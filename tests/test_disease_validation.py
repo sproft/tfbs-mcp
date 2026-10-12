@@ -308,7 +308,9 @@ def test_model_type_reaches_the_pipeline(files, tmp_path, monkeypatch):
     assert _flag(_disease(files, tmp_path, slurm=True)["command"].split(), "--model-type") == "VCNNBpnet"
 
 
-class _FakeNet(torch.nn.Module):
+class FakeNet(torch.nn.Module):
+    # A model class is one defined in tfbs.nn.models under its own name.
+    __module__ = "tfbs.nn.models"
     loaded = []
 
     @classmethod
@@ -323,14 +325,14 @@ class _FakeNet(torch.nn.Module):
 def test_pipeline_loads_every_checkpoint_as_the_model_type(monkeypatch):
     import tfbs.nn.models as models_mod
 
-    monkeypatch.setattr(models_mod, "FakeNet", _FakeNet, raising=False)
-    _FakeNet.loaded = []
+    monkeypatch.setattr(models_mod, "FakeNet", FakeNet, raising=False)
+    FakeNet.loaded = []
     genome = {"chr1": "ACGTACGTAC" * 10}
     df = pd.DataFrame([{"chrom": "chr1", "pos": 50, "ref": genome["chr1"][49], "alt": "A",
                         "label": "benign"}])
     scored = dv.score_with_nn(df, {"m": "/ckpt/m.ckpt"}, genome, window=24, device="cpu",
                               model_type="FakeNet")
-    assert _FakeNet.loaded == [("/ckpt/m.ckpt", "cpu")]
+    assert FakeNet.loaded == [("/ckpt/m.ckpt", "cpu")]
     assert {"nn_m_ref", "nn_m_alt", "nn_m_dd"} <= set(scored.columns)
 
 
@@ -338,6 +340,15 @@ def test_pipeline_rejects_an_unknown_model_type():
     with pytest.raises(SystemExit) as stop:
         dv.model_class("NoSuchNet")
     assert "NoSuchNet" in stop.value.code and "VCNNBpnet" in stop.value.code
+
+
+@pytest.mark.parametrize("name", ["BaseModel", "IrrepBatchNorm", "_MissingEquirc"])
+def test_pipeline_rejects_a_helper_class_as_the_model_type(name):
+    """Only the model classes the server lists are a model type, not its helpers."""
+    with pytest.raises(SystemExit) as stop:
+        dv.model_class(name)
+    known = stop.value.code.split("(known: ")[1]
+    assert name not in known.split(", ") and "VCNNBpnet" in known
 
 
 # ---------------------------------------------------------------------------
@@ -599,3 +610,72 @@ def test_an_output_dir_that_is_a_file_is_an_error_not_an_exception(files, tmp_pa
         checkpoints={"peaks": files["ckpt"]}, slurm=True))
     assert "Cannot create the directory" in result["error"] and "output_dir" in result["fix"]
     assert rec.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Inference checkpoints (the NKX2-1 study's released vcnnbpnet.pt format)
+# ---------------------------------------------------------------------------
+
+def _released_like(path: Path) -> Path:
+    from tfbs.nn import models
+
+    torch.manual_seed(0)
+    model = models.VCNNBpnet(num_channels=4, kernel_size=3, dilations=[1, 2],
+                             pool_output_size=5, dense_sizes=[8], input_length=10)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"arch": "VCNNBpnet", "hyper_parameters": dict(model.hparams),
+                "state_dict": model.state_dict(), "library": "flank",
+                "scaling": {"scaling_method": "standardize", "mean": 0.0, "std": 1.0}}, path)
+    return path
+
+
+@pytest.mark.parametrize("slurm", [False, True])
+def test_nn_models_take_an_inference_checkpoint(files, tmp_path, monkeypatch, slurm):
+    rec = Pipeline(monkeypatch)
+    ckpt = _released_like(tmp_path / "models" / "flank" / "vcnnbpnet.pt")
+    result = _disease(files, tmp_path, slurm=slurm, nn_models={"flank": "models/flank/vcnnbpnet.pt"})
+    assert "error" not in result, result
+    assert result["nn_models"] == {"flank": str(ckpt.resolve())}
+    cmd = rec.pipeline_cmd() if not slurm else result["command"].split()
+    assert f"flank={ckpt.resolve()}" in " ".join(cmd).replace("'", "")
+
+
+def test_nn_models_reject_an_inference_checkpoint_of_another_model_type(files, tmp_path,
+                                                                       monkeypatch):
+    rec = Pipeline(monkeypatch)
+    ckpt = _released_like(tmp_path / "models" / "flank" / "vcnnbpnet.pt")
+    result = _disease(files, tmp_path, slurm=False, nn_models={"flank": str(ckpt)},
+                      model_type="RNN")
+    assert "holds a VCNNBpnet model, but model_type is RNN" in result["error"]
+    assert "model_type='VCNNBpnet'" in result["fix"] and result["arch"] == "VCNNBpnet"
+    assert rec.calls == []
+
+
+@pytest.mark.parametrize("slurm", [False, True])
+def test_nn_models_reject_a_bare_state_dict_before_running(files, tmp_path, monkeypatch, slurm):
+    rec = Pipeline(monkeypatch)
+    released = _released_like(tmp_path / "models" / "flank" / "vcnnbpnet.pt")
+    bare = tmp_path / "models" / "flank" / "weights.pt"
+    torch.save(torch.load(released, weights_only=True)["state_dict"], bare)
+    result = _disease(files, tmp_path, slurm=slurm, nn_models={"flank": str(bare)})
+    assert "bare state_dict" in result["error"] and str(bare.resolve()) in result["error"]
+    assert "{arch, hyper_parameters, state_dict}" in result["fix"]
+    assert "Nothing was run or submitted" in result["fix"]
+    assert rec.calls == []
+
+
+def test_disease_pipeline_exits_cleanly_on_a_file_it_cannot_load(tmp_path):
+    genome = {"chr1": "".join(np.random.RandomState(3).choice(list("ACGT"), 100))}
+    ref = genome["chr1"][49]
+    df = pd.DataFrame([{"chrom": "chr1", "pos": 50, "ref": ref,
+                        "alt": "A" if ref != "A" else "C", "label": "benign"}])
+    released = _released_like(tmp_path / "flank" / "vcnnbpnet.pt")
+    bare = tmp_path / "flank" / "weights.pt"
+    torch.save(torch.load(released, weights_only=True)["state_dict"], bare)
+    corrupt = tmp_path / "flank" / "corrupt.pt"
+    corrupt.write_bytes(b"not a checkpoint")
+    for path, expected in ((bare, "bare state_dict"), (corrupt, "not a PyTorch checkpoint")):
+        with pytest.raises(SystemExit) as stop:
+            dv.score_with_nn(df, {"flank": str(path)}, genome, window=10, device="cpu",
+                             model_type="VCNNBpnet")
+        assert f"--models flank={path}" in stop.value.code and expected in stop.value.code

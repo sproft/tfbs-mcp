@@ -428,3 +428,165 @@ def test_the_probe_reports_a_timeout_as_none(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server.subprocess, "run", missing)
     assert server._module_importable("anything_x", tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# Inference checkpoints (the NKX2-1 study's released vcnnbpnet.pt format)
+# ---------------------------------------------------------------------------
+
+def _inference_ckpt(path: Path, arch: str = "VCNNBpnet") -> Path:
+    from tfbs.nn import models
+
+    torch.manual_seed(0)
+    model = models.VCNNBpnet(num_channels=4, kernel_size=3, dilations=[1, 2],
+                             pool_output_size=5, dense_sizes=[8], input_length=10)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"arch": arch, "hyper_parameters": dict(model.hparams),
+                "state_dict": model.state_dict(), "library": "flank",
+                "scaling": {"scaling_method": "standardize", "mean": 0.0, "std": 1.0}}, path)
+    return path
+
+
+@pytest.mark.parametrize("name", TOOLS)
+def test_tools_accept_an_inference_checkpoint_without_probing_a_class(name, bench, monkeypatch):
+    tmp_path, files, calls = bench
+
+    def no_probe(*a, **k):
+        raise AssertionError("an inference checkpoint has no class module to probe")
+
+    monkeypatch.setattr(server, "_module_importable", no_probe)
+    ckpt = _inference_ckpt(tmp_path / "released" / "flank" / "vcnnbpnet.pt")
+    result = _tool(name, tmp_path, files, checkpoints={"flank": str(ckpt)})
+    assert "error" not in result, result
+    assert result["checkpoints"] == {"flank": str(ckpt.resolve())}
+    cmd = calls[-1]
+    assert cmd[cmd.index("--checkpoints") + 1] == f"flank={ckpt.resolve()}"
+
+
+@pytest.mark.parametrize("name", TOOLS)
+def test_tools_reject_an_inference_checkpoint_of_another_model_type(name, bench):
+    tmp_path, files, calls = bench
+    ckpt = _inference_ckpt(tmp_path / "released" / "flank" / "vcnnbpnet.pt")
+    result = _tool(name, tmp_path, files, checkpoints={"flank": str(ckpt)}, model_type="RNN")
+    assert "holds a VCNNBpnet model, but model_type is RNN" in result["error"]
+    assert "model_type='VCNNBpnet'" in result["fix"] and result["arch"] == "VCNNBpnet"
+    assert result["checkpoint"] == str(ckpt.resolve())
+    assert calls == []
+
+
+def test_an_inference_checkpoint_of_an_unknown_architecture_is_rejected(bench):
+    tmp_path, files, calls = bench
+    ckpt = _inference_ckpt(tmp_path / "released" / "x.pt", arch="FutureNet")
+    result = _tool("tfbs_chipseq_benchmark", tmp_path, files, checkpoints={"x": str(ckpt)},
+                   model_type="FutureNet")
+    assert "FutureNet" in result["error"] and "tfbs.nn.models" in result["error"]
+    assert result["fix"] and calls == []
+
+
+def test_an_inference_checkpoint_found_by_the_lookup_is_recognised_too(bench, monkeypatch):
+    tmp_path, files, calls = bench
+    monkeypatch.setattr(server, "_module_importable",
+                        lambda *a, **k: pytest.fail("no probe expected"))
+    _inference_ckpt(tmp_path / "m" / "ds" / "standardize" / "best_VCNNBpnet.ckpt")
+    result = _tool("tfbs_chipseq_benchmark", tmp_path, files, datasets=["ds"],
+                   models_dir=str(tmp_path / "m"))
+    assert "error" not in result, result
+    # A VCNNBpnet file saved under the name the lookup expects for an RNN.
+    _inference_ckpt(tmp_path / "m" / "ds" / "standardize" / "best_RNN.ckpt")
+    wrong = _tool("tfbs_chipseq_benchmark", tmp_path, files, datasets=["ds"],
+                  models_dir=str(tmp_path / "m"), model_type="RNN")
+    assert "model_type is RNN" in wrong["error"]
+
+
+def test_each_checkpoint_is_read_once_per_call(bench, monkeypatch):
+    tmp_path, files, calls = bench
+    ckpt = _inference_ckpt(tmp_path / "released" / "flank" / "vcnnbpnet.pt")
+    lightning = _class_path_ckpt(tmp_path / "m" / "best.ckpt", "tfbs.nn.models.VCNNBpnet")
+    reads = []
+    real = server._load_weights_only
+
+    def counting(path):
+        reads.append(Path(path))
+        return real(path)
+
+    monkeypatch.setattr(server, "_load_weights_only", counting)
+    result = _tool("tfbs_chipseq_benchmark", tmp_path, files,
+                   checkpoints={"flank": str(ckpt), "mine": str(lightning)})
+    assert "error" not in result, result
+    assert sorted(map(str, reads)) == sorted([str(ckpt.resolve()), str(lightning.resolve())])
+
+
+def test_checkpoint_descriptions_name_both_formats_and_the_released_files():
+    for name in (*TOOLS, "tfbs_disease_variant_validation", "tfbs_validate"):
+        doc = " ".join(getattr(server, name).__doc__.split())
+        assert "inference checkpoint" in doc and "Lightning" in doc, name
+        assert "<models>/flank/vcnnbpnet.pt" in doc, name
+        assert "doi:10.5281/zenodo.21399578" in doc, name
+    resolver = " ".join(ck.__doc__.split())
+    assert "either format" in resolver and "<models>/flank/vcnnbpnet.pt" in resolver
+
+
+def test_validate_rejects_an_inference_checkpoint_of_another_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    submitted = []
+    monkeypatch.setattr(server.subprocess, "run",
+                        lambda cmd, *a, **k: submitted.append(cmd) or subprocess.CompletedProcess(
+                            cmd, 0, "Submitted batch job 9\n", ""))
+    monkeypatch.setattr(server.shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+    ckpt = _inference_ckpt(tmp_path / "released" / "flank" / "vcnnbpnet.pt")
+    data = _dataset(tmp_path / "data" / "flank_dataset")
+    wrong = run(server.tfbs_validate(checkpoint_path=str(ckpt), data_path=str(data),
+                                     model_name="RNN", output_file=str(tmp_path / "v.csv")))
+    assert "holds a VCNNBpnet model, but model_name is RNN" in wrong["error"]
+    assert "model_name='VCNNBpnet'" in wrong["fix"] and submitted == []
+    ok = run(server.tfbs_validate(checkpoint_path=str(ckpt), data_path=str(data),
+                                  model_name="VCNNBpnet", output_file=str(tmp_path / "v.csv")))
+    assert "error" not in ok, ok
+    assert f"--checkpoint_path {ckpt.resolve()}" in ok["validate_command"].replace("'", "")
+
+
+@pytest.mark.parametrize("name", TOOLS)
+def test_tools_reject_a_bare_state_dict_before_running(name, bench, monkeypatch):
+    tmp_path, files, calls = bench
+    monkeypatch.setattr(server, "_module_importable",
+                        lambda *a, **k: pytest.fail("a bare state_dict has no class to probe"))
+    released = _inference_ckpt(tmp_path / "released" / "flank" / "vcnnbpnet.pt")
+    bare = tmp_path / "released" / "flank" / "weights.pt"
+    torch.save(torch.load(released, weights_only=True)["state_dict"], bare)
+    result = _tool(name, tmp_path, files, checkpoints={"flank": str(bare)})
+    assert "bare state_dict" in result["error"] and result["checkpoint"] == str(bare.resolve())
+    assert "{arch, hyper_parameters, state_dict}" in result["fix"]
+    assert "Nothing was run or submitted" in result["fix"]
+    assert calls == []
+
+
+def test_an_inference_checkpoint_of_a_helper_class_is_rejected(bench):
+    tmp_path, files, calls = bench
+    ckpt = _inference_ckpt(tmp_path / "released" / "base.pt", arch="BaseModel")
+    result = _tool("tfbs_chipseq_benchmark", tmp_path, files, checkpoints={"x": str(ckpt)})
+    assert "holds a BaseModel model" in result["error"] and "tfbs.nn.models" in result["error"]
+    assert "BaseModel" not in result["available"] and "VCNNBpnet" in result["available"]
+    assert calls == []
+
+
+def test_validate_checks_model_name_and_rejects_a_bare_state_dict(tmp_path, monkeypatch):
+    monkeypatch.setenv("TFBS_PROJECT_ROOT", str(tmp_path))
+    submitted = []
+    monkeypatch.setattr(server.subprocess, "run",
+                        lambda cmd, *a, **k: submitted.append(cmd) or subprocess.CompletedProcess(
+                            cmd, 0, "Submitted batch job 9\n", ""))
+    monkeypatch.setattr(server.shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+    data = _dataset(tmp_path / "data" / "flank_dataset")
+    lightning = _class_path_ckpt(tmp_path / "trained" / "best.ckpt", "tfbs.nn.models.VCNNBpnet")
+    unknown = run(server.tfbs_validate(checkpoint_path=str(lightning), data_path=str(data),
+                                       model_name="Nope", output_file=str(tmp_path / "v.csv")))
+    assert unknown["error"] == "Unknown model_name 'Nope'."
+    assert "VCNNBpnet" in unknown["available"] and submitted == []
+    released = _inference_ckpt(tmp_path / "released" / "flank" / "vcnnbpnet.pt")
+    bare = tmp_path / "released" / "flank" / "weights.pt"
+    torch.save(torch.load(released, weights_only=True)["state_dict"], bare)
+    result = run(server.tfbs_validate(checkpoint_path=str(bare), data_path=str(data),
+                                      output_file=str(tmp_path / "v.csv")))
+    assert "bare state_dict" in result["error"] and submitted == []
+    doc = " ".join(server.tfbs_validate.__doc__.split())
+    assert "a bare state_dict" in doc and "names no model class in tfbs.nn.models" in doc

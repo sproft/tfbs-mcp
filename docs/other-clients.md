@@ -1,6 +1,6 @@
 # Connecting AI apps other than Claude
 
-The [README](../README.md) covers Claude Code and Claude Desktop. This page is for everything else. Do steps 1 and 2 of the README first (create the environment, install, run `tfbs-mcp --check`), then come back here.
+The [README](../README.md) covers Claude Code and Claude Desktop. This page is for everything else. Do steps 1 and 2 of the README first (create the environment, install, run `tfbs-mcp --check`; on Windows see [install-windows.md](install-windows.md)), then come back here. Problems and their fixes are listed in [troubleshooting.md](troubleshooting.md).
 
 ## Before you start
 

@@ -34,6 +34,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from tfbs.mcp.cli import SETUP_VARIABLES
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -509,8 +511,11 @@ def _resolve_reference(value: str | None, arg: str) -> tuple[Path | None, str | 
     if not raw:
         return None, json.dumps({
             "error": f"No {what} configured.",
-            "fix": f"Pass {arg}=/path/to/file, or set {env_var} in the 'env' "
-                   f"block of your MCP client config.",
+            "fix": f"Pass {arg}=/path/to/file, or register it as {env_var}: run "
+                   f"`{_setup_command(env_var)}` (with the flags of the files "
+                   f"already registered, since each run replaces the whole "
+                   f"registration), apply the Claude Code command or Claude "
+                   f"Desktop block it prints, and restart the client.",
         })
     path = Path(raw).expanduser().resolve()
     if not path.exists():
@@ -519,6 +524,35 @@ def _resolve_reference(value: str | None, arg: str) -> tuple[Path | None, str | 
             "fix": f"Check the {arg} argument or the {env_var} environment variable.",
         })
     return path, None
+
+
+def _setup_command(env_var: str) -> str:
+    """The ``tfbs-mcp --setup`` call that registers ``env_var``, for fix texts."""
+    flag = next(v.flag for v in SETUP_VARIABLES if v.env == env_var)
+    return f"tfbs-mcp --setup --non-interactive {flag} /path/to/file"
+
+
+def _reference_files() -> dict[str, dict]:
+    """The registered reference files, as tfbs_server_info reports them.
+
+    One entry per reference variable (TFBS_GENOME_FASTA, TFBS_MOTIF_FILE,
+    TFBS_CLINVAR_VCF, TFBS_FOLDX_PDB): ``path`` is the variable's value
+    expanded and made absolute the way the tools resolve it, or None when it
+    is unset or empty; ``exists`` says whether that path exists, the same
+    check the tools make, and is None when no path is set.
+    """
+    files: dict[str, dict] = {}
+    for arg in ("genome_fasta", "motif_file", "clinvar_vcf", "foldx_pdb"):
+        raw = os.environ.get(REFERENCE_DATA_ENV[arg], "").strip()
+        path, exists = None, None
+        if raw:
+            try:
+                resolved = Path(raw).expanduser().resolve()
+                path, exists = str(resolved), resolved.exists()
+            except (OSError, RuntimeError, ValueError):
+                path, exists = raw, False
+        files[REFERENCE_DATA_ENV[arg]] = {"path": path, "exists": exists}
+    return files
 
 
 def _optional_reference(value: str | None, arg: str) -> tuple[Path | None, str | None]:
@@ -865,29 +899,28 @@ def _error(error: str, fix: str, **extra: Any) -> str:
 
 
 def _available_model_types() -> list[str]:
-    """The model classes of tfbs.nn.models a model_type may name."""
+    """The model classes of tfbs.nn.models a model_type may name.
+
+    The rule is tfbs.nn.loading.model_class_names, the one the loader
+    applies to a model_type and to an inference checkpoint's arch.
+    """
+    from tfbs.nn.loading import model_class_names
+
     _ensure_imports()
-    return sorted(
-        n for n in dir(_models)
-        if isinstance(getattr(_models, n, None), type)
-        and issubclass(getattr(_models, n), _torch.nn.Module)
-        and n != "BaseModel" and not n.startswith("_")
-        and getattr(_models, n).__module__ == _models.__name__
-    )
+    return model_class_names()
 
 
-def _model_type_error(model_type: str) -> str | None:
+def _model_type_error(model_type: str, argument: str = "model_type") -> str | None:
     """{error, fix} JSON when model_type names no model class in tfbs.nn.models.
 
     Checked before a pipeline runs or is submitted, so an unknown class
-    fails at once instead of when the SLURM job starts.
+    fails at once instead of when the SLURM job starts.  argument is the
+    parameter's name in the error.
     """
-    _ensure_imports()
-    model_cls = getattr(_models, str(model_type), None)
-    if isinstance(model_cls, type) and issubclass(model_cls, _torch.nn.Module):
-        return None
     available = _available_model_types()
-    return _error(f"Unknown model_type '{model_type}'.",
+    if str(model_type) in available:
+        return None
+    return _error(f"Unknown {argument} '{model_type}'.",
                   f"Use one of: {available}.", available=available)
 
 
@@ -1115,9 +1148,6 @@ def _load_sequence_input(
 # ---------------------------------------------------------------------------
 # Checkpoint loading helpers
 # ---------------------------------------------------------------------------
-_CLASS_PATH_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
-
-
 def _load_weights_only(path: Path) -> Any:
     """The object torch.load(weights_only=True) reads from path, or None."""
     _ensure_imports()
@@ -1164,65 +1194,41 @@ def _recorded_scaling(ckpt: Path, meta: dict) -> str | None:
     return ckpt.parent.name if ckpt.parent.name in _SCALING_METHODS else None
 
 
-def _class_path_in(message: str, model_type: str) -> str | None:
-    """A class path ending in model_type, from a module not yet imported, in a message."""
-    for match in _CLASS_PATH_RE.findall(message):
-        module, _, name = match.rpartition(".")
-        if name == model_type and module not in sys.modules:
-            return match
-    return None
+def _load_checkpoint(path: Path, model_type: str, device: str, meta: dict):
+    """(model, None) or (None, error JSON) for a Lightning checkpoint.
 
-
-def _import_class_module(class_path: str) -> bool:
-    """Import the module that defines class_path; False if it cannot be imported."""
-    module = class_path.rpartition(".")[0]
-    if not module:
-        return False
-    if module in sys.modules:
-        return True
-    try:
-        importlib.import_module(module)
-    except Exception:
-        return False
-    return True
-
-
-def _load_checkpoint(model_cls, path: Path, model_type: str, device: str,
-                     meta: dict | None = None):
-    """(model, None) or (None, error JSON).
-
-    Lightning resolves the class path stored in a LightningCLI checkpoint
-    and, depending on its version, refuses one whose module is not
-    imported yet.  The module named in the checkpoint is imported first;
-    when loading still fails over a class path whose module was not
-    imported, that module is imported and the load retried once.
+    The model is built by tfbs.nn.loading.load_checkpoint, the loader the
+    pipelines share.  Lightning resolves the class path stored in a
+    LightningCLI checkpoint and, depending on its version, refuses one
+    whose module is not imported yet.  The module named in the checkpoint
+    is imported first; when loading still fails over a class path whose
+    module was not imported, that module is imported and the load retried
+    once.
     """
+    from tfbs.nn.loading import UnimportableClassError, load_checkpoint
+
     class_path = _checkpoint_class_path(path, meta)
-    if class_path:
-        _import_class_module(class_path)
     try:
-        return model_cls.load_from_checkpoint(str(path), map_location=device), None
+        # Only the hyper_parameters are passed on: a frame holding the
+        # memory-mapped checkpoint would keep its file mapped (see
+        # tfbs.nn.loading.load_checkpoint).
+        model, _ = load_checkpoint(path, model_type, map_location=device,
+                                   payload={"hyper_parameters": meta["hyper_parameters"]})
+        return model, None
+    except UnimportableClassError as exc:
+        return None, _error(
+            f"The checkpoint was saved with the class {exc.class_path}, and its "
+            f"module {exc.module} cannot be imported by the server.",
+            f"Put the package that defines {exc.module} on the PYTHONPATH of the "
+            "MCP server (the 'env' block of the client config) and restart it; "
+            "for the NKX2-1 study checkpoints that is the TF-NN workspace, whose "
+            "classes package maps classes.* to tfbs.*. Or re-save the checkpoint "
+            "with hyper_parameters['_class_path'] set to the matching tfbs class, "
+            f"tfbs.nn.models.{model_type}.",
+            class_path=exc.class_path,
+        )
     except Exception as exc:
         failure = exc
-    failed_path = _class_path_in(str(failure), model_type) or class_path
-    if failed_path and failed_path.rpartition(".")[0] not in sys.modules:
-        if not _import_class_module(failed_path):
-            module = failed_path.rpartition(".")[0]
-            return None, _error(
-                f"The checkpoint was saved with the class {failed_path}, and its "
-                f"module {module} cannot be imported by the server.",
-                f"Put the package that defines {module} on the PYTHONPATH of the "
-                "MCP server (the 'env' block of the client config) and restart it; "
-                "for the NKX2-1 study checkpoints that is the TF-NN workspace, whose "
-                "classes package maps classes.* to tfbs.*. Or re-save the checkpoint "
-                "with hyper_parameters['_class_path'] set to the matching tfbs class, "
-                f"tfbs.nn.models.{model_type}.",
-                class_path=failed_path,
-            )
-        try:
-            return model_cls.load_from_checkpoint(str(path), map_location=device), None
-        except Exception as exc:
-            failure = exc
     return None, _error(
         f"Could not load {path} as {model_type}: {type(failure).__name__}: {str(failure)[:1500]}",
         "Check that model_type is the architecture the checkpoint was trained "
@@ -1415,21 +1421,26 @@ def _json_safe(value: Any) -> Any:
 
 def _is_inference_payload(ckpt: Any) -> bool:
     """A released inference checkpoint: {arch, hyper_parameters, state_dict, ...}."""
-    return (isinstance(ckpt, dict) and isinstance(ckpt.get("arch"), str)
-            and isinstance(ckpt.get("hyper_parameters"), dict)
-            and isinstance(ckpt.get("state_dict"), dict))
+    from tfbs.nn.loading import is_inference_payload
+
+    return is_inference_payload(ckpt)
 
 
-def _build_inference_model(payload: dict, path: Path, model_type: str, model_cls):
-    """(model, None) or (None, error JSON) for an inference checkpoint."""
+def _build_inference_model(payload: dict, path: Path, model_type: str, device: str):
+    """(model, None) or (None, error JSON) for an inference checkpoint.
+
+    The model is built by tfbs.nn.loading.load_checkpoint, the loader the
+    pipelines share, on device and in eval mode.
+    """
+    from tfbs.nn.loading import load_checkpoint
+
     arch = payload["arch"]
     if arch != model_type:
         return None, _error(
             f"{path} holds a {arch} model, but model_type is {model_type}.",
             f"Pass model_type='{arch}', the architecture the file records.", arch=arch)
     try:
-        model = model_cls(**payload["hyper_parameters"])
-        model.load_state_dict(payload["state_dict"], strict=True)
+        model, _ = load_checkpoint(path, model_type, map_location=device, payload=payload)
     except Exception as exc:
         return None, _error(
             f"Could not build {arch} from {path}: {type(exc).__name__}: {str(exc)[:1500]}",
@@ -1589,19 +1600,28 @@ async def tfbs_load_model(
                       "Pass the absolute path of a .ckpt file, e.g. the checkpoint_path "
                       "that tfbs_config reported.")
 
-    model_cls = getattr(_models, model_type, None)
     err = _model_type_error(model_type)
     if err:
         return err
 
+    from tfbs.nn.loading import checkpoint_problem
+
     ckpt = _load_weights_only(path)
+    problem = checkpoint_problem(path, ckpt)
+    if problem:
+        del ckpt
+        return _error(
+            problem,
+            "Pass a Lightning .ckpt or an inference checkpoint saved with torch.save as "
+            "{arch, hyper_parameters, state_dict}, such as a released vcnnbpnet.pt; "
+            "nothing was registered.")
     extra: dict[str, Any] = {}
     if _is_inference_payload(ckpt):
         checkpoint_format = "inference"
         scaling_params, scaling_source, err = _inference_scaling(ckpt, path, model_type, data_path)
         if err:
             return err
-        model, err = _build_inference_model(ckpt, path, model_type, model_cls)
+        model, err = _build_inference_model(ckpt, path, model_type, device)
         if err:
             return err
         hparams = ckpt["hyper_parameters"]
@@ -1619,7 +1639,7 @@ async def tfbs_load_model(
             data_path, path, model_type, meta)
         if err:
             return err
-        model, err = _load_checkpoint(model_cls, path, model_type, device, meta)
+        model, err = _load_checkpoint(path, model_type, device, meta)
         if err:
             return err
         input_length = getattr(model, "input_length", None)
@@ -2864,13 +2884,26 @@ async def tfbs_list_models() -> str:
     },
 )
 async def tfbs_server_info() -> str:
-    """Show the server's runtime environment and auto-detected defaults.
+    """Show the server's runtime environment, defaults and registered reference files.
 
     Reports whether the server is running inside a SLURM job, how many
     GPUs are visible, the default device and batch size, the default SLURM
-    partition, and the torch version and CUDA status.  The server imports
+    partition, the reference files registered for the server (genome,
+    motif, ClinVar VCF and FoldX structure) and whether each exists, and
+    the torch version and CUDA status.  The server imports
     PyTorch and the other native libraries at startup, so every call,
     this one included, answers at once.
+
+    To register or change the reference files and the project folder, run
+    `tfbs-mcp --setup --non-interactive` in a shell with the flags
+    --genome, --motif, --clinvar, --foldx-pdb and --project-root.  It
+    asks nothing, checks each path and prints the `claude mcp add` command
+    for Claude Code and the env block for Claude Desktop.  Each run
+    replaces the whole registration, so pass the paths already registered
+    too (`claude mcp get tfbs` shows them), and keep any other variable
+    such as TFBS_SLURM_PARTITION.  For Claude Code, run
+    `claude mcp remove tfbs --scope user`, then the printed command; the
+    server reads the paths when it starts, so restart the client.
 
     Returns:
         JSON with on_slurm, slurm_job_id, slurm_partition (partition of the
@@ -2886,7 +2919,15 @@ async def tfbs_server_info() -> str:
         working directory), project_root (working directory of the
         validation and benchmark pipelines, against which their relative
         models_dir resolves: $TFBS_PROJECT_ROOT, else the checkout, else the
-        server's working directory), loaded_models, torch_version,
+        server's working directory; it shows that fallback when
+        TFBS_PROJECT_ROOT is unset), reference_files (one entry per
+        reference variable, TFBS_GENOME_FASTA, TFBS_MOTIF_FILE,
+        TFBS_CLINVAR_VCF and TFBS_FOLDX_PDB, each {"path": the registered
+        path, expanded and made absolute as the tools resolve it, or null,
+        "exists": whether that path exists, null when no path is set}; the
+        tools that read a variable fall back to it when a call passes no
+        path),
+        loaded_models, torch_version,
         cuda_version (CUDA version of the PyTorch build, null for CPU
         builds) and cuda_available, plus cuda_device_name and
         cuda_device_count when CUDA is available.
@@ -2901,6 +2942,7 @@ async def tfbs_server_info() -> str:
     info["call_log"] = os.environ.get(CALL_LOG_ENV, "").strip() or None
     info["results_dir"] = str(_results_root())
     info["project_root"] = str(_project_root())
+    info["reference_files"] = _reference_files()
     info["torch_version"] = _torch.__version__
     info["cuda_version"] = _torch.version.cuda
     info["cuda_available"] = _torch.cuda.is_available()
@@ -4307,9 +4349,18 @@ async def tfbs_validate(
     job's .o/.e logs are written next to that file.
 
     Args:
-        checkpoint_path: Path to the .ckpt model checkpoint.
+        checkpoint_path: Path to the model checkpoint.  Both formats are
+            accepted: a PyTorch Lightning .ckpt, or an inference
+            checkpoint such as the NKX2-1 study's released
+            <models>/flank/vcnnbpnet.pt (Zenodo,
+            doi:10.5281/zenodo.21399578).  An inference checkpoint whose
+            arch is not model_name, and a bare state_dict (a file
+            saved with torch.save(model.state_dict())), are an error
+            before anything is submitted.
         data_path: Path to the dataset (tensor directory or CSV).
-        model_name: Model class name (e.g. "VCNNBpnet", "RNN").
+        model_name: Model class name (e.g. "VCNNBpnet", "RNN"); one that
+            names no model class in tfbs.nn.models is an error before
+            anything is submitted.
         scaling_method: Label scaling ("standardize", "normalize", "none").
         output_file: CSV file to append results to.  Defaults to
                      validation_results.csv in the results directory
@@ -4339,6 +4390,12 @@ async def tfbs_validate(
     data = Path(data_path).resolve()
     if not data.exists():
         return json.dumps({"error": f"Data path not found: {data_path}"})
+
+    err = _model_type_error(model_name, "model_name") or await asyncio.to_thread(
+        _inference_checkpoint_error, {"checkpoint_path": str(ckpt)}, model_name, None,
+        "model_name")
+    if err:
+        return err
 
     project_root, err = _work_dir()
     if err:
@@ -6471,14 +6528,92 @@ def _module_importable(module: str, project_root: Path,
     return probe.returncode == 0
 
 
-def _unimportable_checkpoint_class(found: dict[str, str], project_root: Path) -> str | None:
+def _checkpoint_summary(path: str, cache: dict[str, dict]) -> dict:
+    """{"arch", "class_path", "bare"} of a checkpoint, told by its content and read once per call.
+
+    arch is set for an inference checkpoint (a dict with arch,
+    hyper_parameters and state_dict, such as the NKX2-1 study's released
+    vcnnbpnet.pt files) and None otherwise; class_path is the class a
+    Lightning checkpoint records in hyper_parameters _class_path, or None;
+    bare is True for a bare state_dict (torch.save(model.state_dict())),
+    which neither loader can rebuild a model from.  cache maps a path to
+    its summary for the length of one tool call.
+    """
+    if path not in cache:
+        from tfbs.nn.loading import is_bare_state_dict
+
+        ckpt = _load_weights_only(Path(path))
+        if _is_inference_payload(ckpt):
+            cache[path] = {"arch": ckpt["arch"], "class_path": None, "bare": False}
+        elif is_bare_state_dict(ckpt):
+            cache[path] = {"arch": None, "class_path": None, "bare": True}
+        else:
+            meta = _checkpoint_meta(Path(path), ckpt if ckpt is not None else {})
+            cache[path] = {"arch": None, "class_path": _checkpoint_class_path(Path(path), meta),
+                           "bare": False}
+        del ckpt
+    return cache[path]
+
+
+def _inference_checkpoint_error(found: dict[str, str], model_type: str | None,
+                                cache: dict[str, dict] | None = None,
+                                argument: str = "model_type") -> str | None:
+    """Error JSON for the first checkpoint that cannot be loaded as given, else None.
+
+    An inference checkpoint's arch must be a class in tfbs.nn.models and,
+    when model_type is given, equal it, because the pipelines rebuild the
+    model from that class.  A bare state_dict is refused, because neither
+    loader can rebuild a model from it.  Lightning checkpoints are left to
+    the class-path probe.
+    """
+    cache = {} if cache is None else cache
+    known = _available_model_types()
+    for name, path in found.items():
+        summary = _checkpoint_summary(path, cache)
+        if summary.get("bare"):
+            return _error(
+                f"The checkpoint for {name} ({path}) is a bare state_dict (a dict of "
+                "tensors only, as torch.save(model.state_dict()) writes it), which records "
+                "neither the architecture nor its hyper_parameters.",
+                "Save the model as {arch, hyper_parameters, state_dict} with torch.save "
+                "(the format of the released vcnnbpnet.pt files) or pass a Lightning .ckpt. "
+                "Nothing was run or submitted.",
+                checkpoint=path,
+            )
+        arch = summary["arch"]
+        if arch is None:
+            continue
+        if arch not in known:
+            return _error(
+                f"The checkpoint for {name} ({path}) holds a {arch} model, which is not a "
+                "model class in tfbs.nn.models of the installed tfbs-mcp.",
+                "Update tfbs-mcp to a version that has this architecture, or check that "
+                "the file is an unmodified release. Nothing was run or submitted.",
+                arch=arch, checkpoint=path, available=known,
+            )
+        if model_type and arch != model_type:
+            return _error(
+                f"The checkpoint for {name} ({path}) holds a {arch} model, but "
+                f"{argument} is {model_type}.",
+                f"Pass {argument}='{arch}', the architecture the file records, or name "
+                f"a checkpoint of a {model_type} model. Nothing was run or submitted.",
+                arch=arch, checkpoint=path,
+            )
+    return None
+
+
+def _unimportable_checkpoint_class(found: dict[str, str], project_root: Path,
+                                   cache: dict[str, dict] | None = None) -> str | None:
     """Error JSON for the first checkpoint whose recorded class module the pipeline cannot import.
 
     Each module is probed once per call, however many checkpoints name it.
+    An inference checkpoint records no class path and is not probed: the
+    pipelines rebuild it from its arch in tfbs.nn.models.
     """
+    cache = {} if cache is None else cache
     verdicts: dict[str, bool | None] = {}
     for name, path in found.items():
-        class_path = _checkpoint_class_path(Path(path))
+        class_path = _checkpoint_summary(path, cache)["class_path"]
         if not class_path:
             continue
         module = class_path.rpartition(".")[0]
@@ -6568,7 +6703,9 @@ def _benchmark_checkpoints(
             + ", so it was probably trained with another label scaling; check that "
             "this is the model you mean, or pass scaling_method or checkpoints."
         )
-    err = _unimportable_checkpoint_class(resolved, project_root)
+    cache: dict[str, dict] = {}
+    err = (_inference_checkpoint_error(resolved, model_type, cache)
+           or _unimportable_checkpoint_class(resolved, project_root, cache))
     if err:
         return None, None, err
     return resolved, warning, None
@@ -6633,9 +6770,10 @@ async def tfbs_chipseq_benchmark(
             that file is missing and scaling_method is omitted, the one
             <dataset>/*/best_<model_type>.ckpt is used if there is exactly
             one.  The lookup is all-or-nothing: when any dataset has no
-            single checkpoint, or a checkpoint's recorded class
+            single checkpoint, a Lightning checkpoint's recorded class
             (hyper_parameters _class_path) cannot be imported from the
-            project root, the call returns an error and nothing is run
+            project root, or an inference checkpoint's arch is not
+            model_type, the call returns an error and nothing is run
             or submitted.
         scaling_method: Folder of the checkpoint under each dataset.
             Default null: "standardize" (the regression models of the
@@ -6644,8 +6782,15 @@ async def tfbs_chipseq_benchmark(
             is under "none"), and the result then carries a "warning".
             An explicit value names the only folder used and never falls
             back.
-        checkpoints: Explicit {dataset name: .ckpt path}; replaces the
-            models_dir lookup, and its names replace datasets.
+        checkpoints: Explicit {dataset name: checkpoint path}; replaces
+            the models_dir lookup, and its names replace datasets.  Both
+            checkpoint formats are accepted, here and in the lookup: a
+            PyTorch Lightning .ckpt, or an inference checkpoint such as
+            the NKX2-1 study's released <models>/flank/vcnnbpnet.pt
+            (Zenodo, doi:10.5281/zenodo.21399578), whose arch must equal
+            model_type.  The NN scores are the model's raw outputs, in
+            the training scale for a standardized model, which leaves
+            the AUCs unchanged.
         genome_fasta: Reference genome FASTA path. Falls back to
             $TFBS_GENOME_FASTA.
         max_sequences: Max sequences per TF for speed.
@@ -6836,9 +6981,10 @@ async def tfbs_chipseq_method_comparison(
             that file is missing and scaling_method is omitted, the one
             <dataset>/*/best_<model_type>.ckpt is used if there is exactly
             one.  The lookup is all-or-nothing: when any dataset has no
-            single checkpoint, or a checkpoint's recorded class
+            single checkpoint, a Lightning checkpoint's recorded class
             (hyper_parameters _class_path) cannot be imported from the
-            project root, the call returns an error and nothing is run
+            project root, or an inference checkpoint's arch is not
+            model_type, the call returns an error and nothing is run
             or submitted.
         scaling_method: Folder of the checkpoint under each dataset.
             Default null: "standardize" (the regression models of the
@@ -6847,8 +6993,15 @@ async def tfbs_chipseq_method_comparison(
             is under "none"), and the result then carries a "warning".
             An explicit value names the only folder used and never falls
             back.
-        checkpoints: Explicit {dataset name: .ckpt path}; replaces the
-            models_dir lookup, and its names replace datasets.
+        checkpoints: Explicit {dataset name: checkpoint path}; replaces
+            the models_dir lookup, and its names replace datasets.  Both
+            checkpoint formats are accepted, here and in the lookup: a
+            PyTorch Lightning .ckpt, or an inference checkpoint such as
+            the NKX2-1 study's released <models>/flank/vcnnbpnet.pt
+            (Zenodo, doi:10.5281/zenodo.21399578), whose arch must equal
+            model_type.  The NN scores are the model's raw outputs, in
+            the training scale for a standardized model, which leaves
+            the AUCs unchanged.
         genome_fasta: Reference genome FASTA. Falls back to
             $TFBS_GENOME_FASTA.
         n_per_tf: Sequences sampled per TF (FoldX bottleneck).
@@ -7057,9 +7210,10 @@ async def tfbs_remap_validation(
             that file is missing and scaling_method is omitted, the one
             <dataset>/*/best_<model_type>.ckpt is used if there is exactly
             one.  The lookup is all-or-nothing: when any dataset has no
-            single checkpoint, or a checkpoint's recorded class
+            single checkpoint, a Lightning checkpoint's recorded class
             (hyper_parameters _class_path) cannot be imported from the
-            project root, the call returns an error and nothing is run
+            project root, or an inference checkpoint's arch is not
+            model_type, the call returns an error and nothing is run
             or submitted.
         scaling_method: Folder of the checkpoint under each dataset.
             Default null: "standardize" (the regression models of the
@@ -7068,8 +7222,15 @@ async def tfbs_remap_validation(
             is under "none"), and the result then carries a "warning".
             An explicit value names the only folder used and never falls
             back.
-        checkpoints: Explicit {dataset name: .ckpt path}; replaces the
-            models_dir lookup, and its names replace datasets.
+        checkpoints: Explicit {dataset name: checkpoint path}; replaces
+            the models_dir lookup, and its names replace datasets.  Both
+            checkpoint formats are accepted, here and in the lookup: a
+            PyTorch Lightning .ckpt, or an inference checkpoint such as
+            the NKX2-1 study's released <models>/flank/vcnnbpnet.pt
+            (Zenodo, doi:10.5281/zenodo.21399578), whose arch must equal
+            model_type.  The NN scores are the model's raw outputs, in
+            the training scale for a standardized model, which leaves
+            the AUCs unchanged.
         genome_fasta: Reference genome FASTA. Falls back to
             $TFBS_GENOME_FASTA.
         foldx_workers: Parallel CPU workers for FoldX.
@@ -7295,14 +7456,23 @@ async def tfbs_disease_variant_validation(
             line needs a number in column 4; otherwise the run stops
             with an error naming the first line without one.
         nn_models: Dict mapping model name to checkpoint path, e.g.
-            {"flank_mean": "/path/to/best_VCNNBpnet.ckpt"}.  A relative
-            path resolves against the project root (TFBS_PROJECT_ROOT,
-            see tfbs_server_info); a checkpoint that does not exist, or a
-            name with "=" or whitespace, is an error.  Omitted: no NN leg.
+            {"flank_mean": "/path/to/best_VCNNBpnet.ckpt"}.  Both
+            checkpoint formats are accepted: a PyTorch Lightning .ckpt,
+            or an inference checkpoint such as the NKX2-1 study's
+            released <models>/flank/vcnnbpnet.pt (Zenodo,
+            doi:10.5281/zenodo.21399578), e.g. {"flank":
+            "<models>/flank/vcnnbpnet.pt"}.  A relative path resolves
+            against the project root (TFBS_PROJECT_ROOT, see
+            tfbs_server_info); a checkpoint that does not exist, or a
+            name with "=" or whitespace, is an error.  The NN scores are
+            the model's raw outputs, in the training scale for a
+            standardized model, which leaves the AUCs unchanged.
+            Omitted: no NN leg.
         model_type: Class in tfbs.nn.models that every nn_models
             checkpoint is loaded as (default "VCNNBpnet"; e.g. "RNN" or
             "BPNetReal" for a model trained with that architecture).  An
-            unknown class is an error before anything runs or is
+            unknown class, or an inference checkpoint whose arch is
+            another class, is an error before anything runs or is
             submitted.
         motif_file: JASPAR / MEME motif file for the FIMO leg.  Empty or
             null uses $TFBS_MOTIF_FILE; when that is unset too, the FIMO
@@ -7405,9 +7575,15 @@ async def tfbs_disease_variant_validation(
         return _error(
             "nn_models names checkpoints that do not exist: "
             + ", ".join(f"{n}={p}" for n, p in missing.items()),
-            "Pass existing .ckpt files (absolute, or relative to the project root "
-            "reported by tfbs_server_info), e.g. the checkpoint_path of tfbs_config.",
+            "Pass existing checkpoint files, a Lightning .ckpt or an inference "
+            "checkpoint such as a released vcnnbpnet.pt (absolute, or relative to the "
+            "project root reported by tfbs_server_info), e.g. the checkpoint_path of "
+            "tfbs_config.",
         )
+    if models_used:
+        err = await asyncio.to_thread(_inference_checkpoint_error, models_used, model_type)
+        if err:
+            return err
 
     out = Path(output_dir).resolve()
     mkdir_err = _mkdir_error(out, "output_dir")
