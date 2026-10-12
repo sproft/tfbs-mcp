@@ -6,13 +6,31 @@
 # ...or from the repo root:
 #   tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/VCNNBpnet.yaml
 #
-# Values are the tuned settings from do_train_final.sh (all_mean, 24 bp).
+# Every value except dilations is the tuned setting from do_train_final.sh
+# for the study's all_mean model (24 bp).
+#
+# dilations: the three-layer stack [1, 1, 2] is the default, not the study's
+# five-layer stack [1, 1, 2, 4, 8], which every study VCNNBpnet in
+# do_train_final.sh (all, core and flank) uses.  Trained as a classifier on
+# small sets at batch size 64, the five-layer stack can sit at a constant
+# output (loss ln 2, AUC 0.5): its output std at initialisation is about
+# 1e-6 (about 1e-4 for three layers).  On planted-motif sets of 24 bp
+# (Adam lr 0.001) it stayed constant in 3 of 10 seeds on 2,000 sequences and
+# stayed at a loss of ln 2 (with a varying output) in 3 of 10 seeds on 3,000
+# sequences, where the three-layer stack trained in every seed and matched
+# the live five-layer runs (best validation loss 0.549 against 0.541, AUC
+# 0.749 against 0.745, on the 2,000-sequence set).  On about 2,000 ChIP
+# windows the five-layer stack stayed constant for every seed and learning
+# rate tried, and the three-layer stack reached a validation AUC of 0.781.
+# To train the study's stack, pass model_params={"dilations": [1, 1, 2, 4, 8]}
+# to tfbs_config, or set dilations below.  Only this template changed: the
+# VCNNBpnet class default is still [1, 1, 2, 4, 8].
 class_path: tfbs.nn.models.VCNNBpnet
 init_args:
   input_length: 24
   input_channels: 4
   num_channels: 82
   kernel_size: 42
-  dilations: [1, 1, 2, 4, 8]
+  dilations: [1, 1, 2]
   pool_output_size: 167
   dense_sizes: [128, 64]
