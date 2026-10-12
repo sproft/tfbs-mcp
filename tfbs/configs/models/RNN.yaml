@@ -1,10 +1,10 @@
 # Example model config for RNN.
 # Conv front-end into a GRU.
 #
-# Use from the scripts/cli/ directory:
-#   tfbs-train fit --config config.example.yaml --model yamls/models/RNN.yaml
+# Use from the installed configs directory (tfbs/configs/):
+#   tfbs-train fit --config config.example.yaml --model models/RNN.yaml
 # ...or from the repo root:
-#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/RNN.yaml
+#   tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/RNN.yaml
 #
 # Values are the tuned settings from do_train_final.sh (all_mean, 24 bp).
 class_path: tfbs.nn.models.RNN

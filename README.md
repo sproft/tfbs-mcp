@@ -68,13 +68,16 @@ tfbs-mcp installation check
   [ok  ] server loads, 33 tools registered
   [ok  ] PyTorch 2.14.0
   [ok  ] tangermeme 1.5.0
+  [ok  ] 6 training and validation pipelines and 13 model templates installed
+  [note] pyBigWig not installed: the bigWig track of tfbs_binding_scan needs it (pip install "tfbs-mcp[foldx]")
+  [note] wandb not installed: tfbs_sweep needs it (pip install "tfbs-mcp[tracking]")
   [ok  ] executable: /home/you/micromamba/envs/tfbs-mcp/bin/tfbs-mcp
 
 Everything needed is installed. Connect the server with ONE of these:
 ...
 ```
 
-If a line says `FAIL`, it also says how to fix it. The command then prints the exact setup text for step 3, with the path to your installation already filled in.
+If a line says `FAIL`, it also says how to fix it. A `note` line names an optional extra that one tool needs; every other tool works without it, and you can add the extra later with the `pip install` command shown. The command then prints the exact setup text for step 3, with the path to your installation already filled in.
 
 ### Step 3: Connect Claude
 
@@ -130,9 +133,9 @@ Claude calls the tools `tfbs_server_info` and `tfbs_list_models`, which need no 
 - **SLURM: No.** Correct unless you are running on an HPC cluster with the SLURM scheduler.
 - **GPU count and default device.** For example 1 GPU and device `cuda` with batch size 512, or 0 GPUs and device `cpu` with batch size 64. Both are fine: the tools work on the CPU.
 - **Models loaded: None.** Expected. No model is loaded until you load one with `tfbs_load_model`.
-- **A note that PyTorch has not been imported yet.** Normal. The server loads PyTorch on the first call that needs it, which is why that call can take up to a minute. Later calls are fast.
+- **The PyTorch version and whether CUDA is available.** The server loads PyTorch and all its other native libraries when it starts. From launch to the first answer this takes about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one Windows 10 machine with a CPU build of PyTorch), timed over the stdio protocol with `scripts/record_demo_session.py`. After that every call answers immediately.
 
-One detail: before PyTorch is loaded, the device is detected from the environment (SLURM variables, `CUDA_VISIBLE_DEVICES` or `nvidia-smi`). On a computer with an NVIDIA GPU but a CPU-only PyTorch build, the first answer says `cuda` and a later one says `cpu`. That is the detection catching up, not a fault.
+The device is detected from the environment (SLURM variables, `CUDA_VISIBLE_DEVICES` or `nvidia-smi`) and checked against PyTorch at startup, so on a computer with an NVIDIA GPU but a CPU-only PyTorch build the answer says `cpu`.
 
 If something goes wrong in a tool, the error comes back as a normal answer such as `{"error": "...", "fix": "..."}`, not as a crash. If an answer looks wrong, ask Claude to show the raw tool response.
 
@@ -152,11 +155,11 @@ Claude calls `tfbs_classify_metrics` and reports ROC-AUC 1.0 and PR-AUC 1.0, bec
 
 > Download PDB entry 3RKQ, an NKX2-5 homeodomain bound to DNA, from RCSB and tell me where the file was saved.
 
-Claude calls `tfbs_fetch_structure` with the PDB id `3RKQ`, downloads the structure from RCSB into a temporary folder and returns the path. This is the one prompt here that needs internet access, and it writes a file.
+Claude calls `tfbs_fetch_structure` with the PDB id `3RKQ`, downloads the structure from RCSB into `<results>/structures/3RKQ/`, where `<results>` is the `results_dir` that `tfbs_server_info` reports, and returns the path. This is the one prompt here that needs internet access, and it writes a file.
 
-> Check the TFBS server environment again. Now that PyTorch is loaded, which device and batch size will it use?
+> Check the TFBS server environment again. Which device and batch size will it use for predictions?
 
-Claude calls `tfbs_server_info` once more. The first two prompts made the server load PyTorch, so the answer now also includes the PyTorch version and whether CUDA is available.
+Claude calls `tfbs_server_info` once more and reports the default device and batch size the prediction tools use when a call does not set them, together with the PyTorch version and whether CUDA is available.
 
 Setup is complete. The remaining tools need reference files such as a genome, which you can add at any time; see [Adding your data](#adding-your-data), which starts with a bundled example that needs no download. The full list of tools is under [Available tools](#available-tools).
 
@@ -186,6 +189,8 @@ claude mcp add tfbs --scope user -- (Get-Command tfbs-mcp).Source
 
 In `claude_desktop_config.json`, every backslash in a Windows path is written twice, as in `C:\\Users\\you\\...`. The blocks printed by `tfbs-mcp --check` and `tfbs-mcp --setup` already have them, so paste those rather than typing a path.
 
+One tool needs Linux, macOS or WSL: `tfbs_disease_variant_validation` reads the ClinVar VCF with pysam, which has no Windows wheel, so the `genomics` extra leaves pysam out on Windows and `tfbs-mcp --check` prints a note about it. Run that tool under WSL (<https://learn.microsoft.com/windows/wsl/install>) if you need it on a Windows computer.
+
 ### Troubleshooting
 
 In most cases, run `tfbs-mcp --check` in the activated environment first. It names the problem.
@@ -203,8 +208,9 @@ In most cases, run `tfbs-mcp --check` in the activated environment first. It nam
 | Works in the terminal, not in the app | The config uses the bare name `tfbs-mcp` instead of the full path | Use the path that `tfbs-mcp --check` prints |
 | `{"error": "No reference genome FASTA configured."}` | The tool needs data you have not supplied | See [Adding your data](#adding-your-data) |
 | `Compressed FASTA is only supported in BGZF format` | The genome is a plain gzip file; `hg38.fa.gz` from UCSC is one | `gunzip hg38.fa.gz` and register the uncompressed `hg38.fa` |
-| `tfbs_fimo` fails with `FileNotFoundError` | The `fimo` program is not on your PATH | Install the MEME Suite (see [Adding your data](#adding-your-data)) and restart Claude |
-| Claude Code times out while the server starts | Slow disk, or antivirus scanning the environment | Set `MCP_TIMEOUT=60000` before starting `claude` |
+| `{"error": "tfbs_remap_validation runs the MEME Suite's fimo program for its FIMO leg, and fimo is not on the PATH of the MCP server. ..."}` (or the same from `tfbs_disease_variant_validation`) | These two pipelines run the `fimo` program itself; the tangermeme fallback is used only by `tfbs_fimo` | Install the MEME Suite (<https://meme-suite.org/meme/doc/download.html>, or `conda install -c bioconda meme`) and put its `bin` directory on the PATH of the MCP server (and of the compute nodes for `slurm=true`); then restart Claude. For the ClinVar check you can instead leave `motif_file` empty with `TFBS_MOTIF_FILE` unset, which skips its FIMO leg |
+| `{"error": "fimo not found on PATH, and no FIMO reimplementation (tangermeme or memelite) to fall back on"}` from `tfbs_fimo` | Neither the MEME Suite's `fimo` program nor tangermeme is available to the server. With tangermeme installed (the `viz` and `genomics` extras bring it), `tfbs_fimo` uses tangermeme's FIMO reimplementation (memelite, numba-based, shipped with tangermeme 1.x) and reports `"backend": "memelite"` | `pip install "tfbs-mcp[viz]"` in the server's environment, or install the MEME Suite (see [Adding your data](#adding-your-data)); then restart Claude |
+| Claude Code times out while the server starts | The server loads PyTorch and its other libraries before it answers, which takes about 7 to 9 seconds on a workstation (7.4 to 8.7 s measured on one Windows 10 machine with a CPU build of PyTorch); a slow disk or antivirus scanning the environment can stretch that past the client's limit | Set `MCP_TIMEOUT=60000` before starting `claude` |
 
 ## Adding your data
 
@@ -222,7 +228,7 @@ It prints the path of the demo BED file. Then, in Claude's chat:
 
 > Extract 200 bp sequences around every peak in <the demo_peaks.bed path it printed> and save the tensors to /tmp/tfbs-demo.
 
-Claude calls `tfbs_extract_loci` on the bundled slice and reports four 200 bp sequences, one-hot encoded as a tensor of shape `[4, 4, 200]`. With the MEME Suite installed:
+Claude calls `tfbs_extract_loci` on the bundled slice and reports four 200 bp sequences, one-hot encoded as a tensor of shape `[4, 4, 200]`. Then:
 
 > Scan the sequence CTCACTTGACCTT for the NKX2-1 motif with FIMO.
 
@@ -234,14 +240,14 @@ That 13-mer is the strongest match in the slice, about 4.2 kb upstream of the th
 |---|---|---|---|
 | Sequence extraction and the ChIP-seq benchmarks (`tfbs_extract_loci`, `tfbs_chipseq_benchmark`, ...) | A reference genome FASTA, uncompressed (hg38 is about 3 GB uncompressed) | hg38 from UCSC: <https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz> (just under 1 GB), then `gunzip hg38.fa.gz`. Register the resulting `hg38.fa`; the server writes an index next to it on first use. NCBI Datasets offers the same assembly (GRCh38.p14, <https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000001405.40/>); note that NCBI names sequences by accession (`NC_000008.11`, not `chr8`), and the chromosome names in your BED files must match the record names in whichever FASTA you register | `TFBS_GENOME_FASTA` |
 | Peaks to extract from or train on | A BED file of ChIP-seq peaks for your transcription factor | ChIP-Atlas: <https://chip-atlas.org/> | none; name the file in your prompt |
-| Motif scanning (`tfbs_fimo`) | The `fimo` program on your PATH, plus a MEME-format motif file | MEME Suite: <https://meme-suite.org/meme/doc/download.html>. Motif: JASPAR `MA1994.1` (NKX2-1) from <https://jaspar.elixir.no/api/v1/matrix/MA1994.1.meme>, licensed CC BY 4.0 (<https://creativecommons.org/licenses/by/4.0/>) | `TFBS_MOTIF_FILE` |
-| Structure-based scoring (`tfbs_binding_energy`, `tfbs_binding_scan`) | **FoldX**, a separately licensed program (free for academic use after registration; the `foldx` pip extra installs pyBigWig, not FoldX), plus a repaired TF-DNA complex PDB | FoldX from the FoldX Suite site: <https://foldxsuite.crg.eu/>. PDB: `tfbs_fetch_structure` downloads one from RCSB, for example <https://www.rcsb.org/structure/3RKQ>; `tfbs_binding_energy` can run FoldX `RepairPDB` on it with its `repair` option | `TFBS_FOLDX_PDB` |
+| Motif scanning (`tfbs_fimo`) | A MEME-format motif file. The tool runs the MEME Suite's `fimo` program when it is on your PATH and otherwise tangermeme's FIMO reimplementation (memelite, numba-based, shipped with tangermeme 1.x), which the install already includes, so the MEME Suite is optional for `tfbs_fimo`. The FIMO legs of `tfbs_remap_validation` (always) and `tfbs_disease_variant_validation` (when it has a motif file) run the `fimo` program itself and have no such fallback: without `fimo` on the server's PATH they return an error before anything runs or is submitted | MEME Suite: <https://meme-suite.org/meme/doc/download.html>. Motif: JASPAR `MA1994.1` (NKX2-1) from <https://jaspar.elixir.no/api/v1/matrix/MA1994.1.meme>, licensed CC BY 4.0 (<https://creativecommons.org/licenses/by/4.0/>) | `TFBS_MOTIF_FILE` |
+| Structure-based scoring (`tfbs_binding_energy`, `tfbs_binding_scan`) | **FoldX**, a separately licensed program (free for academic use after registration; the `foldx` pip extra installs pyBigWig, not FoldX), plus a repaired TF-DNA complex PDB | FoldX from the FoldX Suite site: <https://foldxsuite.crg.eu/>. PDB: `tfbs_fetch_structure` downloads one from RCSB, for example <https://www.rcsb.org/structure/3RKQ>; `tfbs_binding_energy` runs FoldX `RepairPDB` on it with its `repair` option and returns the repaired file as `repaired_structure_path`, the file to give `tfbs_binding_scan` and `TFBS_FOLDX_PDB` | `TFBS_FOLDX_PDB` |
 | Disease-variant validation (`tfbs_disease_variant_validation`) | An indexed ClinVar VCF: `clinvar.vcf.gz` and its `.tbi` index side by side | NCBI, GRCh38: <https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz> (about 200 MB) and <https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz.tbi>. Both are refreshed regularly, so sizes change | `TFBS_CLINVAR_VCF` |
-| Prediction and attribution (`tfbs_predict`, `tfbs_analyze`, `tfbs_mutagenesis`, ...) | A trained model checkpoint; none ship with the package | Train one on peaks from ChIP-Atlas (<https://chip-atlas.org/>) following [Training](docs/development.md#training) | none; load it with `tfbs_load_model` |
-| `slurm_*` tools, and any `slurm=true` option | An HPC cluster running the SLURM scheduler | Your cluster's documentation; the scheduler itself is at <https://slurm.schedmd.com/> | none |
-| Training, benchmark and validation tools (`tfbs_train`, `tfbs_sweep`, `tfbs_validate`, `tfbs_chipseq_benchmark`, ...) | A git clone of this repository, because these tools run scripts under `scripts/`, which pip does not install | `git clone https://github.com/sproft/tfbs-mcp.git` (<https://github.com/sproft/tfbs-mcp>) | `TFBS_PROJECT_ROOT` |
+| Prediction and attribution (`tfbs_predict`, `tfbs_analyze`, `tfbs_mutagenesis`, ...) | A trained model checkpoint; none ship with the package. The NKX2-1 study's released checkpoints (`vcnnbpnet.pt` for the core, flank and all libraries, doi:10.5281/zenodo.21399578) load directly with `tfbs_load_model` and `model_type="VCNNBpnet"`, their label scaling included. `tfbs_predict` reports scores in the original label units with the training run's `scaling_params.json`, which `tfbs_load_model` finds next to the checkpoint, in the training data directory the checkpoint records, or in the study layout `<models_dir>/scaling_params/`, or takes as `data_path` | Train one on peaks from ChIP-Atlas (<https://chip-atlas.org/>) following [Training](docs/development.md#training) | none; load it with `tfbs_load_model` |
+| `slurm_*` tools, and any `slurm=true` option | An HPC cluster running the SLURM scheduler; `tfbs_train` also trains on your own computer with `local=true`, which blocks until training ends and suits small datasets | Your cluster's documentation; the scheduler itself is at <https://slurm.schedmd.com/> | none |
+| Training, benchmark and validation tools (`tfbs_train`, `tfbs_sweep`, `tfbs_validate`, `tfbs_chipseq_benchmark`, ...) | A directory for your datasets, checkpoints and results. The code these tools run is installed with the package. `tfbs_sweep` also needs the `tracking` extra and `wandb login`; `tfbs_disease_variant_validation` needs pysam, which the `genomics` extra installs on Linux and macOS (Windows has no pysam wheel: use WSL) | Any directory you choose | `TFBS_PROJECT_ROOT` |
 
-`TFBS_PROJECT_ROOT` is the directory holding `data/`, `saved_models/` and `results/`. The repo-only scripts under `scripts/` read it too. It defaults to the directory containing the installed `tfbs` package, which is the repository root in a clone, so a fresh clone runs unedited; set it if your data or your checkout lives elsewhere. The example configs and the `tfbs_config` tool are described under [Training](docs/development.md#training).
+`TFBS_PROJECT_ROOT` is the directory holding `data/`, `saved_models/` and `results/`. The benchmark and validation tools run from it, so a relative `models_dir`, such as their default `saved_models_final`, is looked up there. A dataset's checkpoint is `<models_dir>/<dataset>/<scaling_method>/best_<model_type>.ckpt`, the layout `tfbs_config` trains to, with `scaling_method` defaulting to `standardize`; when `scaling_method` is not given and that file is missing, the one `<dataset>/*/best_<model_type>.ckpt` is used if there is exactly one, with a warning in the result. An explicit `scaling_method` never falls back to another folder, and the tools also take explicit `checkpoints`. The lookup is all-or-nothing: if any dataset has no single checkpoint, or the class a checkpoint was saved with cannot be imported from the project root, nothing runs. Without the variable the server uses the repository root when it runs from a clone, and otherwise the directory it was started in; `tfbs_server_info` reports the one in use as `project_root`. The example configs and the `tfbs_config` tool are described under [Training](docs/development.md#training).
 
 Any tool argument you pass explicitly overrides these variables. If neither is set, the tool tells you which argument and which variable would fix it.
 
@@ -270,7 +276,7 @@ What it does:
 - If the `claude` command is on your PATH, it asks `Register with Claude Code now? [y/N]`. Answer `y` and it runs `claude mcp remove tfbs --scope user` (a failure because `tfbs` was not registered yet is ignored), then the `claude mcp add` command, and reports success or the error. Answer `N`, or run it on a computer without `claude`, and it only prints.
 - It never edits `claude_desktop_config.json`. For Claude Desktop, open **Settings > Developer > Edit Config**, replace the earlier `tfbs` entry with the printed block, save, then quit and reopen the app.
 
-Flags prefill answers, so you are not asked for those variables: `--genome PATH`, `--motif PATH`, `--clinvar PATH`, `--foldx-pdb PATH`, `--project-root PATH`. A prefilled path is still checked. `--non-interactive` asks nothing at all: it uses only the flags, never offers to register, and just prints both forms. For example:
+Flags prefill answers, so you are not asked for those variables: `--genome PATH`, `--motif PATH`, `--clinvar PATH`, `--foldx-pdb PATH`, `--project-root PATH`. A prefilled path is still checked. `--demo` prefills `--genome` and `--motif` with the bundled example data (see [Try it first with the bundled example](#try-it-first-with-the-bundled-example)). `--non-interactive` asks nothing at all: it uses only the flags, never offers to register, and just prints both forms. For example:
 
 ```bash
 tfbs-mcp --setup --genome /data/hg38/hg38.fa --motif /data/JASPAR/MA1994.1.meme --non-interactive
@@ -308,19 +314,29 @@ Claude Desktop, in the `tfbs` entry of the config file:
 }
 ```
 
+One more variable is optional and not asked by `--setup`; add it to the `--env` list or the `env` block the same way:
+
+| Variable | What it does |
+|---|---|
+| `TFBS_CALL_LOG` | path of a JSON Lines file. When set, every tool call appends one line after it returns, holding the arguments and the result: `timestamp` (start of the call, UTC), `tool`, `arguments` as received, `seconds` (wall time), `is_error` and `result` (the tool's JSON answer; one larger than 1 MB is stored as its size and first 4096 characters). A call that fails is logged too. Unset, nothing is written. `tfbs_server_info` reports the file in use as `call_log` |
+
 ### Example prompts once your data is registered
 
 With a genome FASTA registered and a BED file of peaks on disk:
 
 > Extract 200 bp sequences centred on every peak in /data/peaks/nkx2-1.bed and save the tensors to /data/tensors/nkx2-1.
 
-Claude calls `tfbs_extract_loci`, reads the genome from `TFBS_GENOME_FASTA`, writes `sequences.pt` (and `scores.pt` when the BED file has a score column) into the output folder, and reports the tensor shape and how many peaks were extracted.
+Claude calls `tfbs_extract_loci`, reads the genome from `TFBS_GENOME_FASTA`, writes `sequences.pt` (and `scores.pt` when the BED file has a score column) and `regions.bed` into the output folder, and reports the tensor shape, how many peaks were extracted and the paths it wrote. Without an output folder the tool uses `nkx2-1_loci_200bp/` next to the BED file (the window, and `_gc` or `_shuffled` when negatives are drawn, are part of the name, so another window never overwrites it), and the data tools after it name their outputs from that (`nkx2-1_200bp_classification/`, `nkx2-1_200bp_dataset/`), so a chain of calls needs no file names.
 
-With the MEME Suite installed and the JASPAR motif `MA1994.1` (NKX2-1) registered as the motif file:
+> Extract 24 bp windows around the peaks in /data/peaks/nkx2-1.bed with GC-matched negatives, and build a classification dataset.
+
+Claude calls `tfbs_extract_loci` with `negatives="gc_matched"`, which samples one genomic window per peak with the same length and GC content (away from the peaks, without N) into `negatives/sequences.pt`, then `tfbs_prepare_classification` and `tfbs_prepare_dataset` on the paths it returned.
+
+With the JASPAR motif `MA1994.1` (NKX2-1) registered as the motif file:
 
 > Scan the sequence AAACACTTGAGGCAAA for the NKX2-1 motif with FIMO.
 
-Claude calls `tfbs_fimo`, which runs the `fimo` program with `TFBS_MOTIF_FILE` against the sequence and returns the matches with position, strand, score and p-value.
+Claude calls `tfbs_fimo`, which scans the sequence with `TFBS_MOTIF_FILE` (with the `fimo` program when the MEME Suite is installed, otherwise with tangermeme's FIMO reimplementation (memelite, numba-based, shipped with tangermeme 1.x); `backend` says which) and returns the matches with position, strand, score, p-value and the matched site.
 
 ## Uninstall
 
@@ -351,7 +367,7 @@ With venv, delete the folder:
 rm -rf ~/tfbs-env
 ```
 
-Finally, delete the data files you downloaded for [Adding your data](#adding-your-data) (the genome, motif, ClinVar and PDB files) if you no longer need them. Structures fetched by `tfbs_fetch_structure` without an output folder sit in temporary folders named `tfbs_struct_*`.
+Finally, delete the data files you downloaded for [Adding your data](#adding-your-data) (the genome, motif, ClinVar and PDB files) if you no longer need them. Structures fetched by `tfbs_fetch_structure` without an output folder are in `<results>/structures/<id>/`, where `<results>` is the `results_dir` that `tfbs_server_info` reports; the repaired copies that `tfbs_binding_energy` keeps are saved there too.
 
 ## Available tools
 

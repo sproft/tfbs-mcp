@@ -1,0 +1,161 @@
+[
+ {
+  "role": "user",
+  "text": "Build an NKX2-1 classifier from the bundled thyroglobulin-promoter demo with GC-matched negatives (BPNetReal, 51 bp, train it here), then score the sites and the crystallised CAAG>CACG core mutant with the released FLANK model."
+ },
+ {
+  "role": "llm",
+  "text": "Plan: 51 bp windows plus GC-matched negatives, split, BPNetReal config, local training; then FLANK (24 bp input) on the four sites and on both alleles of demo_chr8:830 T>G in the same window, and fetch 9U19."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_extract_loci",
+  "phase": "Data prep",
+  "shown_args": "in_window=51, negatives=gc_matched",
+  "arguments": {
+   "bed_path": "@DEMO/demo_peaks.bed",
+   "genome_fasta": "@DEMO/demo_genome.fa",
+   "in_window": 51,
+   "negatives": "gc_matched",
+   "output_dir": "@WORK/demo_peaks_loci"
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_prepare_classification",
+  "phase": "Data prep",
+  "arguments": {
+   "positive_path": {
+    "$ref": "2.files.sequences"
+   },
+   "negative_path": {
+    "$ref": "2.files.negatives"
+   }
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_prepare_dataset",
+  "phase": "Data prep",
+  "arguments": {
+   "sequences_path": {
+    "$ref": "3.files.sequences"
+   },
+   "labels_path": {
+    "$ref": "3.files.labels"
+   }
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_config",
+  "phase": "Training",
+  "shown_args": "",
+  "arguments": {
+   "model_type": "BPNetReal",
+   "input_length": 51,
+   "classify": true,
+   "data_path": {
+    "$ref": "4.output_dir"
+   }
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_train",
+  "phase": "Training",
+  "shown_args": "local",
+  "arguments": {
+   "config_path": {
+    "$ref": "5.files.config"
+   },
+   "local": true
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_load_model",
+  "phase": "Analysis",
+  "shown_args": "FLANK",
+  "arguments": {
+   "model_id": "flank",
+   "model_type": "VCNNBpnet",
+   "checkpoint_path": "@RELEASE/models/flank/vcnnbpnet.pt"
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_extract_loci",
+  "phase": "Analysis",
+  "shown_args": "in_window=24",
+  "arguments": {
+   "bed_path": "@DEMO/demo_peaks.bed",
+   "genome_fasta": "@DEMO/demo_genome.fa",
+   "in_window": 24,
+   "output_dir": "@WORK/demo_peaks_24bp"
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_predict",
+  "phase": "Analysis",
+  "shown_args": "sites",
+  "arguments": {
+   "model_id": "flank",
+   "sequences_path": {
+    "$ref": "8.files.sequences"
+   }
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_extract_loci",
+  "phase": "Analysis",
+  "shown_args": "variants=[demo_chr8:830:T>G]",
+  "arguments": {
+   "genome_fasta": "@DEMO/demo_genome.fa",
+   "variants": [
+    "demo_chr8:830:T>G"
+   ],
+   "in_window": 24,
+   "output_dir": "@WORK/variant"
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_predict",
+  "phase": "Analysis",
+  "shown_args": "ref",
+  "arguments": {
+   "model_id": "flank",
+   "sequences_path": {
+    "$ref": "10.files.ref_sequences"
+   }
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_predict",
+  "phase": "Analysis",
+  "shown_args": "alt",
+  "arguments": {
+   "model_id": "flank",
+   "sequences_path": {
+    "$ref": "10.files.alt_sequences"
+   }
+  }
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_fetch_structure",
+  "phase": "Structure",
+  "shown_args": "pdb_id=9U19",
+  "arguments": {
+   "pdb_id": "9U19"
+  }
+ },
+ {
+  "role": "llm",
+  "text": "Classifier trained here (12 epochs, best val_loss 1.05). FLANK scores the sites 1.96, 1.39, 2.61 and -0.69 log2FC; the CACG mutant falls from 1.07 to -0.54 in its window, a 1.6 log2FC loss. 9U19 fetched with its DNA."
+ }
+]

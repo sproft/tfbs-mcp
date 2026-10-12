@@ -1,28 +1,44 @@
 """
-FoldX binding-energy tools for TF–DNA complex analysis.
+FoldX binding-energy tools for TF-DNA complex analysis.
 
 Registers three tools on the shared ``mcp`` FastMCP instance:
 
-* **tfbs_fetch_structure** — retrieve a TF-DNA complex structure from a local
-  path, PDB, AlphaFold DB, or gene-name search.
-* **tfbs_binding_energy** — run FoldX AnalyseComplex on a TF-DNA structure.
-* **tfbs_binding_scan** — slide a window across a genomic region and score
-  each position with FoldX, writing a bigWig track.
+* **tfbs_fetch_structure**: retrieve a structure from a local path, the PDB
+  (by accession or RCSB gene-name search) or AlphaFold DB, moving on to the
+  next source given when one fails.
+* **tfbs_binding_energy**: run FoldX AnalyseComplex on a TF-DNA structure.
+* **tfbs_binding_scan**: slide a window across a genomic region, score each
+  window with FoldX and write a bigWig track, in-process or as a SLURM
+  array job.
+
+Progress goes to the module logger, never to stdout: on the stdio transport
+stdout carries the MCP protocol.
 """
 
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
+import logging
+import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
-import textwrap
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any, NamedTuple
 
+import tfbs.mcp.server as _server
 from tfbs.mcp.server import mcp
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +46,26 @@ from tfbs.mcp.server import mcp
 # ---------------------------------------------------------------------------
 
 _COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
+
+_HTTP_TIMEOUT = 60
+_RCSB_DOWNLOAD_URL = "https://files.rcsb.org/download/{}.pdb"
+_RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
+_AFDB_API_URL = "https://alphafold.ebi.ac.uk/api/prediction/{}"
+
+# FoldX runs per SLURM array task: at about 7 min per run, 250 runs take
+# about 29 h, inside the 48 h default time limit.
+_FOLDX_RUNS_PER_TASK = 250
+
+_NO_DNA_NOTE = (
+    "The structure has no DNA chains, so tfbs_binding_energy and "
+    "tfbs_binding_scan cannot score TF-DNA binding on it. AlphaFold DB models "
+    "are protein-only; for FoldX pass a TF-DNA complex (a PDB co-crystal, or "
+    "an AlphaFold 3 prediction saved as PDB) as local_path."
+)
+
+
+def _error(error: str, fix: str, **extra: Any) -> str:
+    return json.dumps({"error": error, "fix": fix, **extra})
 
 
 def _find_foldx() -> str | None:
@@ -59,6 +95,64 @@ def _parse_dna_from_pdb(pdb_path: str) -> dict[str, list[tuple[int, str]]]:
     return {ch: sorted(bases.items()) for ch, bases in chains.items()}
 
 
+_PLDDT_CONFIDENT = 70.0
+_PLDDT_LOW = 50.0
+_MAX_LOW_SEGMENTS = 20
+
+
+def _plddt_summary(pdb_path: str) -> dict | None:
+    """Per-residue pLDDT statistics from the B-factor column of an AlphaFold PDB.
+
+    AlphaFold writes the residue's pLDDT into the B-factor of each of its
+    atoms; the first atom of every residue is read.  None when the file
+    has no ATOM records.
+    """
+    residues: list[tuple[str, int, float]] = []
+    seen: set[tuple[str, str]] = set()
+    with open(pdb_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.startswith("ATOM") or len(line) < 66:
+                continue
+            key = (line[21], line[22:27])
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                residues.append((line[21], int(line[22:26]), float(line[60:66])))
+            except ValueError:
+                continue
+    if not residues:
+        return None
+    n = len(residues)
+    segments: list[dict[str, Any]] = []
+    previous: tuple[str, int] | None = None
+    for chain, resnum, plddt in residues:
+        if plddt < _PLDDT_LOW:
+            if (segments and previous is not None and previous[0] == chain
+                    and resnum == previous[1] + 1 and segments[-1]["end"] == previous[1]
+                    and segments[-1]["chain"] == chain.strip()):
+                segments[-1]["end"] = resnum
+            else:
+                segments.append({"chain": chain.strip(), "start": resnum, "end": resnum})
+        previous = (chain, resnum)
+    return {
+        "fraction_confident": round(sum(p >= _PLDDT_CONFIDENT for *_, p in residues) / n, 4),
+        "fraction_low": round(sum(p < _PLDDT_LOW for *_, p in residues) / n, 4),
+        "low_confidence_segments": segments[:_MAX_LOW_SEGMENTS],
+        "low_confidence_segments_total": len(segments),
+    }
+
+
+def _has_dna(structure_path: str) -> bool | None:
+    """Whether a PDB-format file has DNA chains; None if it cannot be parsed."""
+    if Path(structure_path).suffix.lower() not in (".pdb", ".ent"):
+        return None
+    try:
+        return bool(_parse_dna_from_pdb(structure_path))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
 def _build_foldx_mutation_string(
     ref_bases: list[tuple[int, str]],
     target_seq: str,
@@ -67,7 +161,7 @@ def _build_foldx_mutation_string(
     """Build a FoldX mutation string to convert reference DNA to target.
 
     FoldX DNA mutation syntax uses lowercase: ``aC3t`` means residue A
-    at chain C position 3 → T.
+    at chain C position 3 becomes T.
 
     Only generates mutations for positions that differ.  Returns empty
     string if no mutations needed.
@@ -85,7 +179,7 @@ def _run_foldx_energy(
     working_dir: str,
     mutation_string: str | None = None,
 ) -> float | None:
-    """Run FoldX BuildModel (if mutations) + AnalyseComplex, return ΔG.
+    """Run FoldX BuildModel (if mutations) + AnalyseComplex, return the energy.
 
     Returns the interaction energy in kcal/mol, or None on failure.
     """
@@ -102,12 +196,13 @@ def _run_foldx_energy(
     # Apply mutations if needed
     if mutation_string:
         mut_file = wd / "individual_list.txt"
-        mut_file.write_text(mutation_string + "\n")
+        mut_file.write_text(mutation_string + "\n", newline="\n")
         try:
-            r = subprocess.run(
+            subprocess.run(
                 [foldx_bin, "--command=BuildModel",
                  f"--pdb={pdb_name}", f"--mutant-file={mut_file.name}"],
-                capture_output=True, text=True, timeout=1200, cwd=str(wd),
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                timeout=1200, cwd=str(wd),
             )
         except subprocess.TimeoutExpired:
             return None
@@ -118,10 +213,10 @@ def _run_foldx_energy(
             return None
 
     # AnalyseComplex
-    r = subprocess.run(
+    subprocess.run(
         [foldx_bin, "--command=AnalyseComplex",
          f"--pdb={analyse_target}", "--complexWithDNA=true"],
-        capture_output=True, text=True, timeout=60, cwd=str(wd),
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60, cwd=str(wd),
     )
 
     # Parse energy from output file
@@ -139,14 +234,215 @@ def _run_foldx_energy(
         return None
 
 
+def _repaired_file(work: Path, input_name: str) -> Path | None:
+    """The file FoldX RepairPDB wrote into ``work``, or None."""
+    expected = work / f"{Path(input_name).stem}_Repair.pdb"
+    if expected.is_file():
+        return expected
+    # Some FoldX versions use different naming
+    others = sorted(p for p in work.glob("*Repair*.pdb") if p.name != input_name)
+    return others[0] if others else None
+
+
+def _repaired_dir(pdb: Path, output_dir: str | None) -> Path:
+    """Where tfbs_binding_energy keeps a repaired structure."""
+    if output_dir:
+        return Path(output_dir).expanduser().resolve()
+    structures = (_server._results_root() / "structures").resolve()
+    if pdb.parent.parent == structures:
+        return pdb.parent
+    return structures / _server._safe_name(pdb.stem)
+
+
+_FOLDX_MISSING = "FoldX binary not found on PATH."
+_FOLDX_MISSING_FIX = (
+    "Install FoldX (https://foldxsuite.crg.eu/, free academic licence), put "
+    "'foldx' or 'foldx5' on the PATH of the MCP server process, and restart "
+    "the server."
+)
+
+
 def _foldx_missing_error() -> str:
-    return json.dumps({
-        "error": (
-            "FoldX binary not found on PATH. "
-            "Install FoldX (https://foldxsuite.crg.eu/) and ensure 'foldx' "
-            "or 'foldx5' is available on your $PATH."
-        ),
-    })
+    return _error(_FOLDX_MISSING, _FOLDX_MISSING_FIX)
+
+
+# ---------------------------------------------------------------------------
+# Structure sources for tfbs_fetch_structure
+# ---------------------------------------------------------------------------
+
+class _SourceError(Exception):
+    """A structure source failed; carries the error and a fix hint."""
+
+    def __init__(self, error: str, fix: str) -> None:
+        super().__init__(error)
+        self.error = error
+        self.fix = fix
+
+
+_RETRY_FIX = "Retry later or check the network connection; or pass local_path."
+
+
+def _http_json(url: str, payload: dict | None = None) -> Any:
+    """GET (or POST ``payload`` to) ``url`` and parse the JSON body; None if empty."""
+    req: str | urllib.request.Request = url
+    if payload is not None:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+        body = resp.read().decode()
+    return json.loads(body) if body.strip() else None
+
+
+def _download(url: str, dest: Path) -> None:
+    """Download ``url`` to ``dest``, removing a partial file on failure."""
+    try:
+        with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as resp, open(dest, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
+
+
+def _fetch_local(local_path: str, out: Path | None) -> dict:
+    p = Path(local_path)
+    if not p.is_file():
+        raise _SourceError(
+            f"Local file not found: {local_path}",
+            "Check the path, or also pass pdb_id, gene_name or uniprot_id so "
+            "a structure can be downloaded instead.",
+        )
+    return {
+        "source": "local",
+        "structure_path": str(p.resolve()),
+        "metadata": {"original_path": str(p)},
+    }
+
+
+def _fetch_pdb(pdb_id: str, out: Path) -> dict:
+    pdb_id = pdb_id.strip().upper()
+    url = _RCSB_DOWNLOAD_URL.format(urllib.parse.quote(pdb_id))
+    dest = out / f"{re.sub(r'[^A-Z0-9_]', '_', pdb_id)}.pdb"
+    try:
+        _download(url, dest)
+    except Exception as exc:
+        raise _SourceError(
+            f"Failed to download PDB {pdb_id} from RCSB: {exc}",
+            "Check the accession on rcsb.org (very large entries have no "
+            "PDB-format file) and the network connection, or pass local_path.",
+        ) from exc
+    return {
+        "source": "pdb",
+        "structure_path": str(dest.resolve()),
+        "metadata": {"pdb_id": pdb_id, "url": url},
+    }
+
+
+def _rcsb_protein_dna_query(gene_name: str) -> dict:
+    """RCSB search for the top experimental entry with protein and DNA."""
+    def polymer(kind: str) -> dict:
+        return {
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "entity_poly.rcsb_entity_polymer_type",
+                "operator": "exact_match",
+                "value": kind,
+            },
+        }
+
+    return {
+        "query": {
+            "type": "group",
+            "logical_operator": "and",
+            "nodes": [
+                {"type": "terminal", "service": "full_text",
+                 "parameters": {"value": gene_name}},
+                polymer("Protein"),
+                polymer("DNA"),
+            ],
+        },
+        "return_type": "entry",
+        "request_options": {
+            "results_content_type": ["experimental"],
+            "paginate": {"start": 0, "rows": 1},
+        },
+    }
+
+
+def _fetch_gene(gene_name: str, out: Path) -> dict:
+    gene_name = gene_name.strip()
+    try:
+        data = _http_json(_RCSB_SEARCH_URL, _rcsb_protein_dna_query(gene_name))
+    except Exception as exc:
+        raise _SourceError(f"RCSB search failed for '{gene_name}': {exc}", _RETRY_FIX) from exc
+    hits = (data or {}).get("result_set") or []
+    if not hits:
+        raise _SourceError(
+            f"No PDB protein-DNA structure found for gene '{gene_name}'",
+            "Try another gene symbol or alias, pass uniprot_id for an AlphaFold "
+            "DB model, or pass a TF-DNA complex as local_path.",
+        )
+    result = _fetch_pdb(hits[0]["identifier"], out)
+    result["metadata"]["gene_name"] = gene_name
+    return result
+
+
+def _fetch_alphafold(uniprot_id: str, out: Path) -> dict:
+    acc = uniprot_id.strip()
+    api_url = _AFDB_API_URL.format(urllib.parse.quote(acc))
+    no_entry_fix = (
+        "Pass a UniProt accession such as P43699 (not an entry name such as "
+        "NKX21_HUMAN) and check it on https://alphafold.ebi.ac.uk, or pass "
+        "pdb_id, gene_name or local_path."
+    )
+    try:
+        entries = _http_json(api_url)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 404):
+            raise _SourceError(
+                f"AlphaFold DB has no entry for '{acc}' (HTTP {exc.code} from {api_url})",
+                no_entry_fix,
+            ) from exc
+        raise _SourceError(f"AlphaFold DB API request failed for '{acc}': {exc}", _RETRY_FIX) from exc
+    except Exception as exc:
+        raise _SourceError(f"AlphaFold DB API request failed for '{acc}': {exc}", _RETRY_FIX) from exc
+
+    if isinstance(entries, dict):
+        entries = [entries]
+    models = [e for e in entries or [] if isinstance(e, dict) and e.get("pdbUrl")]
+    if not models:
+        raise _SourceError(f"AlphaFold DB has no PDB-format model for '{acc}' ({api_url})", no_entry_fix)
+
+    # The API also lists isoform entries (e.g. P43699-3); prefer the exact match.
+    wanted = acc.upper()
+    entry = next(
+        (e for e in models
+         if wanted in {str(e.get(k, "")).upper() for k in ("uniprotAccession", "entryId", "modelEntityId")}),
+        models[0],
+    )
+    model_url = entry["pdbUrl"]
+    dest = out / (Path(urllib.parse.urlparse(model_url).path).name or f"AF-{wanted}.pdb")
+    try:
+        _download(model_url, dest)
+    except Exception as exc:
+        raise _SourceError(
+            f"AlphaFold DB model download failed for '{acc}' ({model_url}): {exc}", _RETRY_FIX,
+        ) from exc
+    return {
+        "source": "alphafold",
+        "structure_path": str(dest.resolve()),
+        "metadata": {
+            "uniprot_id": entry.get("uniprotAccession", acc),
+            "entry_id": entry.get("entryId"),
+            "latest_version": entry.get("latestVersion"),
+            "mean_plddt": entry.get("globalMetricValue"),
+            "url": model_url,
+            "api_url": api_url,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -169,130 +465,125 @@ async def tfbs_fetch_structure(
     uniprot_id: str | None = None,
     output_dir: str | None = None,
 ) -> str:
-    """Retrieve a TF-DNA complex structure.
+    """Retrieve a TF-DNA complex structure, trying each source given in turn.
 
-    Resolution priority: local_path → pdb_id → gene_name search → uniprot_id
-    (AlphaFold DB).
+    Search order, over the arguments passed: local_path, then pdb_id (RCSB
+    download), then gene_name (RCSB search restricted to entries with both
+    protein and DNA), then uniprot_id (AlphaFold DB; the latest model
+    version is looked up through the AlphaFold DB API).  When a source
+    fails, the next one given is tried, so passing several arguments makes
+    a fallback chain.
+
+    AlphaFold DB models are protein-only (``has_dna`` false), so FoldX
+    cannot score TF-DNA binding on them; report their ``mean_plddt`` (0 to
+    100, below 70 is low confidence) whenever you use one.  For them the
+    result also has ``plddt_summary``, read from the per-residue pLDDT in
+    the model's B-factor column, which lets the client flag low-confidence
+    regions (often the disordered parts of a transcription factor
+    outside its DNA-binding domain).
+
+    Default structure source and why: a PDB co-crystal first (pdb_id, or
+    gene_name for the top RCSB entry with protein and DNA), with
+    AlphaFold DB (uniprot_id) only as the fallback when no co-crystal
+    exists, because FoldX scores the protein-DNA interface and only an
+    experimental complex contains that DNA with measured contacts.  Pass
+    gene_name and uniprot_id together to get this order in one call.
 
     Args:
         local_path:  Path to a PDB file already on disk.
         pdb_id:      4-character PDB accession (e.g. ``3RKQ``).
-        gene_name:   Gene name to search RCSB for (e.g. ``p53``).
-        uniprot_id:  UniProt accession for AlphaFold DB lookup.
-        output_dir:  Directory to save downloaded files.  Defaults to a
-                     temporary directory.
+        gene_name:   Gene name to search RCSB for (e.g. ``NKX2-1``).
+        uniprot_id:  UniProt accession for AlphaFold DB (e.g. ``P43699``).
+        output_dir:  Directory to save downloaded files.  Default
+                     <results>/structures/<id>/, with <results> the
+                     results_dir of tfbs_server_info and <id> the value of
+                     the source argument being tried (e.g. 3RKQ, NKX2-1 or
+                     P43699; PDB and UniProt IDs uppercased, so 3rkq and
+                     3RKQ share a directory).  A repeated call reuses
+                     that directory and downloads the file again,
+                     overwriting an earlier copy of the same file.
 
     Returns:
-        JSON with ``source``, ``structure_path``, and metadata.
+        JSON with ``source`` (``local``, ``pdb`` or ``alphafold``),
+        ``argument`` (the argument that succeeded), ``structure_path``,
+        ``metadata`` and ``attempted`` (the sources that failed first, each
+        with ``argument``, ``value``, ``error`` and ``fix``).  ``metadata``
+        always has ``has_dna`` (null if the file is not PDB format); for
+        AlphaFold DB it also has ``mean_plddt``, ``latest_version``,
+        ``entry_id`` and the model ``url``.  An AlphaFold DB model also
+        gets ``plddt_summary``: ``fraction_confident`` (share of residues
+        with pLDDT >= 70), ``fraction_low`` (share below 50),
+        ``low_confidence_segments`` (up to 20 runs of consecutive
+        residues with pLDDT below 50, each as {chain, start, end} with
+        residue numbers) and ``low_confidence_segments_total`` (the
+        number of such runs, also beyond the first 20); PDB entries have
+        none.
+        If every source fails, JSON with ``error``, ``fix`` and
+        ``attempted``.
     """
-    out = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="tfbs_struct_"))
-    out.mkdir(parents=True, exist_ok=True)
-
-    # --- 1. Local path -------------------------------------------------
-    if local_path is not None:
-        p = Path(local_path)
-        if not p.is_file():
-            return json.dumps({"error": f"Local file not found: {local_path}"})
-        return json.dumps({
-            "source": "local",
-            "structure_path": str(p.resolve()),
-            "metadata": {"original_path": str(p)},
-        })
-
-    # --- 2. PDB download -----------------------------------------------
-    if pdb_id is not None:
-        pdb_id = pdb_id.strip().upper()
-        dest = out / f"{pdb_id}.pdb"
-        url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-        try:
-            urllib.request.urlretrieve(url, str(dest))
-        except Exception as exc:
-            return json.dumps({"error": f"Failed to download PDB {pdb_id}: {exc}"})
-        return json.dumps({
-            "source": "pdb",
-            "structure_path": str(dest.resolve()),
-            "metadata": {"pdb_id": pdb_id, "url": url},
-        })
-
-    # --- 3. Gene-name search on RCSB -----------------------------------
-    if gene_name is not None:
-        query_json = {
-            "query": {
-                "type": "group",
-                "logical_operator": "and",
-                "nodes": [
-                    {
-                        "type": "terminal",
-                        "service": "full_text",
-                        "parameters": {"value": gene_name},
-                    },
-                    {
-                        "type": "terminal",
-                        "service": "text",
-                        "parameters": {
-                            "attribute": "entity_poly.rcsb_entity_polymer_type",
-                            "operator": "exact_match",
-                            "value": "Protein",
-                        },
-                    },
-                    {
-                        "type": "terminal",
-                        "service": "text",
-                        "parameters": {
-                            "attribute": "entity_poly.rcsb_entity_polymer_type",
-                            "operator": "exact_match",
-                            "value": "DNA",
-                        },
-                    },
-                ],
-            },
-            "return_type": "entry",
-            "request_options": {"results_content_type": ["experimental"], "paginate": {"start": 0, "rows": 1}},
-        }
-        search_url = "https://search.rcsb.org/rcsbsearch/v2/query"
-        req = urllib.request.Request(
-            search_url,
-            data=json.dumps(query_json).encode(),
-            headers={"Content-Type": "application/json"},
+    legs = (
+        ("local_path", local_path, _fetch_local),
+        ("pdb_id", pdb_id, _fetch_pdb),
+        ("gene_name", gene_name, _fetch_gene),
+        ("uniprot_id", uniprot_id, _fetch_alphafold),
+    )
+    candidates = [(arg, value, leg) for arg, value, leg in legs if value is not None and str(value).strip()]
+    if not candidates:
+        return _error(
+            "No structure source given.",
+            "Pass at least one of local_path, pdb_id, gene_name or uniprot_id.",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
-            hits = data.get("result_set", [])
-            if not hits:
-                return json.dumps({"error": f"No PDB structures found for gene '{gene_name}'"})
-            found_id = hits[0]["identifier"]
-        except Exception as exc:
-            return json.dumps({"error": f"RCSB search failed for '{gene_name}': {exc}"})
 
-        dest = out / f"{found_id}.pdb"
-        dl_url = f"https://files.rcsb.org/download/{found_id}.pdb"
+    attempted: list[dict] = []
+    for arg, value, leg in candidates:
+        out: Path | None = None
+        if arg != "local_path":
+            key = str(value).strip()
+            if arg in ("pdb_id", "uniprot_id"):
+                key = key.upper()
+            out = (Path(output_dir) if output_dir
+                   else _server._results_root() / "structures" / _server._safe_name(key))
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return _error(
+                    f"Cannot create output directory {out}: {exc}",
+                    "Pass a writable output_dir, or set TFBS_PROJECT_ROOT to a writable "
+                    "directory (tfbs_server_info reports the results_dir in use).",
+                    attempted=attempted,
+                )
         try:
-            urllib.request.urlretrieve(dl_url, str(dest))
+            result = leg(value, out)
+        except _SourceError as exc:
+            error, fix = exc.error, exc.fix
         except Exception as exc:
-            return json.dumps({"error": f"Failed to download PDB {found_id}: {exc}"})
-        return json.dumps({
-            "source": "pdb",
-            "structure_path": str(dest.resolve()),
-            "metadata": {"pdb_id": found_id, "gene_name": gene_name, "url": dl_url},
-        })
+            error, fix = f"{type(exc).__name__}: {exc}", _RETRY_FIX
+        else:
+            has_dna = _has_dna(result["structure_path"])
+            result["metadata"]["has_dna"] = has_dna
+            result["argument"] = arg
+            result["attempted"] = attempted
+            if has_dna is False:
+                result["note"] = _NO_DNA_NOTE
+            if result["source"] == "alphafold":
+                try:
+                    summary = _plddt_summary(result["structure_path"])
+                except OSError:
+                    summary = None
+                if summary is not None:
+                    result["plddt_summary"] = summary
+            return json.dumps(result)
+        logger.info("tfbs_fetch_structure: %s=%r failed: %s", arg, value, error)
+        attempted.append({"argument": arg, "value": value, "error": error, "fix": fix})
 
-    # --- 4. AlphaFold DB -----------------------------------------------
-    if uniprot_id is not None:
-        uniprot_id = uniprot_id.strip()
-        dest = out / f"AF-{uniprot_id}-F1-model_v4.pdb"
-        url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
-        try:
-            urllib.request.urlretrieve(url, str(dest))
-        except Exception as exc:
-            return json.dumps({"error": f"AlphaFold DB download failed for {uniprot_id}: {exc}"})
-        return json.dumps({
-            "source": "alphafold",
-            "structure_path": str(dest.resolve()),
-            "metadata": {"uniprot_id": uniprot_id, "url": url},
-        })
-
-    return json.dumps({"error": "Provide at least one of: local_path, pdb_id, gene_name, uniprot_id"})
+    if len(attempted) == 1:
+        return _error(attempted[0]["error"], attempted[0]["fix"], attempted=attempted)
+    tried = ", ".join(a["argument"] for a in attempted)
+    return _error(
+        f"No structure could be retrieved; every source failed ({tried}).",
+        "See 'attempted' for each source's error and fix.",
+        attempted=attempted,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -314,19 +605,41 @@ async def tfbs_binding_energy(
     repair: bool = True,
     chains_protein: str = "A",
     chains_dna: str = "C,D",
+    output_dir: str | None = None,
 ) -> str:
     """Compute TF-DNA binding energy with FoldX AnalyseComplex.
+
+    With repair=true (the default) FoldX RepairPDB runs first and the
+    repaired complex is kept as <stem>_Repair.pdb, <stem> being the
+    structure file's name without .pdb.  Its path, returned as
+    ``repaired_structure_path``, is the repaired structure that
+    tfbs_binding_scan (structure_path) and the FoldX legs of
+    tfbs_chipseq_method_comparison and tfbs_remap_validation (foldx_pdb,
+    or $TFBS_FOLDX_PDB) and tfbs_disease_variant_validation (foldx_pdb)
+    expect.
 
     Args:
         structure_path: Path to a PDB file.
         sequences:      Optional DNA sequences (placeholder for future
                         mutation support).
-        repair:         Run FoldX RepairPDB first (recommended).
+        repair:         Run FoldX RepairPDB first and keep the repaired
+                        file (recommended).  Pass false only for a
+                        structure FoldX has already repaired.
         chains_protein: Protein chain ID(s), e.g. ``"A"``.
         chains_dna:     DNA chain ID(s), comma-separated, e.g. ``"C,D"``.
+        output_dir:     Directory for the repaired file.  Default: the
+                        structure's own directory when it lies in
+                        <results>/structures/<id>/, where
+                        tfbs_fetch_structure downloads (<results> is the
+                        results_dir of tfbs_server_info), else
+                        <results>/structures/<stem>/.  A repeated call
+                        overwrites the earlier repaired file.
 
     Returns:
-        JSON with energy components parsed from FoldX output.
+        JSON with ``structure_path`` (the input),
+        ``repaired_structure_path`` (null with repair=false, when the
+        input is scored as given) and the energy components parsed from
+        the FoldX output.
     """
     foldx = _find_foldx()
     if foldx is None:
@@ -334,7 +647,11 @@ async def tfbs_binding_energy(
 
     pdb = Path(structure_path).resolve()
     if not pdb.is_file():
-        return json.dumps({"error": f"Structure file not found: {structure_path}"})
+        return _error(
+            f"Structure file not found: {structure_path}",
+            "Pass the path of a PDB file, for example the structure_path "
+            "returned by tfbs_fetch_structure.",
+        )
 
     tmpdir = tempfile.mkdtemp(prefix="tfbs_foldx_")
     work = Path(tmpdir)
@@ -345,39 +662,70 @@ async def tfbs_binding_energy(
     pdb_name = pdb.name
     stem = pdb.stem
 
-    # --- RepairPDB -----------------------------------------------------
-    if repair:
-        cmd_repair = [
-            foldx, "--command=RepairPDB",
+    stage = "RepairPDB"
+    kept: Path | None = None
+    try:
+        # --- RepairPDB -------------------------------------------------
+        if repair:
+            cmd_repair = [
+                foldx, "--command=RepairPDB",
+                f"--pdb={pdb_name}",
+                f"--output-dir={tmpdir}",
+            ]
+            repair_run = subprocess.run(cmd_repair, capture_output=True, text=True,
+                                        stdin=subprocess.DEVNULL, cwd=tmpdir, timeout=600)
+            repaired = _repaired_file(work, pdb.name)
+            if repaired is None:
+                return _error(
+                    "FoldX RepairPDB wrote no repaired structure",
+                    "Read stderr and stdout; check that the file is a PDB-format "
+                    "TF-DNA complex FoldX can read.",
+                    stderr=repair_run.stderr[-2000:] if repair_run.stderr else "",
+                    stdout=repair_run.stdout[-2000:] if repair_run.stdout else "",
+                )
+            pdb_name = repaired.name
+            kept = _repaired_dir(pdb, output_dir) / f"{stem}_Repair.pdb"
+            try:
+                kept.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(repaired, kept)
+            except OSError as exc:
+                return _error(
+                    f"Cannot save the repaired structure to {kept}: {exc}",
+                    "Pass a writable output_dir, or set TFBS_PROJECT_ROOT to a writable "
+                    "directory (tfbs_server_info reports the results_dir in use).",
+                )
+
+        # --- AnalyseComplex --------------------------------------------
+        stage = "AnalyseComplex"
+        cmd_analyse = [
+            foldx, "--command=AnalyseComplex",
             f"--pdb={pdb_name}",
+            f"--analyseComplexChains={chains_protein},{chains_dna}",
+            "--complexWithDNA=true",
             f"--output-dir={tmpdir}",
         ]
-        result = subprocess.run(cmd_repair, capture_output=True, text=True, cwd=tmpdir, timeout=600)
-        repaired = work / f"{stem}_Repair.pdb"
-        if repaired.is_file():
-            pdb_name = repaired.name
-        else:
-            # Some FoldX versions use different naming
-            for candidate in work.glob("*Repair*.pdb"):
-                pdb_name = candidate.name
-                break
-
-    # --- AnalyseComplex ------------------------------------------------
-    cmd_analyse = [
-        foldx, "--command=AnalyseComplex",
-        f"--pdb={pdb_name}",
-        f"--analyseComplexChains={chains_protein},{chains_dna}",
-        "--complexWithDNA=true",
-        f"--output-dir={tmpdir}",
-    ]
-    result = subprocess.run(cmd_analyse, capture_output=True, text=True, cwd=tmpdir, timeout=600)
+        result = subprocess.run(cmd_analyse, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL, cwd=tmpdir, timeout=600)
+    except subprocess.TimeoutExpired as exc:
+        return _error(
+            f"FoldX {stage} timed out after {exc.timeout:.0f} s",
+            "Check that the file is a single TF-DNA complex of moderate size; "
+            "pass repair=false if it has already been repaired.",
+        )
+    except OSError as exc:
+        return _error(
+            f"Could not run FoldX {stage} ({foldx}): {exc}",
+            "Check that the FoldX binary on PATH runs on this machine.",
+        )
 
     if result.returncode != 0:
-        return json.dumps({
-            "error": "FoldX AnalyseComplex failed",
-            "stderr": result.stderr[-2000:] if result.stderr else "",
-            "stdout": result.stdout[-2000:] if result.stdout else "",
-        })
+        return _error(
+            "FoldX AnalyseComplex failed",
+            "Read stderr and stdout; check that chains_protein and chains_dna "
+            "match the chain IDs in the structure.",
+            stderr=result.stderr[-2000:] if result.stderr else "",
+            stdout=result.stdout[-2000:] if result.stdout else "",
+        )
 
     # --- Parse output --------------------------------------------------
     interaction_file = None
@@ -394,10 +742,13 @@ async def tfbs_binding_energy(
                 break
 
     if interaction_file is None:
-        return json.dumps({
-            "error": "FoldX output file not found",
-            "files": [f.name for f in work.iterdir()],
-        })
+        return _error(
+            "FoldX output file not found",
+            "FoldX ran but wrote no Interaction_*.fxout; check that the "
+            "structure contains the protein and DNA chains named in "
+            "chains_protein and chains_dna.",
+            files=[f.name for f in work.iterdir()],
+        )
 
     energy = {}
     with open(interaction_file) as fh:
@@ -422,6 +773,7 @@ async def tfbs_binding_energy(
 
     return json.dumps({
         "structure_path": str(pdb.resolve()),
+        "repaired_structure_path": str(kept) if kept else None,
         "interaction_energy": energy.get("Interaction Energy", None),
         "backbone_hbond": energy.get("Backbone Hbond", None),
         "sidechain_hbond": energy.get("Sidechain Hbond", None),
@@ -430,6 +782,298 @@ async def tfbs_binding_energy(
         "all_components": energy,
         "foldx_stdout": result.stdout[-1000:] if result.stdout else "",
     })
+
+
+# ---------------------------------------------------------------------------
+# Scan helpers shared by the local scan and the SLURM jobs
+# ---------------------------------------------------------------------------
+
+class _DnaTemplate(NamedTuple):
+    """The structure's DNA: the forward chain and, if present, its partner."""
+
+    fwd_chain: str
+    fwd_bases: list[tuple[int, str]]
+    rev_chain: str | None
+    rev_bases: list[tuple[int, str]] | None
+
+
+def _dna_template(pdb_path: str) -> _DnaTemplate | None:
+    chains = _parse_dna_from_pdb(pdb_path)
+    if not chains:
+        return None
+    ids = sorted(chains)
+    rev = ids[1] if len(ids) > 1 else None
+    return _DnaTemplate(ids[0], chains[ids[0]], rev, chains[rev] if rev else None)
+
+
+def _mutation_string(template: _DnaTemplate, seq_fwd: str) -> str | None:
+    """FoldX mutation string threading ``seq_fwd`` onto both DNA strands."""
+    parts = []
+    mut_fwd = _build_foldx_mutation_string(template.fwd_bases, seq_fwd, template.fwd_chain)
+    if mut_fwd:
+        parts.append(mut_fwd.rstrip(";"))
+    if template.rev_chain and template.rev_bases:
+        seq_rev = "".join(_COMPLEMENT.get(b, "N") for b in reversed(seq_fwd))
+        mut_rev = _build_foldx_mutation_string(template.rev_bases, seq_rev, template.rev_chain)
+        if mut_rev:
+            parts.append(mut_rev.rstrip(";"))
+    return ",".join(parts) + ";" if parts else None
+
+
+class _WindowScorer:
+    """Score scan windows with FoldX.
+
+    A window's energy is the lowest FoldX interaction energy over every
+    placement of the structure's DNA inside it (one placement when the
+    window equals the DNA length).  Placement energies are cached, so
+    overlapping windows share FoldX runs; windows must be scored in
+    increasing order.
+    """
+
+    def __init__(self, foldx_bin: str, structure: str, template: _DnaTemplate,
+                 genome: Any, chrom: str, window: int) -> None:
+        self.foldx_bin = foldx_bin
+        self.structure = structure
+        self.template = template
+        self.genome = genome
+        self.chrom = chrom
+        self.window = window
+        self.dna_length = len(template.fwd_bases)
+        self.runs = 0
+        self._cache: dict[int, float] = {}
+
+    def _placement_energy(self, pos: int) -> float:
+        try:
+            seq = str(self.genome[self.chrom][pos:pos + self.dna_length]).upper()
+        except (KeyError, ValueError, IndexError):
+            return math.nan
+        if len(seq) != self.dna_length or any(c not in "ACGT" for c in seq):
+            return math.nan
+        self.runs += 1
+        try:
+            with tempfile.TemporaryDirectory(prefix="fxw_") as wdir:
+                energy = _run_foldx_energy(
+                    self.foldx_bin, self.structure, wdir, _mutation_string(self.template, seq),
+                )
+        except Exception as exc:
+            logger.warning("FoldX failed at %s:%d: %s", self.chrom, pos, exc)
+            return math.nan
+        return math.nan if energy is None else float(energy)
+
+    def window_energy(self, w_start: int) -> float:
+        for pos in [p for p in self._cache if p < w_start]:
+            del self._cache[pos]
+        energies = []
+        for pos in range(w_start, w_start + self.window - self.dna_length + 1):
+            if pos not in self._cache:
+                self._cache[pos] = self._placement_energy(pos)
+            if not math.isnan(self._cache[pos]):
+                energies.append(self._cache[pos])
+        return min(energies) if energies else math.nan
+
+
+def _bigwig_interval(w_start: int, window: int, step: int) -> tuple[int, int]:
+    """Interval that carries one window's value in the bigWig.
+
+    bigWig entries must not overlap, so when windows overlap (step < window)
+    each value covers the step-wide bin centred on its window.
+    """
+    if window <= step:
+        return w_start, w_start + window
+    left = w_start + (window - step) // 2
+    return left, left + step
+
+
+def _write_bigwig(bw_path: Path, chrom: str, chrom_length: int,
+                  scores: list[tuple[int, float]], window: int, step: int) -> int:
+    """Write scored windows to ``bw_path``; return how many carried a value."""
+    import pyBigWig
+
+    entries = []
+    for w_start, energy in sorted(scores):
+        if math.isnan(energy):
+            continue
+        lo, hi = _bigwig_interval(w_start, window, step)
+        hi = min(hi, chrom_length)
+        if lo < hi:
+            entries.append((lo, hi, float(energy)))
+    bw = pyBigWig.open(str(bw_path), "w")
+    try:
+        bw.addHeader([(chrom, chrom_length)])
+        if entries:
+            bw.addEntries(
+                [chrom] * len(entries),
+                [e[0] for e in entries],
+                ends=[e[1] for e in entries],
+                values=[e[2] for e in entries],
+            )
+    finally:
+        bw.close()
+    return len(entries)
+
+
+# Parameters that decide which windows a chunk holds and how they are
+# scored; a chunk written under different values must not be merged.
+_SCAN_KEYS = ("structure", "genome_fasta", "chrom", "start", "step", "window",
+              "num_windows", "windows_per_task")
+_DIGEST_PREFIX = "# params_digest="
+
+
+def _params_digest(params: dict) -> str:
+    blob = json.dumps({k: params.get(k) for k in _SCAN_KEYS}, sort_keys=True)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _chunk_digest(path: Path) -> str | None:
+    """The params digest on a chunk CSV's first line, or None."""
+    try:
+        with open(path) as fh:
+            first = fh.readline().strip()
+    except OSError:
+        return None
+    return first[len(_DIGEST_PREFIX):] if first.startswith(_DIGEST_PREFIX) else None
+
+
+def _chunk_rows(path: Path):
+    """The data rows of a chunk CSV, without its digest line."""
+    with open(path, newline="") as fh:
+        yield from csv.DictReader(line for line in fh if not line.startswith("#"))
+
+
+def _count_csv_rows(path: Path) -> int:
+    return sum(1 for _ in _chunk_rows(path))
+
+
+def _scan_chunk_job(params_path: str) -> None:
+    """Score one SLURM array task's windows into ``chunk_<task>.csv``.
+
+    Entry point of the worker script that tfbs_binding_scan(slurm=True)
+    writes.  Each chunk CSV starts with the digest of the scan parameters.
+    A chunk whose CSV holds all its rows under the current digest is
+    skipped, so a resubmitted array redoes only unfinished chunks, and a
+    chunk from a scan with another region, window or step is rewritten.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    p = json.loads(Path(params_path).read_text())
+    digest = _params_digest(p)
+    task_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
+    w_from = task_id * p["windows_per_task"]
+    w_to = min(w_from + p["windows_per_task"], p["num_windows"])
+    csv_path = Path(p["chunks_dir"]) / f"chunk_{task_id:05d}.csv"
+    if (csv_path.exists() and _chunk_digest(csv_path) == digest
+            and _count_csv_rows(csv_path) >= w_to - w_from):
+        logger.info("Chunk %d already complete; skipping.", task_id)
+        return
+    logger.info("Task %d: windows %d-%d of %d", task_id, w_from, w_to - 1, p["num_windows"])
+
+    import pyfaidx
+
+    template = _dna_template(p["structure"])
+    genome = pyfaidx.Fasta(p["genome_fasta"])
+    scorer = _WindowScorer(p["foldx_bin"], p["structure"], template, genome, p["chrom"], p["window"])
+    try:
+        with open(csv_path, "w", newline="") as fh:
+            fh.write(f"{_DIGEST_PREFIX}{digest}\n")
+            writer = csv.writer(fh, lineterminator="\n")
+            writer.writerow(["position", "energy"])
+            for done, i in enumerate(range(w_from, w_to), start=1):
+                w_start = p["start"] + i * p["step"]
+                writer.writerow([w_start, scorer.window_energy(w_start)])
+                fh.flush()
+                if done % 10 == 0:
+                    logger.info("Task %d: %d/%d windows done", task_id, done, w_to - w_from)
+    finally:
+        genome.close()
+    logger.info("Task %d complete; wrote %s", task_id, csv_path)
+
+
+def _merge_chunks_job(params_path: str) -> None:
+    """Merge the chunk CSVs into the bigWig; entry point of the merge job.
+
+    Only chunks carrying the digest of the current scan parameters are
+    merged; a leftover chunk of an earlier scan in the same output_dir is
+    skipped with a warning.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    p = json.loads(Path(params_path).read_text())
+    digest = _params_digest(p)
+    scores: list[tuple[int, float]] = []
+    for chunk in sorted(Path(p["chunks_dir"]).glob("chunk_*.csv")):
+        if _chunk_digest(chunk) != digest:
+            logger.warning("Skipping %s: written by a scan with other parameters.", chunk)
+            continue
+        for row in _chunk_rows(chunk):
+            try:
+                energy = float(row["energy"])
+            except (TypeError, ValueError):
+                energy = math.nan
+            scores.append((int(row["position"]), energy))
+    n = _write_bigwig(Path(p["bigwig_path"]), p["chrom"], p["chrom_length"],
+                      scores, p["window"], p["step"])
+    logger.info("BigWig written to %s (%d of %d windows scored)", p["bigwig_path"], n, len(scores))
+
+
+def _write_slurm_scan_scripts(out: Path, params_path: Path, n_tasks: int,
+                              partition: str | None, max_time: str | None) -> tuple[Path, Path]:
+    """Write the worker, merge and sbatch scripts; return the two sbatch paths."""
+    root = str(Path(__file__).resolve().parents[2])
+    python = shlex.quote(sys.executable)
+    logs = out.resolve() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+
+    def job_script(name: str, entry: str) -> str:
+        path = out / name
+        path.write_text(
+            "import sys\n"
+            f"sys.path.insert(0, {root!r})\n"
+            f"from tfbs.mcp.foldx_tools import {entry}\n"
+            f"{entry}({str(params_path.resolve())!r})\n",
+            newline="\n",
+        )
+        return f"{python} {shlex.quote(str(path.resolve()))}"
+
+    def sbatch_script(name: str, directives: list[str], command: str) -> Path:
+        path = out / name
+        lines = ["#!/bin/bash", *(f"#SBATCH {d}" for d in directives), "", "date", command, "date", ""]
+        path.write_text("\n".join(lines), newline="\n")
+        return path
+
+    partition_flag = [f"--partition={partition}"] if partition else []
+    array_sh = sbatch_script("foldx_scan.sh", [
+        "--job-name=foldx_scan",
+        f"--output={logs}/scan_%A_%a.out",
+        f"--error={logs}/scan_%A_%a.err",
+        f"--array=0-{n_tasks - 1}",
+        "--ntasks=1",
+        "--cpus-per-task=4",
+        "--mem=8G",
+        *partition_flag,
+        f"--time={max_time or '48:00:00'}",
+    ], job_script("foldx_scan_worker.py", "_scan_chunk_job"))
+    merge_sh = sbatch_script("foldx_merge.sh", [
+        "--job-name=foldx_merge",
+        f"--output={logs}/merge_%j.out",
+        f"--error={logs}/merge_%j.err",
+        "--ntasks=1",
+        "--cpus-per-task=1",
+        "--mem=4G",
+        *partition_flag,
+        "--time=00:30:00",
+    ], job_script("foldx_scan_merge.py", "_merge_chunks_job"))
+    return array_sh, merge_sh
+
+
+async def _sbatch(script: Path, sbatch_flags: list[str] | None = None) -> dict:
+    """Submit through the slurm_submit tool; the dict has ``error`` on failure."""
+    from tfbs.mcp import server
+
+    try:
+        result = json.loads(await server.slurm_submit(script_path=str(script), sbatch_flags=sbatch_flags))
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if "error" not in result and not result.get("job_id"):
+        result["error"] = "sbatch reported no job ID"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +1094,7 @@ async def tfbs_binding_scan(
     genome_fasta: str,
     region: str,
     output_dir: str | None = None,
-    window: int = 200,
+    window: int | None = None,
     step: int = 50,
     slurm: bool = False,
     partition: str | None = None,
@@ -458,373 +1102,268 @@ async def tfbs_binding_scan(
 ) -> str:
     """Slide a window across a genomic region and score TF binding with FoldX.
 
-    Produces a bigWig track of per-window binding energy estimates.
+    Windows start every ``step`` bp.  Each window is scored by threading
+    the genomic sequence onto the structure's DNA (FoldX BuildModel) and
+    running AnalyseComplex; the window's value is the lowest (most
+    favourable) interaction energy in kcal/mol over every placement of the
+    structure's DNA inside the window.  Produces a bigWig track.
 
     Args:
-        structure_path: Path to a repaired PDB file.
-        genome_fasta:   Path to a genome FASTA (with .fai index).
+        structure_path: Path to a PDB file of a TF-DNA complex that FoldX
+                        RepairPDB has repaired: pass the
+                        repaired_structure_path that tfbs_binding_energy
+                        returns with repair=true, not the file
+                        tfbs_fetch_structure downloaded.  It must contain
+                        DNA chains (AlphaFold DB models do not).
+        genome_fasta:   Path to a genome FASTA (an .fai index is built if
+                        missing).
         region:         Genomic interval, e.g. ``chr1:1000-2000``.
-        output_dir:     Where to write the bigWig; defaults to a temp dir.
-        window:         Window size in bp (default 200).
-        step:           Step size in bp (default 50).
-        slurm:          Submit as a SLURM batch job instead of running locally.
-        partition:      SLURM partition name.
-        max_time:       SLURM max wall time, e.g. ``"2:00:00"``.
+        output_dir:     Where to write the bigWig.  Default
+                        <results>/binding_scan/<digest>/, with <results>
+                        the results_dir of tfbs_server_info and <digest> a
+                        hash of the region, window, step and the path,
+                        size and modification time of both the structure
+                        and the genome FASTA, so a repeated call writes to
+                        the same place, while scans against a different
+                        or rewritten genome or structure never share one.
+        window:         Window size in bp.  Default None means the DNA
+                        length of the structure (e.g. 11 bp), one FoldX run
+                        per window.  An explicit value is used as given,
+                        even when it is much larger than the DNA: every
+                        placement of the DNA inside the window is scored,
+                        so a window costs window - DNA length + 1 FoldX
+                        runs (shared between overlapping windows), and the
+                        result then carries a "warning" with the run count
+                        (placements x windows).  A value below the DNA
+                        length is rejected.
+        step:           Distance between window starts in bp (default 50).
+                        With step > window the positions between windows
+                        are not scored; use step <= window for gap-free
+                        coverage.
+        slurm:          Submit a SLURM array job (one CSV per chunk of
+                        windows, completed chunks skipped on resubmission)
+                        plus a dependent merge job that writes the bigWig,
+                        instead of scanning in-process.
+        partition:      SLURM partition name.  Default None submits
+                        without --partition, so the scheduler's default
+                        partition is used, because FoldX runs on CPUs
+                        only and needs no GPU partition.
+        max_time:       SLURM max wall time per array task (default
+                        ``"48:00:00"``).
 
     Returns:
-        JSON with bigwig_path, num_windows, and job metadata (if SLURM).
+        JSON with ``bigwig_path``, ``num_windows``, and the ``window``,
+        ``dna_length``, ``placements`` (DNA placements per window) and
+        ``step`` actually used, plus ``foldx_runs_planned`` (distinct
+        placements to score; with slurm=true a lower bound, because array
+        tasks do not share the placements of overlapping windows at
+        their chunk boundaries); with slurm=true, also ``array_job_id``
+        and ``merge_job_id``.  ``warning`` reports the FoldX run count when a
+        window holds more than one placement.  When windows overlap, each
+        value covers the step-wide bigWig bin centred on its window.
     """
     # --- Validate inputs -----------------------------------------------
     pdb = Path(structure_path).resolve()
     if not pdb.is_file():
-        return json.dumps({"error": f"Structure file not found: {structure_path}"})
+        return _error(
+            f"Structure file not found: {structure_path}",
+            "Pass a PDB file of a TF-DNA complex, for example the "
+            "structure_path returned by tfbs_fetch_structure.",
+        )
 
     fasta = Path(genome_fasta).resolve()
     if not fasta.is_file():
-        return json.dumps({"error": f"Genome FASTA not found: {genome_fasta}"})
+        return _error(
+            f"Genome FASTA not found: {genome_fasta}",
+            "Pass the path of the genome FASTA that the region refers to.",
+        )
 
     foldx = _find_foldx()
     if foldx is None:
         return _foldx_missing_error()
 
-    # Parse region
     m = re.match(r"^(chr\w+):(\d+)-(\d+)$", region)
     if not m:
-        return json.dumps({"error": f"Invalid region format: '{region}'. Expected chr:start-end"})
+        return _error(
+            f"Invalid region format: '{region}'. Expected chr:start-end",
+            "Use chrom:start-end with integer coordinates, e.g. chr14:36500000-36520000.",
+        )
     chrom, start, end = m.group(1), int(m.group(2)), int(m.group(3))
+    if end <= start:
+        return _error(f"Region end ({end}) is not after its start ({start}).",
+                      "Pass the region as chrom:start-end with start < end.")
+    if step < 1:
+        return _error(f"step must be at least 1 bp, got {step}.", "Pass step >= 1 (default 50).")
 
-    out = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="tfbs_scan_"))
-    out.mkdir(parents=True, exist_ok=True)
+    try:
+        import pyBigWig  # noqa: F401
+        import pyfaidx
+    except ImportError as exc:
+        return _error(
+            f"Missing Python package for the scan: {exc.name}",
+            'Install it with: pip install "tfbs-mcp[genomics,foldx]" '
+            "(pyfaidx and pyBigWig), then restart the server.",
+        )
 
+    try:
+        template = _dna_template(str(pdb))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return _error(f"Cannot parse {pdb} as PDB: {exc}", "Pass a PDB-format file (not mmCIF).")
+    if template is None:
+        return _error(
+            "No DNA chains found in the PDB structure.",
+            "The scan threads genomic sequence onto the structure's DNA, so it "
+            "needs a TF-DNA complex. AlphaFold DB models are protein-only; use a "
+            "PDB co-crystal or an AlphaFold 3 complex saved as PDB.",
+        )
+    dna_length = len(template.fwd_bases)
+    if window is None:
+        window = dna_length
+    elif window < dna_length:
+        return _error(
+            f"window ({window} bp) is shorter than the DNA in the structure ({dna_length} bp).",
+            f"Pass window >= {dna_length}, or omit window to use the DNA length.",
+        )
     num_windows = max(1, (end - start - window) // step + 1)
+    placements = window - dna_length + 1
+    if step >= placements:
+        runs_planned = placements * num_windows
+    else:
+        runs_planned = (num_windows - 1) * step + placements
+    warnings: list[str] = []
+    if placements > 1:
+        warnings.append(
+            f"window {window} bp holds {placements} placements of the {dna_length} bp "
+            f"structure DNA, so the scan costs {placements} placements x {num_windows} "
+            f"windows = {placements * num_windows} FoldX runs"
+            + (f" ({runs_planned} distinct, shared between overlapping windows)"
+               if runs_planned < placements * num_windows else "")
+            + "; omit window to score one placement per window."
+        )
 
-    # --- SLURM mode (array jobs with checkpointing) ---------------------
+    try:
+        genome = pyfaidx.Fasta(str(fasta))
+    except Exception as exc:
+        return _error(f"Cannot open genome FASTA {fasta}: {exc}",
+                      "Check the FASTA file, and that its folder is writable for the .fai index.")
+    if chrom not in genome.keys():
+        genome.close()
+        return _error(f"Chromosome '{chrom}' is not in {fasta}.",
+                      "Use a chromosome name exactly as it appears in the FASTA headers.")
+    chrom_length = len(genome[chrom])
+
+    out = (Path(output_dir).expanduser() if output_dir
+           else _server._results_root() / "binding_scan"
+           / _server._digest(region, window, step, _server._file_identity(str(pdb)),
+                             _server._file_identity(str(fasta))))
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        genome.close()
+        return _error(f"Cannot create output directory {out}: {exc}",
+                      "Pass a writable output_dir, or set TFBS_PROJECT_ROOT to a writable "
+                      "directory (tfbs_server_info reports the results_dir in use).")
+    bw_path = out.resolve() / "foldx_binding_scan.bw"
+    used = {
+        "region": region,
+        "window": window,
+        "dna_length": dna_length,
+        "placements": placements,
+        "step": step,
+        "num_windows": num_windows,
+        "foldx_runs_planned": runs_planned,
+        "output_dir": str(out.resolve()),
+        "bigwig_path": str(bw_path),
+    }
+    if warnings:
+        used["warning"] = " ".join(warnings)
+
+    # --- SLURM mode (array job + dependent merge job) -------------------
     if slurm:
-        from tfbs.mcp.server import slurm_submit
-
-        # Determine chunk size: ~250 windows per task at ~7 min each ≈ 29h
-        windows_per_task = 250
+        genome.close()
+        windows_per_task = max(1, _FOLDX_RUNS_PER_TASK // placements)
         n_tasks = (num_windows + windows_per_task - 1) // windows_per_task
-        chunks_dir = out / "chunks"
-        chunks_dir.mkdir(parents=True, exist_ok=True)
+        chunks_dir = out.resolve() / "chunks"
+        params_path = out.resolve() / "foldx_scan_params.json"
+        params = {
+            "structure": str(pdb),
+            "genome_fasta": str(fasta),
+            "chrom": chrom,
+            "chrom_length": chrom_length,
+            "start": start,
+            "step": step,
+            "window": window,
+            "num_windows": num_windows,
+            "windows_per_task": windows_per_task,
+            "foldx_bin": foldx,
+            "chunks_dir": str(chunks_dir),
+            "bigwig_path": str(bw_path),
+        }
+        params["params_digest"] = _params_digest(params)
+        try:
+            chunks_dir.mkdir(parents=True, exist_ok=True)
+            params_path.write_text(json.dumps(params, indent=2), newline="\n")
+            array_sh, merge_sh = _write_slurm_scan_scripts(out, params_path, n_tasks, partition, max_time)
+        except OSError as exc:
+            return _error(f"Cannot write the SLURM job files to {out}: {exc}",
+                          "Pass a writable output_dir on a filesystem the cluster nodes can read.")
 
-        # --- Worker script (one per array task) ---
-        worker_script = out / "foldx_scan_worker.py"
-        worker_script.write_text(textwrap.dedent(f"""\
-            #!/usr/bin/env python
-            \"\"\"FoldX binding scan worker – processes one chunk of windows.\"\"\"
-            import csv, math, os, sys, tempfile
-            from pathlib import Path
-            import pyfaidx
-
-            sys.path.insert(0, "{Path(__file__).resolve().parent.parent.parent}")
-            from tfbs.mcp.foldx_tools import (
-                _parse_dna_from_pdb, _build_foldx_mutation_string,
-                _run_foldx_energy, _COMPLEMENT,
+        array = await _sbatch(array_sh)
+        if "error" in array:
+            return _error(
+                f"Submitting the FoldX scan array job failed: {array['error']}",
+                "Run with slurm=false to scan in-process, or start the MCP server "
+                "on a SLURM login node where sbatch is on PATH.",
+                mode="slurm_array", stage="array", stderr=array.get("stderr"),
+                array_script=str(array_sh), merge_script=str(merge_sh),
             )
+        array_job_id = array["job_id"]
 
-            task_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
-            structure = "{pdb}"
-            fasta_path = "{fasta}"
-            chrom = "{chrom}"
-            region_start = {start}
-            region_end = {end}
-            step = {step}
-            foldx_bin = "{foldx}"
-            chunks_dir = Path("{chunks_dir.resolve()}")
-            windows_per_task = {windows_per_task}
-
-            # Parse DNA from structure
-            dna_chains = _parse_dna_from_pdb(structure)
-            fwd_chain = sorted(dna_chains.keys())[0]
-            rev_chain = sorted(dna_chains.keys())[1] if len(dna_chains) > 1 else None
-            ref_fwd = dna_chains[fwd_chain]
-            ref_rev = dna_chains[rev_chain] if rev_chain else None
-            dna_len = len(ref_fwd)
-
-            # This task's window range
-            total_windows = max(1, (region_end - region_start - dna_len) // step + 1)
-            w_from = task_id * windows_per_task
-            w_to = min(w_from + windows_per_task, total_windows)
-            print(f"Task {{task_id}}: windows {{w_from}}-{{w_to-1}} of {{total_windows}}")
-
-            csv_path = chunks_dir / f"chunk_{{task_id:05d}}.csv"
-
-            # Check if already completed (resume support)
-            if csv_path.exists():
-                existing = sum(1 for _ in open(csv_path)) - 1  # minus header
-                if existing >= (w_to - w_from):
-                    print(f"Chunk {{task_id}} already complete ({{existing}} rows). Skipping.")
-                    sys.exit(0)
-
-            genome = pyfaidx.Fasta(fasta_path)
-
-            with open(csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["position", "energy"])
-
-                for i in range(w_from, w_to):
-                    w_start = region_start + i * step
-                    w_end = w_start + dna_len
-                    try:
-                        seq_fwd = str(genome[chrom][w_start:w_end]).upper()
-                    except (KeyError, ValueError):
-                        writer.writerow([w_start, "nan"])
-                        continue
-                    if len(seq_fwd) != dna_len or any(c not in "ACGT" for c in seq_fwd):
-                        writer.writerow([w_start, "nan"])
-                        continue
-
-                    mut_parts = []
-                    mut_fwd = _build_foldx_mutation_string(ref_fwd, seq_fwd, fwd_chain)
-                    if mut_fwd:
-                        mut_parts.append(mut_fwd.rstrip(";"))
-                    if rev_chain and ref_rev:
-                        seq_rev = "".join(_COMPLEMENT.get(b, "N") for b in reversed(seq_fwd))
-                        mut_rev = _build_foldx_mutation_string(ref_rev, seq_rev, rev_chain)
-                        if mut_rev:
-                            mut_parts.append(mut_rev.rstrip(";"))
-                    mutation_str = ",".join(mut_parts) + ";" if mut_parts else None
-
-                    try:
-                        with tempfile.TemporaryDirectory(prefix="fxw_") as wdir:
-                            energy = _run_foldx_energy(foldx_bin, structure, wdir, mutation_str)
-                            writer.writerow([w_start, energy if energy is not None else "nan"])
-                    except Exception as exc:
-                        writer.writerow([w_start, "nan"])
-                        print(f"  Window {{i}}: error - {{exc}}")
-
-                    f.flush()  # flush after each window for crash safety
-
-                    done = i - w_from + 1
-                    if done % 10 == 0:
-                        print(f"  Task {{task_id}}: {{done}}/{{w_to - w_from}} windows done")
-
-            genome.close()
-            print(f"Task {{task_id}} complete. Wrote {{csv_path}}")
-        """))
-
-        # --- Merge script (runs after all array tasks) ---
-        merge_script = out / "foldx_scan_merge.py"
-        merge_script.write_text(textwrap.dedent(f"""\
-            #!/usr/bin/env python
-            \"\"\"Merge FoldX scan chunk CSVs into a bigwig file.\"\"\"
-            import csv, math, glob
-            from pathlib import Path
-            import pyBigWig, pyfaidx
-
-            chunks_dir = Path("{chunks_dir.resolve()}")
-            out_dir = Path("{out.resolve()}")
-            fasta_path = "{fasta}"
-            chrom = "{chrom}"
-            step = {step}
-
-            # Collect all chunk CSVs
-            rows = []
-            for csv_file in sorted(chunks_dir.glob("chunk_*.csv")):
-                with open(csv_file) as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        pos = int(row["position"])
-                        try:
-                            energy = float(row["energy"])
-                        except ValueError:
-                            energy = float("nan")
-                        rows.append((pos, energy))
-
-            rows.sort()
-            valid = [(p, e) for p, e in rows if not math.isnan(e)]
-            print(f"Total rows: {{len(rows)}}, valid: {{len(valid)}}")
-
-            # Get chrom length
-            genome = pyfaidx.Fasta(fasta_path)
-            chrom_len = len(genome[chrom])
-            genome.close()
-
-            bw_path = out_dir / "foldx_binding_scan.bw"
-            bw = pyBigWig.open(str(bw_path), "w")
-            bw.addHeader([(chrom, chrom_len)])
-            if valid:
-                ps, es = zip(*valid)
-                bw.addEntries([chrom]*len(ps), list(ps),
-                              ends=[p + step for p in ps],
-                              values=[float(e) for e in es])
-            bw.close()
-            print(f"BigWig written to {{bw_path}} ({{len(valid)}} entries)")
-        """))
-
-        # --- SLURM array script ---
-        partition_line = f"#SBATCH --partition={partition}" if partition else ""
-        time_line = f"#SBATCH --time={max_time}" if max_time else "#SBATCH --time=48:00:00"
-
-        sbatch_script = out / "foldx_scan.sh"
-        sbatch_script.write_text(textwrap.dedent(f"""\
-            #!/bin/bash
-            #SBATCH --job-name=foldx_scan
-            #SBATCH --output={out.resolve()}/logs/scan_%A_%a.out
-            #SBATCH --error={out.resolve()}/logs/scan_%A_%a.err
-            #SBATCH --array=0-{n_tasks - 1}
-            #SBATCH --ntasks=1
-            #SBATCH --cpus-per-task=4
-            #SBATCH --mem=8G
-            {partition_line}
-            {time_line}
-
-            echo "Array task $SLURM_ARRAY_TASK_ID starting on $(hostname)"
-            date
-            python {worker_script.resolve()}
-            date
-        """))
-
-        # --- SLURM merge script (dependency: afterok on array) ---
-        merge_sbatch = out / "foldx_merge.sh"
-        merge_sbatch.write_text(textwrap.dedent(f"""\
-            #!/bin/bash
-            #SBATCH --job-name=foldx_merge
-            #SBATCH --output={out.resolve()}/logs/merge_%j.out
-            #SBATCH --error={out.resolve()}/logs/merge_%j.err
-            #SBATCH --ntasks=1
-            #SBATCH --cpus-per-task=1
-            #SBATCH --mem=4G
-            {partition_line}
-            #SBATCH --time=00:30:00
-
-            echo "Merging FoldX scan results"
-            date
-            python {merge_script.resolve()}
-            date
-        """))
-
-        (out / "logs").mkdir(parents=True, exist_ok=True)
-
-        # Submit array job
-        submit_result = json.loads(await slurm_submit(script_path=str(sbatch_script)))
-        array_job_id = submit_result.get("job_id")
-
-        # Submit merge job with dependency
-        merge_result = json.loads(await slurm_submit(
-            script_path=str(merge_sbatch),
-            sbatch_flags=[f"--dependency=afterany:{array_job_id}"],
-        ))
+        merge = await _sbatch(merge_sh, [f"--dependency=afterany:{array_job_id}"])
+        if "error" in merge:
+            return _error(
+                f"The array job {array_job_id} was submitted, but submitting the "
+                f"merge job failed: {merge['error']}",
+                f"Submit the merge yourself with: sbatch --dependency=afterany:{array_job_id} "
+                f"{merge_sh}; or cancel the array job with slurm_cancel.",
+                mode="slurm_array", stage="merge", array_job_id=array_job_id,
+                stderr=merge.get("stderr"), merge_script=str(merge_sh),
+            )
 
         return json.dumps({
             "mode": "slurm_array",
             "array_job_id": array_job_id,
-            "merge_job_id": merge_result.get("job_id"),
-            "num_windows": num_windows,
+            "merge_job_id": merge["job_id"],
             "num_tasks": n_tasks,
             "windows_per_task": windows_per_task,
-            "chunks_dir": str(chunks_dir.resolve()),
-            "output_dir": str(out.resolve()),
-            "bigwig_path": str(out / "foldx_binding_scan.bw"),
+            "chunks_dir": str(chunks_dir),
+            "params_path": str(params_path),
+            "params_digest": params["params_digest"],
+            **used,
         })
 
     # --- Local mode ----------------------------------------------------
+    scorer = _WindowScorer(foldx, str(pdb), template, genome, chrom, window)
+    scores: list[tuple[int, float]] = []
     try:
-        import pyfaidx
-    except ImportError:
-        return json.dumps({"error": "pyfaidx is required for local scan: pip install pyfaidx"})
+        for i in range(num_windows):
+            w_start = start + i * step
+            scores.append((w_start, scorer.window_energy(w_start)))
+            if (i + 1) % 100 == 0:
+                logger.info("FoldX scan: %d/%d windows processed", i + 1, num_windows)
+    finally:
+        genome.close()
 
-    # Parse reference DNA from the structure to know what to mutate
-    dna_chains = _parse_dna_from_pdb(str(pdb))
-    if not dna_chains:
-        return json.dumps({"error": "No DNA chains found in the PDB structure."})
-
-    # Use the first DNA chain (forward strand) as the mutation target
-    fwd_chain = sorted(dna_chains.keys())[0]
-    rev_chain = sorted(dna_chains.keys())[1] if len(dna_chains) > 1 else None
-    ref_bases_fwd = dna_chains[fwd_chain]
-    ref_bases_rev = dna_chains[rev_chain] if rev_chain else None
-    dna_len = len(ref_bases_fwd)
-
-    # Override window to match DNA length in the structure
-    if window != dna_len:
-        window = dna_len
-        num_windows = max(1, (end - start - window) // step + 1)
-
-    genome = pyfaidx.Fasta(str(fasta))
-
-    scores: list[tuple[int, int, float]] = []
-    for i in range(num_windows):
-        w_start = start + i * step
-        w_end = w_start + window
-        try:
-            seq_fwd = str(genome[chrom][w_start:w_end]).upper()
-        except (KeyError, ValueError):
-            scores.append((w_start, w_end, float("nan")))
-            continue
-
-        if len(seq_fwd) != dna_len or any(c not in "ACGT" for c in seq_fwd):
-            scores.append((w_start, w_end, float("nan")))
-            continue
-
-        # Build mutation strings for forward and reverse complement chains
-        mut_fwd = _build_foldx_mutation_string(ref_bases_fwd, seq_fwd, fwd_chain)
-        mut_parts = []
-        if mut_fwd:
-            mut_parts.append(mut_fwd.rstrip(";"))
-        if rev_chain and ref_bases_rev:
-            seq_rev = "".join(_COMPLEMENT.get(b, "N") for b in reversed(seq_fwd))
-            mut_rev = _build_foldx_mutation_string(ref_bases_rev, seq_rev, rev_chain)
-            if mut_rev:
-                mut_parts.append(mut_rev.rstrip(";"))
-
-        mutation_string = ",".join(mut_parts) + ";" if mut_parts else None
-
-        # Run FoldX in a fresh temp dir per window to avoid file collisions
-        try:
-            with tempfile.TemporaryDirectory(prefix="fxw_") as wdir:
-                energy = _run_foldx_energy(foldx, str(pdb), wdir, mutation_string)
-                scores.append((w_start, w_end, energy if energy is not None else float("nan")))
-        except Exception:
-            scores.append((w_start, w_end, float("nan")))
-
-        if (i + 1) % 100 == 0:
-            print(f"  FoldX scan: {i + 1}/{num_windows} windows processed")
-
-    genome.close()
-
-    # Write bigWig
-    bw_path = out / "foldx_binding_scan.bw"
     try:
-        import pyBigWig
-    except ImportError:
-        return json.dumps({"error": "pyBigWig is required for bigWig output: pip install pyBigWig"})
+        num_scored = _write_bigwig(bw_path, chrom, chrom_length, scores, window, step)
+    except Exception as exc:
+        return _error(f"Writing the bigWig failed: {exc}",
+                      "Check that output_dir is writable and pyBigWig is installed.", **used)
 
-    # Need chromosome sizes
-    fai = Path(str(fasta) + ".fai")
-    chrom_sizes = {}
-    if fai.is_file():
-        with open(fai) as fh:
-            for line in fh:
-                parts = line.strip().split("\t")
-                if len(parts) >= 2:
-                    chrom_sizes[parts[0]] = int(parts[1])
-    else:
-        # Fallback: use the end of the region
-        chrom_sizes[chrom] = end + window
-
-    bw = pyBigWig.open(str(bw_path), "w")
-    bw.addHeader(list(chrom_sizes.items()))
-
-    import math
-    valid_scores = [(s[0], s[1], s[2]) for s in scores
-                    if not (isinstance(s[2], float) and math.isnan(s[2]))]
-    if valid_scores:
-        chroms_list = [chrom] * len(valid_scores)
-        starts_list = [s[0] for s in valid_scores]
-        ends_list = [s[1] for s in valid_scores]
-        vals_list = [s[2] for s in valid_scores]
-        bw.addEntries(chroms_list, starts_list, ends=ends_list, values=vals_list)
-
-    bw.close()
-
-    return json.dumps({
-        "mode": "local",
-        "bigwig_path": str(bw_path.resolve()),
-        "output_dir": str(out.resolve()),
-        "num_windows": num_windows,
-        "region": region,
-        "window": window,
-        "step": step,
-    })
+    result = {"mode": "local", "num_scored": num_scored, "foldx_runs": scorer.runs, **used}
+    if num_scored == 0:
+        warnings.append("No window could be scored: the region has no ACGT-only "
+                        "sequence or FoldX failed on every placement.")
+    if warnings:
+        result["warning"] = " ".join(warnings)
+    return json.dumps(result)

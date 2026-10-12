@@ -1,10 +1,10 @@
 # Example model config for BPNet.
 # BPNet-style dilated stack for base-resolution count data.
 #
-# Use from the scripts/cli/ directory:
-#   tfbs-train fit --config config.example.yaml --model yamls/models/BPNet.yaml
+# Use from the installed configs directory (tfbs/configs/):
+#   tfbs-train fit --config config.example.yaml --model models/BPNet.yaml
 # ...or from the repo root:
-#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/BPNet.yaml
+#   tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/BPNet.yaml
 #
 # Values are the class defaults - tune them for your data.
 class_path: tfbs.nn.models.BPNet

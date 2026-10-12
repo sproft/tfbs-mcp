@@ -1,10 +1,10 @@
 # Example model config for my_cnn.
 # Small two-layer CNN used in early experiments.
 #
-# Use from the scripts/cli/ directory:
-#   tfbs-train fit --config config.example.yaml --model yamls/models/my_cnn.yaml
+# Use from the installed configs directory (tfbs/configs/):
+#   tfbs-train fit --config config.example.yaml --model models/my_cnn.yaml
 # ...or from the repo root:
-#   tfbs-train fit --config scripts/cli/config.example.yaml --model scripts/cli/yamls/models/my_cnn.yaml
+#   tfbs-train fit --config tfbs/configs/config.example.yaml --model tfbs/configs/models/my_cnn.yaml
 #
 # Values are the class defaults - tune them for your data.
 class_path: tfbs.nn.models.my_cnn
