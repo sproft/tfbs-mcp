@@ -2,6 +2,7 @@
 {"error", "fix"}, never an exception.  Also the job writers, tfbs_sweep's
 tracking extra, clipped conv-filter PFMs and the FlexibleMLP template."""
 import asyncio
+import gzip
 import importlib.util
 import inspect
 import json
@@ -435,23 +436,39 @@ def test_docs_name_every_pipeline_that_needs_the_fimo_program():
 
 
 def test_troubleshooting_quotes_the_bed_errors_the_tool_returns(tmp_path):
-    """A ChIP-Atlas track line and a column-name header give the two quoted errors."""
+    """A column-name header and a damaged gzip give the quoted errors; a ChIP-Atlas
+    track line is skipped."""
     pytest.importorskip("pyfaidx")
     from tfbs.mcp.cli import demo_dir
 
     genome = str(demo_dir() / "demo_genome.fa")
     track = tmp_path / "chipatlas.bed"
     track.write_text('track name="NKX2-1 (@ All cell types) 100" gffTags="on"\n'
-                     "demo_chr8\t100\t300\tID=SRX1\t223\t.\t100\t300\t0,227,255\n")
+                     "demo_chr8\t100\t300\tID=SRX1;Catalog#: MS-699-P\t223\t.\t100\t300\t0,227,255\n")
     header = tmp_path / "header.bed"
     header.write_text("chrom\tstart\tend\ndemo_chr8\t100\t300\n")
     guide = _doc("docs/troubleshooting.md")
-    for bed, quoted in ((track, "Error tokenizing data. C error: Expected 1 fields in line 2, saw 9"),
-                        (header, "Non-integer start or end in")):
-        result = json.loads(asyncio.run(server.tfbs_extract_loci(
+
+    def extract(bed):
+        return json.loads(asyncio.run(server.tfbs_extract_loci(
             bed_path=str(bed), genome_fasta=genome, output_dir=str(tmp_path / bed.stem))))
-        assert quoted in result["error"], result
-        assert quoted in guide
+
+    result = extract(track)
+    assert "error" not in result, result
+    assert result["num_peaks_input"] == 1 and result["num_peaks_extracted"] == 1
+    assert result["has_scores"] is True
+    assert torch.load(result["files"]["scores"], weights_only=True).tolist() == [[223.0]]
+    assert "track name=" not in guide
+    quoted = "Non-integer start or end in"
+    assert quoted in extract(header)["error"]
+    assert quoted in guide
+    packed = gzip.compress(track.read_bytes() * 200)
+    damaged = tmp_path / "damaged.bed.gz"
+    damaged.write_bytes(packed[:20] + bytes(b ^ 0xFF for b in packed[20:60]) + packed[60:])
+    error = extract(damaged)["error"]
+    assert error.startswith("Could not read BED file ")
+    assert ": the gzip data cannot be decompressed (" in error
+    assert "Could not read BED file ...: the gzip data cannot be decompressed (...)" in guide
 
 
 # ---------------------------------------------------------------------------

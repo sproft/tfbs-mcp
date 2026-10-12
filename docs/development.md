@@ -58,7 +58,7 @@ The six tools that run a longer job (`tfbs_validate`, `tfbs_sweep`, `tfbs_chipse
 python -m tfbs.pipelines.remap_validation --help
 ```
 
-In direct mode (`slurm=false`) the benchmark and validation tools run the module in a worker thread, so the server keeps answering other calls while it runs, and a cancelled call kills the module's whole process group (the process tree on Windows). `remap_validation`, `chipseq_benchmark_with_foldx` (behind `tfbs_chipseq_method_comparison`), and `disease_variant_validation` when it has a motif file, run the MEME Suite's `fimo` program, which must be on PATH (it has no native Windows build, see [install-windows.md](install-windows.md#tools-that-need-wsl)); the tools check for it before they run or submit anything. The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working, including `main(args)` with an `argparse.Namespace` for `validate` and `run_sweep`.
+In direct mode (`slurm=false`) the benchmark and validation tools run the module in a worker thread, so the server keeps answering other calls while it runs, and a cancelled call kills the module's whole process group (the process tree on Windows). `remap_validation`, `chipseq_benchmark_with_foldx` (behind `tfbs_chipseq_method_comparison`), and `disease_variant_validation` when it has a motif file, run the MEME Suite's `fimo` program, which must be on PATH (it has no native Windows build, see [install-windows.md](install-windows.md#tools-that-need-wsl)); the tools check for it before they run or submit anything. The modules are `validate`, `run_sweep`, `chipseq_benchmark`, `chipseq_benchmark_with_foldx`, `remap_validation` and `disease_variant_validation`. In a clone, `scripts/<name>.py` (and `scripts/cli/run_sweep.py`) are thin wrappers around them, so older commands keep working, including `main(args)` with an `argparse.Namespace` for `validate` and `run_sweep`. The peak BEDs of `tfbs_extract_loci`, `remap_validation` and `disease_variant_validation` are read through `tfbs.bedio`, which skips blank lines and lines that start with `#`, `track` or `browser`, keeps a `#` inside a line as data (ChIP-Atlas peak BEDs hold catalog numbers such as `Catalog#: MS-699-P` in column 4), and decompresses gzip, bzip2, xz, zip (an archive that holds one file) and zstd files, which it recognises by their first bytes, not by their names (zstd needs Python 3.14 or later, or the `zstandard` package). A compressed file it cannot decompress raises `tfbs.bedio.BedReadError`, an `OSError` that says why: corrupt or truncated data, a zip archive with no file or more than one, or zstd without a decoder.
 
 ## Prediction
 
@@ -204,6 +204,7 @@ tfbs/                     Python package
 ├── dataloaders/          Data loading and one-hot encoding
 ├── prediction/           Window-based scoring and analysis
 ├── predict.py            ChIP-seq peak prediction CLI
+├── bedio.py              BED reader: skips whole comment lines only
 ├── cli/train_cli.py      Lightning CLI backing the tfbs-train command
 ├── pipelines/            Validation, sweep and benchmark jobs the MCP tools run
 ├── configs/              Training config templates (package data)

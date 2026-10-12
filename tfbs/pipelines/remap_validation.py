@@ -47,6 +47,7 @@ import pyfaidx
 import torch
 from sklearn.metrics import auc, roc_curve
 
+from tfbs.bedio import read_bed
 from tfbs.pipelines.checkpoints import (
     DEFAULT_SCALING, describe_problems, parse_named_paths, resolve_checkpoints,
 )
@@ -57,6 +58,18 @@ from tfbs.pipelines.chipseq_benchmark_with_foldx import (
 )
 
 from tfbs.nn.loading import load_checkpoint
+
+REMAP_COLUMNS = ["chrom", "start", "end", "name", "score", "strand",
+                 "thickStart", "thickEnd", "itemRgb"]
+
+
+def read_remap_bed(path):
+    """The ReMap peaks BED as a DataFrame with the REMAP_COLUMNS names.
+
+    Blank lines and lines starting with #, track or browser are skipped
+    (tfbs.bedio); a "#" inside a line is data.
+    """
+    return read_bed(path, names=REMAP_COLUMNS)
 
 
 def load_model(checkpoint_path, model_type, device="cuda"):
@@ -360,11 +373,7 @@ def main(argv=None):
         nn_models[ds] = load_model(str(ckpt), args.model_type, args.device)
 
     # ---------------- Read ReMap peaks ----------------
-    remap_df = pd.read_csv(
-        args.remap_bed, sep="\t", header=None, comment="#",
-        names=["chrom", "start", "end", "name", "score", "strand",
-               "thickStart", "thickEnd", "itemRgb"],
-    )
+    remap_df = read_remap_bed(args.remap_bed)
     print(f"\nReMap NKX2-1 peaks: {len(remap_df):,}")
     print("Score (#experiments) distribution:")
     print(remap_df["score"].value_counts().sort_index())
