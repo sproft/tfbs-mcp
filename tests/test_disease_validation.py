@@ -546,6 +546,20 @@ def test_extraction_finds_variants_in_an_ncbi_named_vcf(monkeypatch, bed_chrom):
     assert vcf.fetched == ["1"]
 
 
+def test_extraction_skips_records_without_an_alt_allele(monkeypatch):
+    """ClinVar writes ALT "." for some records; pysam reports alts None for them."""
+    no_alt = _Rec(155, "Pathogenic")
+    no_alt.alts = None
+    none_inside = _Rec(156, "Pathogenic")
+    none_inside.alts = (None,)
+    vcf = _FakeVcf(["chr1"], {"chr1": [_Rec(150, "Pathogenic"), no_alt, none_inside, _Rec(160, "Benign")]})
+    _fake_pysam(monkeypatch, vcf)
+    peaks = pd.DataFrame([{"chrom": "chr1", "start": 100, "end": 200, "num": 1}])
+    hits = dv.extract_clinvar_snvs(peaks, "clinvar.vcf.gz")
+    assert hits["pos"].tolist() == [150, 160]
+    assert hits["label"].tolist() == ["pathogenic", "benign"]
+
+
 def test_no_variant_messages_do_not_claim_the_vcf_may_use_any_names(files, tmp_path, monkeypatch):
     Pipeline(monkeypatch, returncode=1, stderr="No ClinVar variants found in the 5 peaks")
     fix = _disease(files, tmp_path, slurm=False)["fix"]

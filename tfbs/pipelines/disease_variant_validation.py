@@ -263,7 +263,11 @@ def extract_clinvar_snvs(peaks: pd.DataFrame, clinvar_vcf: str) -> pd.DataFrame:
     for peak in peaks.itertuples():
         try:
             for rec in _fetch_peak(vcf, contigs, peak.chrom, peak.start, peak.end):
-                if len(rec.ref) != 1 or any(len(a) != 1 for a in rec.alts):
+                # ClinVar writes some records with ALT "." (no alternative
+                # allele); pysam gives rec.alts None for them.
+                if not rec.ref or rec.alts is None:
+                    continue
+                if len(rec.ref) != 1 or any(a is None or len(a) != 1 for a in rec.alts):
                     continue
                 clnsig = rec.info.get("CLNSIG", ())
                 clnsig = ",".join(clnsig) if isinstance(clnsig, tuple) else str(clnsig)
