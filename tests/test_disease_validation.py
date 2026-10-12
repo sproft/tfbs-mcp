@@ -588,8 +588,12 @@ def test_foldx_leg_scores_an_eleven_bp_duplex_and_keeps_every_row(monkeypatch):
     genome = _Genome({"chr1": "ACGTACGTAC" + "T" + "GCATGCATGC" + "A" * 30})
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/foldx" if name == "foldx" else None)
     monkeypatch.setattr(foldx_tools, "_parse_dna_from_pdb", lambda pdb: {"C": "GGTCAAGTGTT", "D": "AACACTTGACC"})
-    monkeypatch.setattr(foldx_tools, "_build_foldx_mutation_string", lambda ref, seq, chain: "GA1T;")
-    monkeypatch.setattr(foldx_tools, "_run_foldx_energy", lambda binary, pdb, wd, ms: -7.5 if ms else -8.0)
+    # The fake mutation string carries the window's centre base, so the fake
+    # energy can tell the reference window (T) from the variant window (G).
+    monkeypatch.setattr(foldx_tools, "_build_foldx_mutation_string",
+                        lambda ref, seq, chain: f"X{seq[5]}6;")
+    monkeypatch.setattr(foldx_tools, "_run_foldx_energy",
+                        lambda binary, pdb, wd, ms: -8.0 if ms and "XT6" in ms else -7.5)
 
     class _SerialPool:
         def __init__(self, n):
