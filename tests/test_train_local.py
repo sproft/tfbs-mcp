@@ -741,3 +741,152 @@ def test_analyze_description_says_warnings_group_on_colon_and_space():
     doc = " ".join(server.tfbs_analyze.__doc__.split())
     assert 'its text before the first ": " (colon and space)' in doc
     assert 'before the first ":" (' not in doc
+
+
+# ---------------------------------------------------------------------------
+# The constant-output warning of a classifier that did not learn
+# ---------------------------------------------------------------------------
+
+def _run_with_metrics(popen, tmp_path, csv_text: str, classify: bool | None = True) -> dict:
+    """tfbs_train local=true on a config whose run writes csv_text as its metrics.csv."""
+    cfg = tmp_path / "cfg" / "RNN.yaml"
+    cfg.parent.mkdir(exist_ok=True)
+    model = "" if classify is None else f"model:\n  init_args:\n    classify: {str(classify).lower()}\n"
+    cfg.write_text(CONFIG + model)
+    settings, _ = popen
+    settings["action"] = lambda cmd, kwargs: _metrics_csv(
+        cfg.parent / "ckpts" / "logs" / "best_RNN" / "version_0" / "metrics.csv", csv_text)
+    return run(server.tfbs_train(config_path=str(cfg), local=True))
+
+
+def test_a_classifier_at_ln2_in_every_epoch_gets_the_constant_output_warning(popen, tmp_path):
+    result = _run_with_metrics(popen, tmp_path,
+                               "epoch,step,train_loss,val_loss,val_acc,val_auc\n"
+                               "0,30,0.70,,,\n0,30,,0.6950,0.5,0.5\n"
+                               "1,61,0.69,,,\n1,61,,0.6905,0.5,0.52\n"
+                               "2,92,,0.6931,0.5,0.49\n")
+    assert result["metrics"]["val_loss"] == 0.6905
+    warning = result["warning"]
+    assert "did not learn" in warning and "constant output" in warning
+    assert "every logged epoch" in warning
+    assert "seed" in warning and "more data" in warning and "model_params" in warning
+
+
+def test_a_best_first_epoch_at_ln2_without_improvement_gets_the_warning(popen, tmp_path):
+    # The later epochs drift away from ln 2 but never improve on the first.
+    result = _run_with_metrics(popen, tmp_path,
+                               "epoch,step,val_loss,val_acc,val_auc\n"
+                               "0,30,0.6960,0.5,0.5\n1,61,0.7200,0.5,0.55\n2,92,0.7500,0.5,0.54\n",
+                               classify=None)
+    assert result["metrics"]["best_epoch"] == 0
+    assert "did not learn" in result["warning"]
+    assert "no later epoch improved" in result["warning"]
+
+
+@pytest.mark.parametrize("csv_text", [
+    # Learns: the loss leaves ln 2.
+    "epoch,step,val_loss,val_acc,val_auc\n0,30,0.6900,0.55,0.6\n1,61,0.5500,0.7,0.8\n",
+    # Overfits after a good first epoch, far below ln 2.
+    "epoch,step,val_loss,val_acc,val_auc\n0,30,0.4000,0.8,0.9\n1,61,0.4500,0.8,0.9\n",
+    # One epoch 0.0069 above ln 2, outside the 0.005 tolerance.
+    "epoch,step,val_loss,val_acc,val_auc\n0,30,0.7000,0.5,0.5\n",
+])
+def test_a_classifier_that_learns_or_overfits_gets_no_warning(popen, tmp_path, csv_text):
+    result = _run_with_metrics(popen, tmp_path, csv_text)
+    assert result["metrics"] is not None and "warning" not in result
+
+
+def test_a_regression_run_at_ln2_gets_no_warning(popen, tmp_path):
+    result = _run_with_metrics(popen, tmp_path,
+                               "epoch,step,val_loss\n0,30,0.6931\n1,61,0.6930\n",
+                               classify=False)
+    assert result["metrics"]["val_loss"] == 0.6930 and "warning" not in result
+
+
+def test_dead_run_rule_on_its_own():
+    ln2 = 0.6931471805599453
+    flat = [(0, ln2 + 0.004), (1, ln2 - 0.0049), (2, ln2)]
+    assert server._dead_classifier_warning({"best_epoch": 1, "val_loss": ln2 - 0.0049}, flat, True)
+    assert server._dead_classifier_warning({"best_epoch": 1, "val_loss": ln2 - 0.0049}, flat,
+                                           False) is None
+    moved = [(0, ln2), (1, ln2 - 0.006)]
+    assert server._dead_classifier_warning({"best_epoch": 1, "val_loss": ln2 - 0.006}, moved,
+                                           True) is None
+    assert server._dead_classifier_warning({"best_epoch": 0}, [], True) is None
+
+
+# A loss still near ln 2 in the first epochs, while the AUC already rises,
+# is a run that learns.  The rows are measured runs of the three-layer
+# default stack (planted-motif sets) and a one-epoch CLI run.
+@pytest.mark.parametrize("csv_text", [
+    # Flat loss, AUC 0.75.
+    "epoch,step,val_loss,val_acc,val_auc\n0,30,0.6930,0.6,0.75\n1,61,0.6932,0.62,0.75\n",
+    # de_easy seed 6, epoch 0: loss 0.6927, AUC 0.777.
+    "epoch,step,val_loss,val_acc,val_auc\n0,30,0.6927,0.55,0.777\n",
+    # de_hard seed 13: losses 0.6935, 0.6941, 0.6923; AUC 0.53, 0.62, 0.66.
+    "epoch,step,val_loss,val_acc,val_auc\n"
+    "0,30,0.6935,0.5,0.53\n1,61,0.6941,0.5,0.62\n2,92,0.6923,0.55,0.66\n",
+    # The best epoch is the first, the later ones are worse, but its AUC is 0.741.
+    "epoch,step,val_loss,val_acc,val_auc\n0,30,0.6917,0.6,0.741\n1,61,0.6950,0.6,0.73\n",
+    # An AUC far below 0.5 is a learned, inverted ranking, not a constant output.
+    "epoch,step,val_loss,val_acc,val_auc\n0,30,0.6931,0.4,0.30\n1,61,0.6931,0.4,0.30\n",
+])
+def test_a_flat_loss_with_an_auc_away_from_chance_gets_no_warning(popen, tmp_path, csv_text):
+    result = _run_with_metrics(popen, tmp_path, csv_text)
+    assert result["metrics"] is not None and "warning" not in result, result
+
+
+def test_a_flat_loss_with_an_auc_near_chance_gets_the_warning_naming_the_auc(popen, tmp_path):
+    result = _run_with_metrics(popen, tmp_path,
+                               "epoch,step,val_loss,val_acc,val_auc\n"
+                               "0,30,0.6930,0.5,0.53\n1,61,0.6932,0.5,0.47\n")
+    assert result["metrics"]["val_auc"] == 0.53
+    assert "did not learn" in result["warning"]
+    assert "val_auc at the best epoch was 0.530, near chance" in result["warning"]
+
+
+def test_a_flat_loss_without_val_auc_falls_back_to_the_loss_rule(popen, tmp_path):
+    result = _run_with_metrics(popen, tmp_path,
+                               "epoch,step,val_loss,val_acc\n0,30,0.6930,0.5\n1,61,0.6932,0.5\n")
+    assert "val_auc" not in result["metrics"]
+    assert "did not learn" in result["warning"] and "val_auc" not in result["warning"]
+
+
+def test_a_single_class_validation_split_warns_from_the_loss_alone(popen, tmp_path):
+    # torchmetrics logs 0.0 as val_auc there; it is nulled before the rule runs,
+    # so it does not count as an AUC far from chance.
+    data = tmp_path / "bound_dataset"
+    (data / "val").mkdir(parents=True)
+    torch.save(torch.tensor([1.0, 1.0, 1.0]).unsqueeze(1), data / "val" / "labels.pt")
+    cfg = tmp_path / "cfg" / "RNN.yaml"
+    cfg.parent.mkdir()
+    cfg.write_text(CONFIG + f"data:\n  data_path: {data.as_posix()}\n")
+    settings, _ = popen
+    settings["action"] = lambda cmd, kwargs: _metrics_csv(
+        cfg.parent / "ckpts" / "logs" / "best_RNN" / "version_0" / "metrics.csv",
+        "epoch,step,val_loss,val_acc,val_auc\n0,5,0.6930,1.0,0.0\n1,11,0.6931,1.0,0.0\n")
+    result = run(server.tfbs_train(config_path=str(cfg), local=True))
+    assert result["metrics"]["val_auc"] is None
+    assert "did not learn" in result["warning"] and "val_auc" not in result["warning"]
+
+
+def test_dead_run_rule_with_val_auc_on_its_own():
+    ln2 = 0.6931471805599453
+    flat = [(0, ln2), (1, ln2 + 0.001)]
+    best = {"best_epoch": 0, "val_loss": ln2}
+    assert server._dead_classifier_warning({**best, "val_auc": 0.5}, flat, True)
+    assert server._dead_classifier_warning({**best, "val_auc": 0.549}, flat, True)
+    assert server._dead_classifier_warning({**best, "val_auc": 0.451}, flat, True)
+    assert server._dead_classifier_warning({**best, "val_auc": 0.55}, flat, True) is None
+    assert server._dead_classifier_warning({**best, "val_auc": 0.75}, flat, True) is None
+    assert server._dead_classifier_warning({**best, "val_auc": None}, flat, True)
+    assert server._dead_classifier_warning({**best, "val_auc": float("nan")}, flat, True)
+
+
+def test_dead_run_warning_suggests_the_template_three_layer_stack():
+    ln2 = 0.6931471805599453
+    warning = server._dead_classifier_warning({"best_epoch": 0, "val_loss": ln2},
+                                              [(0, ln2), (1, ln2)], True)
+    assert '{"dilations": [1, 1, 2]}' in warning
+    assert "[1, 1, 2, 4, 8]" in warning
+    assert '"dilations": [1, 1]}' not in warning

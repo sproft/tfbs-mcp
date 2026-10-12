@@ -3609,7 +3609,18 @@ async def tfbs_train(
         when the config has no CSVLogger, this run wrote no metrics.csv,
         or the file cannot be read;
         val_auc is null, with a note, when the validation split holds a
-        single class (AUROC is undefined there).  A failed run returns
+        single class (AUROC is undefined there).  For a classifier
+        (model.init_args.classify true, or val_acc or val_auc logged) a
+        "warning" says the model did not learn (constant output) when
+        val_loss lies within 0.005 of ln 2 at every logged epoch, or
+        when the best epoch is the first, a later epoch was logged and
+        the best val_loss lies within 0.005 of ln 2, and, when val_auc
+        is logged, the best epoch's val_auc also lies within 0.05 of 0.5
+        (a run whose loss is still near ln 2 in its first epochs while
+        its AUC already rises is learning); it suggests another seed,
+        more data, or a shallower stack through tfbs_config's
+        model_params (for VCNNBpnet, the template's dilations
+        [1, 1, 2]).  A failed run returns
         error, fix, exit_code, log_path and log_tail; a run killed after
         local_timeout returns error, fix and log_path.  In local mode a
         config whose trainer, or the init_args of its ModelCheckpoint or
@@ -3925,14 +3936,17 @@ def _rows_of_this_run(rows: list[dict[str, str]], before: list[dict[str, str]] |
 
 def _best_epoch_metrics(log_dir: Path,
                         before: dict[Path, tuple[int, list[dict[str, str]] | None]],
-                        ) -> tuple[dict | None, Path | None, str | None]:
-    """(metrics, metrics.csv, None) for the best epoch of the run, or (None, path or None, note).
+                        ) -> tuple[dict | None, Path | None, str | None,
+                                   list[tuple[int, float]]]:
+    """(metrics, metrics.csv, None, val_losses) for the best epoch of the run.
 
-    Only a metrics.csv under log_dir that is new or whose st_mtime_ns
-    changed since before (from _metrics_snapshot) counts, and only the
-    rows it gained during the run, so an earlier run's log is never
-    reported.  A row whose epoch or val_loss is blank, nan or inf is
-    not a candidate for the best epoch.
+    On failure (None, path or None, note, []).  Only a metrics.csv under
+    log_dir that is new or whose st_mtime_ns changed since before (from
+    _metrics_snapshot) counts, and only the rows it gained during the
+    run, so an earlier run's log is never reported.  A row whose epoch
+    or val_loss is blank, nan or inf is not a candidate for the best
+    epoch.  val_losses holds (epoch, val_loss) for every row of the run
+    with a finite val_loss and epoch, in the order logged.
     """
     import csv
 
@@ -3944,20 +3958,21 @@ def _best_epoch_metrics(log_dir: Path,
                  if ns is not None and (p not in before or before[p][0] != ns)}
         if not fresh:
             return None, None, (f"This run wrote no metrics.csv under {log_dir} (the config's "
-                                "CSVLogger directory), so no validation metrics are reported.")
+                                "CSVLogger directory), so no validation metrics are "
+                                "reported."), []
         path = max(fresh, key=fresh.__getitem__)
         rows = _rows_of_this_run(_read_metrics_rows(path), before.get(path, (0, None))[1])
     except (OSError, UnicodeDecodeError, csv.Error) as exc:
         return None, path, (f"Could not read {path or log_dir} after the run "
                             f"({type(exc).__name__}: {exc}), so no validation metrics "
-                            "are reported.")
+                            "are reported."), []
     numbered = [(r, _as_float(r.get("epoch"))) for r in rows]
     epochs = [int(e) for _, e in numbered if e is not None]
     scored = [(r, e) for r, e in numbered
               if e is not None and _as_float(r.get("val_loss")) is not None]
     if not scored:
         return None, path, (f"{path} has no row with a finite val_loss and epoch, so no "
-                            "validation metrics are reported.")
+                            "validation metrics are reported."), []
     best, best_epoch = min(scored, key=lambda pair: _as_float(pair[0]["val_loss"]))
     metrics: dict[str, Any] = {}
     for key in ("val_loss", "val_acc", "val_auc"):
@@ -3966,7 +3981,65 @@ def _best_epoch_metrics(log_dir: Path,
             metrics[key] = value
     metrics["best_epoch"] = int(best_epoch)
     metrics["epochs_run"] = max(epochs) + 1
-    return metrics, path, None
+    return metrics, path, None, [(int(e), _as_float(r["val_loss"])) for r, e in scored]
+
+
+# A classifier whose validation BCE stays within this distance of ln 2 (the
+# loss of a constant output of 0.5 on balanced classes) has not learned.
+_DEAD_RUN_TOLERANCE = 0.005
+# A run whose best-epoch val_auc lies this far or further from 0.5 is
+# learning even when its val_loss is still near ln 2: the default
+# three-layer VCNNBpnet stays within 0.005 of ln 2 for its first 1 to 3
+# epochs while its AUC already reaches 0.6 to 0.8.
+_DEAD_RUN_AUC_TOLERANCE = 0.05
+
+
+def _dead_classifier_warning(metrics: dict, val_losses: list[tuple[int, float]],
+                             classify: bool) -> str | None:
+    """A warning when a classifier run shows a constant output, else None.
+
+    Two patterns count: the val_loss of every logged epoch lies within
+    _DEAD_RUN_TOLERANCE of ln 2, or the best epoch is the run's first
+    epoch, at least one later epoch was logged without improving on it,
+    and its val_loss lies within _DEAD_RUN_TOLERANCE of ln 2.  When
+    metrics holds a finite val_auc (the best epoch's), the run also
+    needs that val_auc within _DEAD_RUN_AUC_TOLERANCE of 0.5; a val_auc
+    that is None (a single-class validation split) counts as not
+    logged.  metrics and val_losses are as _best_epoch_metrics returns
+    them.
+    """
+    if not classify or not val_losses:
+        return None
+    ln2 = math.log(2.0)
+    epochs = [e for e, _ in val_losses]
+    if all(abs(v - ln2) <= _DEAD_RUN_TOLERANCE for _, v in val_losses):
+        pattern = "at every logged epoch"
+    elif (metrics.get("best_epoch") == min(epochs) and max(epochs) > min(epochs)
+          and abs(metrics.get("val_loss", math.inf) - ln2) <= _DEAD_RUN_TOLERANCE):
+        pattern = "at its best epoch, the first, and no later epoch improved on it"
+    else:
+        return None
+    auc = metrics.get("val_auc")
+    auc_note = ""
+    if isinstance(auc, (int, float)) and math.isfinite(auc):
+        if abs(auc - 0.5) >= _DEAD_RUN_AUC_TOLERANCE:
+            return None
+        auc_note = f", and val_auc at the best epoch was {auc:.3f}, near chance (0.5)"
+    return (f"The model did not learn: val_loss stayed within {_DEAD_RUN_TOLERANCE} of "
+            f"ln 2 ({ln2:.4f}), the loss of a constant output of 0.5, {pattern}"
+            f"{auc_note}. "
+            "Train again with another seed (extra_args ['--seed_everything 7'] or "
+            "seed_everything in the config), with more data, or with a shallower stack "
+            "through tfbs_config's model_params (for VCNNBpnet with the study's five "
+            "layers [1, 1, 2, 4, 8], the template's three-layer default "
+            "{\"dilations\": [1, 1, 2]}).")
+
+
+def _config_classify(config: dict) -> bool:
+    """Whether the config's model.init_args.classify is true."""
+    model = config.get("model")
+    args = model.get("init_args") if isinstance(model, dict) else None
+    return isinstance(args, dict) and args.get("classify") is True
 
 
 def _single_class_validation(config: dict, base: Path) -> bool:
@@ -4115,7 +4188,7 @@ async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str
         notes.append("The config has no CSVLogger with a save_dir (trainer.logger), so no "
                      "validation metrics are reported; tfbs_config adds one.")
     else:
-        metrics, metrics_path, note = _best_epoch_metrics(log_dir, before)
+        metrics, metrics_path, note, val_losses = _best_epoch_metrics(log_dir, before)
         if note:
             notes.append(note)
         if metrics is not None and "val_auc" in metrics \
@@ -4123,6 +4196,12 @@ async def _train_locally(config_p: Path, tokens: list[str], timeout: int) -> str
             metrics["val_auc"] = None
             notes.append("validation split contains one class, so AUROC is undefined "
                          "and val_auc is null (torchmetrics logs 0.0 for it).")
+        if metrics is not None:
+            warning = _dead_classifier_warning(
+                metrics, val_losses,
+                _config_classify(config) or "val_acc" in metrics or "val_auc" in metrics)
+            if warning:
+                result["warning"] = warning
         result["metrics"] = metrics
         if metrics_path:
             result["metrics_path"] = str(metrics_path)
@@ -4566,7 +4645,12 @@ async def tfbs_config(
       VCNNBpnet   dilated CNN with a dense head; recommended default for
                   short (24 bp) windows because it is the architecture of
                   the NKX2-1 study, and its template carries those tuned
-                  hyperparameters.
+                  hyperparameters.  Its template uses a three-layer stack,
+                  dilations [1, 1, 2], instead of the study's five layers,
+                  because the five-layer stack can stay at a constant
+                  output on small classification sets at batch size 64,
+                  and model_params={"dilations": [1, 1, 2, 4, 8]} restores
+                  the study's five-layer stack.
       BPNet       BPNet-style dilated stack with a pooled dense head.
       BPNetReal   reference BPNet layout (residual dilated convolutions);
                   predicts one scalar per sequence, not a profile.
