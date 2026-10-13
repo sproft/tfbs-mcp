@@ -1182,11 +1182,12 @@ async def tfbs_binding_scan(
     if foldx is None:
         return _foldx_missing_error()
 
-    m = re.match(r"^(chr\w+):(\d+)-(\d+)$", region)
+    m = re.match(r"^([^\s:]+):(\d+)-(\d+)$", region)
     if not m:
         return _error(
-            f"Invalid region format: '{region}'. Expected chr:start-end",
-            "Use chrom:start-end with integer coordinates, e.g. chr14:36500000-36520000.",
+            f"Invalid region format: '{region}'. Expected chrom:start-end",
+            "Use chrom:start-end with integer coordinates and the contig name as it appears in the "
+            "genome FASTA, e.g. chr14:36500000-36520000.",
         )
     chrom, start, end = m.group(1), int(m.group(2)), int(m.group(3))
     if end <= start:
