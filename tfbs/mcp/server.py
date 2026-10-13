@@ -1195,6 +1195,94 @@ def _recorded_scaling(ckpt: Path, meta: dict) -> str | None:
     return ckpt.parent.name if ckpt.parent.name in _SCALING_METHODS else None
 
 
+def _checkpoint_training_scaling(ckpt: Path) -> tuple[str | None, bool | None]:
+    """(scaling_method, classify) a checkpoint was trained with; None where it records nothing.
+
+    Reads the records tfbs_load_model trusts, without building the model:
+    an inference checkpoint's own scaling block and hyper_parameters, or, for
+    a Lightning checkpoint, the data module's recorded scaling_method or the
+    scaling folder it was saved in (_recorded_scaling) and the model's
+    classify flag.  A file torch cannot read gives (None, None).
+    """
+    payload = _load_weights_only(ckpt)
+    if not isinstance(payload, dict):
+        return None, None
+    if _is_inference_payload(payload):
+        own = payload.get("scaling")
+        scaling = own.get("scaling_method") if isinstance(own, dict) else None
+        hparams = payload.get("hyper_parameters")
+    else:
+        meta = _checkpoint_meta(ckpt, payload)
+        scaling = _recorded_scaling(ckpt, meta)
+        hparams = meta["hyper_parameters"]
+    classify = hparams.get("classify") if isinstance(hparams, dict) else None
+    # Release the (possibly memory-mapped) file before returning.
+    del payload, hparams
+    return (scaling if scaling in _SCALING_METHODS else None,
+            classify if isinstance(classify, bool) else None)
+
+
+def _validate_scaling(ckpt: Path, data: Path, requested: str | None
+                      ) -> tuple[str | None, str | None, list[str], str | None]:
+    """(scaling_method, source, cautions, None), or (None, None, [], error) for tfbs_validate.
+
+    trainer.test() scores the model's outputs, which are on its training
+    scale, against labels put on scaling_method's scale, so the two must
+    agree: otherwise test_loss, and for a classifier test_acc and test_auc,
+    compare two different scales.  Without a requested method the
+    checkpoint's own is used.  When the checkpoint records none, the task
+    decides as in tfbs_config: "none" for a classifier (its classify flag,
+    else 0/1 labels in the dataset) and "standardize" otherwise.
+    """
+    if requested is not None and requested not in _SCALING_METHODS:
+        return None, None, [], _error(
+            f"Unknown scaling_method '{requested}'.",
+            f"Pass one of {list(_SCALING_METHODS)}, or omit scaling_method to use the "
+            "scaling the checkpoint was trained with. Nothing was submitted.")
+    recorded, classify = _checkpoint_training_scaling(ckpt)
+    binary = None
+    if classify is None and data.is_dir():
+        for split in ("test", "train"):
+            binary = _binary_labels(data / split / "labels.pt")
+            if binary is not None:
+                break
+    cautions: list[str] = []
+    if classify and recorded not in (None, "none"):
+        cautions.append(
+            f"{ckpt.name} is a classifier but records label scaling '{recorded}', so it was "
+            "trained against scaled 0/1 labels. It is validated on that scale, and its "
+            "test_acc and test_auc are not those of a classifier trained on 0/1 labels.")
+    if requested is None:
+        if recorded:
+            return recorded, "checkpoint", cautions, None
+        if classify is not None:
+            return ("none" if classify else "standardize"), "checkpoint classify flag", cautions, None
+        if binary:
+            return "none", "labels", cautions, None
+        cautions.append(
+            "The scaling could not be read from the checkpoint or from 0/1 labels, so "
+            "'standardize' is assumed; pass scaling_method if the model was trained otherwise.")
+        return "standardize", "default", cautions, None
+    if recorded and requested != recorded:
+        return None, None, [], _error(
+            f"scaling_method '{requested}' differs from '{recorded}', the scaling "
+            f"{ckpt.name} was trained with: trainer.test() scores the model's outputs on "
+            "its training scale, so the metrics would compare two different scales.",
+            f"Omit scaling_method, or pass scaling_method='{recorded}'. Nothing was submitted.",
+            checkpoint_scaling=recorded)
+    if recorded is None and classify and requested != "none":
+        return None, None, [], _error(
+            f"scaling_method '{requested}' cannot validate {ckpt.name}: it is a classifier, "
+            "whose binary cross-entropy loss, accuracy and ROC-AUC need the 0/1 labels unscaled.",
+            "Omit scaling_method (a classifier is validated with 'none') or pass "
+            "scaling_method='none'. Nothing was submitted.")
+    if recorded is None and classify is None and binary and requested != "none":
+        cautions.append(
+            f"Every label in {data} is 0 or 1, but scaling_method '{requested}' validates the "
+            "checkpoint as a regression model; omit scaling_method if it is a classifier.")
+    return requested, "argument", cautions, None
+
+
 def _load_checkpoint(path: Path, model_type: str, device: str, meta: dict):
     """(model, None) or (None, error JSON) for a Lightning checkpoint.
 
@@ -4411,7 +4499,7 @@ async def tfbs_validate(
     checkpoint_path: str,
     data_path: str,
     model_name: str = "VCNNBpnet",
-    scaling_method: str = "standardize",
+    scaling_method: str | None = None,
     output_file: str | None = None,
     partition: str | None = None,
     gpu_type: str | None = None,
@@ -4441,7 +4529,17 @@ async def tfbs_validate(
         model_name: Model class name (e.g. "VCNNBpnet", "RNN"); one that
             names no model class in tfbs.nn.models is an error before
             anything is submitted.
-        scaling_method: Label scaling ("standardize", "normalize", "none").
+        scaling_method: Label scaling the test labels are put on before
+            trainer.test() scores the model ("standardize", "normalize",
+            "none").  It must be the scaling the checkpoint was trained
+            with, because the model's outputs are on that scale.  Default:
+            read from the checkpoint (an inference checkpoint's scaling
+            block; a Lightning checkpoint's recorded data-module scaling,
+            or the scaling folder it was saved in).  When the checkpoint
+            records none: "none" for a classifier (its classify flag, else
+            0/1 labels in data_path) and "standardize" otherwise.  A value
+            that contradicts the checkpoint, or label scaling for a
+            classifier, is an error before anything is submitted.
         output_file: CSV file to append results to.  Defaults to
                      validation_results.csv in the results directory
                      (results_dir in tfbs_server_info).  Jobs that may
@@ -4460,8 +4558,10 @@ async def tfbs_validate(
         job_name: SLURM job name (default "tfbs_validate").
 
     Returns:
-        JSON with job_id, the generated sbatch script, and the
-        validation command.
+        JSON with job_id, the generated sbatch script, the validation
+        command, scaling_method and scaling_source (checkpoint, checkpoint
+        classify flag, labels, argument or default), and cautions when
+        there are any.
     """
     ckpt = Path(checkpoint_path).resolve()
     if not ckpt.exists():
@@ -4474,6 +4574,11 @@ async def tfbs_validate(
     err = _model_type_error(model_name, "model_name") or await asyncio.to_thread(
         _inference_checkpoint_error, {"checkpoint_path": str(ckpt)}, model_name, None,
         "model_name")
+    if err:
+        return err
+
+    scaling_method, scaling_source, cautions, err = await asyncio.to_thread(
+        _validate_scaling, ckpt, data, scaling_method)
     if err:
         return err
 
@@ -4532,6 +4637,10 @@ async def tfbs_validate(
     ))
 
     submit_result["mode"] = "validate"
+    submit_result["scaling_method"] = scaling_method
+    submit_result["scaling_source"] = scaling_source
+    if cautions:
+        submit_result["cautions"] = cautions
     submit_result["validate_command"] = validate_cmd
     submit_result["sbatch_script"] = sbatch_script
     return json.dumps(submit_result)
