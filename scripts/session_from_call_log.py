@@ -46,6 +46,28 @@ isCompactSummary lines, task notifications (origin.kind
 <command-message>, <local-command-stdout>, <local-command-caveat>,
 <task-notification>, <system-reminder> or "[Request interrupted".
 
+A prompt that another Claude Code session sent over cross-session messaging
+(a user line, or a queued_command attachment when it arrived while the
+session was working, with origin.kind "peer") is not skipped: it becomes a
+user step whose text is origin.body (else the text inside the
+<cross-session-message> wrapper), marked "source": "peer" with "peer" (the
+sending session's name) and "peer_from" (its address), because that prompt
+was written outside the recorded session and sent by another session. A
+prompt that arrived mid-turn stands where the model received it: at the
+time of the queue-operation remove or dequeue line whose commandUuid is the
+attachment's source_uuid (or whose deliveryId is its delivery_id), with the
+time it arrived kept as "arrived_at"; without such a line it stands at the
+time it arrived. Each prompt is expected once: a second copy from the same
+sender with the same text, within 5 s of the time the first arrived or was
+handed to the model, is dropped. A call of the
+client's own SendMessage tool with a non-empty message (the way the session
+answers such a prompt, but any SendMessage with message text counts) becomes
+an llm step with that message as its text, "via": "SendMessage" and "to",
+not a client step; when the client's tool_result for it is an error, the
+step also gets "is_error": true and "client_error_text", since the message
+may not have been delivered. converted_from counts both as peer_prompts and
+sendmessage_replies.
+
 --phases is a JSON object mapping a tool name (or an fnmatch pattern such as
 "tfbs_prepare_*") to a phase label; tools it does not name get the default
 phase below. --labels is a JSON object mapping a 1-based index among the
@@ -63,6 +85,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -87,6 +110,17 @@ MATCH_SLACK_SECONDS = 5.0
 HARNESS_PREFIXES = ("<command-name>", "<command-message>", "<local-command-stdout>",
                     "<local-command-caveat>", "<task-notification>", "<system-reminder>",
                     "[Request interrupted")
+# A prompt from another session, as the client shows it to the model; the
+# opening tag carries double-quoted attributes (from, from-name, from-mode,
+# hop-chain), and a ">" inside a quoted value does not end the tag. The text
+# runs to the last closing tag, so a prompt that quotes the closing tag is
+# kept whole.
+PEER_WRAPPER = re.compile(
+    r'<cross-session-message(?:\s(?:[^>"]|"[^"]*")*)?>(.*)</cross-session-message>', re.DOTALL)
+# The client's tool that sends a message to another session.
+REPLY_TOOL = "SendMessage"
+# Queue operations after which the client has handed a queued prompt to the model.
+QUEUE_DELIVERED = ("remove", "dequeue")
 
 
 # ---------------------------------------------------------------------------
@@ -171,17 +205,103 @@ def _injected_by_client(rec: dict) -> bool:
     return isinstance(origin, dict) and origin.get("kind") == "task-notification"
 
 
+def _peer_prompt(origin, wrapped: str) -> tuple[str, dict] | None:
+    """(text, step fields) of a prompt another session sent, else None.
+
+    origin is the line's origin object; the prompt is its body, else the
+    text inside the <cross-session-message> wrapper of wrapped (what the
+    client showed the model).
+    """
+    if not isinstance(origin, dict) or origin.get("kind") != "peer":
+        return None
+    body = origin.get("body")
+    text = body if isinstance(body, str) and body.strip() else ""
+    if not text:
+        found = PEER_WRAPPER.search(wrapped or "")
+        text = found.group(1).strip() if found else ""
+    if not text:
+        return None
+    return text, {"source": "peer", "peer": str(origin.get("name") or ""),
+                  "peer_from": str(origin.get("from") or "")}
+
+
+def _queue_deliveries(records: list[dict]) -> dict[tuple[str, str], datetime]:
+    """When the client handed each queued prompt to the model.
+
+    Keyed by ("command", commandUuid) and ("delivery", deliveryId) of the
+    queue-operation remove or dequeue lines; the earliest time wins.
+    """
+    handed: dict[tuple[str, str], datetime] = {}
+    for rec in records:
+        if rec.get("type") != "queue-operation" or rec.get("operation") not in QUEUE_DELIVERED:
+            continue
+        ts = parse_ts(rec.get("timestamp"))
+        if ts is None:
+            continue
+        for key, field in (("command", "commandUuid"), ("delivery", "deliveryId")):
+            value = rec.get(field)
+            if isinstance(value, str) and value and (
+                    (key, value) not in handed or ts < handed[(key, value)]):
+                handed[(key, value)] = ts
+    return handed
+
+
+def _handed_at(att: dict, handed: dict[tuple[str, str], datetime]) -> datetime | None:
+    """When a queued_command attachment's prompt reached the model, if logged."""
+    for key, field in (("command", "source_uuid"), ("delivery", "delivery_id")):
+        value = att.get(field)
+        if isinstance(value, str) and (key, value) in handed:
+            return handed[(key, value)]
+    return None
+
+
+def _same_prompt(a: dict, b: dict) -> bool:
+    """Whether two peer prompt events are copies of one prompt: same sender,
+    same text, and times no more than MATCH_SLACK_SECONDS apart."""
+    if a["text"] != b["text"] or a["extra"]["peer_from"] != b["extra"]["peer_from"]:
+        return False
+    return any(abs((s - t).total_seconds()) <= MATCH_SLACK_SECONDS
+               for s in a["times"] for t in b["times"])
+
+
 def read_transcript(records: list[dict]) -> tuple[list[dict], dict[str, dict], str | None]:
     """Events (user, llm, tool_use) in file order, tool results by id, client version."""
     events: list[dict] = []
     results: dict[str, dict] = {}
     version = None
+    handed = _queue_deliveries(records)
+    peers: list[dict] = []
+
+    def add_peer(ev: dict) -> None:
+        # A prompt is expected once; a second copy of it is dropped.
+        if any(_same_prompt(ev, p) for p in peers):
+            return
+        peers.append(ev)
+        events.append({k: v for k, v in ev.items() if k != "times"})
+
     for order, rec in enumerate(records):
         kind = rec.get("type")
-        if kind not in ("user", "assistant") or rec.get("isSidechain"):
+        if kind not in ("user", "assistant", "attachment") or rec.get("isSidechain"):
+            continue
+        ts = parse_ts(rec.get("timestamp"))
+        if kind == "attachment":
+            # A prompt from another session that arrived while this one was
+            # working is written as a queued_command attachment, stamped with
+            # the time it arrived; the model sees it only when the client
+            # hands it over (the queue-operation line with the same id).
+            att = rec.get("attachment")
+            if isinstance(att, dict) and att.get("type") == "queued_command":
+                peer = _peer_prompt(att.get("origin"), _block_text(att.get("prompt")))
+                if peer:
+                    text, extra = peer
+                    seen = _handed_at(att, handed)
+                    times = [t for t in (ts, seen) if t is not None]
+                    if seen is not None and ts is not None and seen != ts:
+                        extra = {**extra, "arrived_at": ts.isoformat(timespec="milliseconds")}
+                    add_peer({"kind": "user", "ts": seen or ts, "order": order,
+                              "text": text, "extra": extra, "times": times})
             continue
         version = version or rec.get("version")
-        ts = parse_ts(rec.get("timestamp"))
         message = rec.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         if kind == "user":
@@ -193,6 +313,11 @@ def read_transcript(records: list[dict]) -> tuple[list[dict], dict[str, dict], s
                             "ts": ts, "text": _block_text(b.get("content")),
                             "is_error": bool(b.get("is_error")),
                         }
+                continue
+            peer = _peer_prompt(rec.get("origin"), _block_text(content))
+            if peer:
+                add_peer({"kind": "user", "ts": ts, "order": order, "text": peer[0],
+                          "extra": peer[1], "times": [ts] if ts is not None else []})
                 continue
             if _injected_by_client(rec):
                 continue
@@ -220,9 +345,19 @@ def read_transcript(records: list[dict]) -> tuple[list[dict], dict[str, dict], s
                 pending.append(b.get("text", ""))
             elif b.get("type") == "tool_use":
                 flush()
+                name = str(b.get("name", ""))
+                tool_input = b.get("input") if isinstance(b.get("input"), dict) else {}
+                reply = tool_input.get("message") if name == REPLY_TOOL else None
+                if isinstance(reply, str) and reply.strip():
+                    # Text the session wrote to another session (its answer to
+                    # a peer's prompt); the id finds the client's tool_result.
+                    events.append({"kind": "llm", "ts": ts, "order": order, "text": reply,
+                                   "id": str(b.get("id")),
+                                   "extra": {"via": REPLY_TOOL,
+                                             "to": str(tool_input.get("to") or "")}})
+                    continue
                 events.append({"kind": "tool_use", "ts": ts, "order": order,
-                               "id": str(b.get("id")), "name": str(b.get("name", "")),
-                               "input": b.get("input") if isinstance(b.get("input"), dict) else {}})
+                               "id": str(b.get("id")), "name": name, "input": tool_input})
         flush()
     return events, results, version
 
@@ -446,7 +581,8 @@ def build_steps(calls: list[dict], events: list[dict] | None, results: dict[str,
                 phases: dict[str, str] | None) -> tuple[list[dict], dict]:
     """Steps in timestamp order, and counts of how the call log was matched."""
     stats = {"matched": 0, "matched_by_order": 0, "transcript_only": 0,
-             "call_log_only": 0, "calls_outside_window": 0, "client": 0}
+             "call_log_only": 0, "calls_outside_window": 0, "client": 0,
+             "peer_prompts": 0, "sendmessage_replies": 0}
     keyed: list[tuple[datetime, int, int, dict]] = []
     logged_tools = {str(c.get("tool")) for c in calls}
 
@@ -469,8 +605,18 @@ def build_steps(calls: list[dict], events: list[dict] | None, results: dict[str,
 
     for ev in filled:
         if ev["kind"] in ("user", "llm"):
+            extra = dict(ev.get("extra", {}))
+            stats["peer_prompts"] += extra.get("source") == "peer"
+            stats["sendmessage_replies"] += extra.get("via") == REPLY_TOOL
+            sent = results.get(ev["id"]) if "id" in ev else None
+            if sent is not None and sent["is_error"]:
+                # The client reported an error: the message may not have
+                # been delivered, so the step says so.
+                extra["is_error"] = True
+                extra["client_error_text"] = "" if _is_client_output_note(sent["text"]) \
+                    else str(sent["text"])
             keyed.append((ev["ts"], 0, ev["order"], {
-                "role": ev["kind"], "text": ev["text"],
+                "role": ev["kind"], "text": ev["text"], **extra,
                 "timestamp": ev["ts"].isoformat(timespec="milliseconds")}))
             continue
         tres = results.get(ev["id"])
@@ -623,12 +769,17 @@ def main(argv: list[str] | None = None) -> int:
                   args.commit, args.client, _load_labels(args.labels))
     _write_json(args.out, log)
     c = log["converted_from"]
+    failed = sum(1 for s in log["steps"]
+                 if s.get("via") == REPLY_TOOL and s.get("is_error") is True)
     print(f"wrote {args.out} with {len(log['steps'])} steps "
           f"({c['matched']} calls matched to the transcript, {c['matched_by_order']} of them "
           f"by order only; {c['transcript_only']} from the transcript only; "
           f"{c['call_log_only']} from the call log only; {c['calls_outside_window']} call-log "
           f"entries outside the transcript's time span left out; "
-          f"{c['client']} client tool calls)", file=sys.stderr)
+          f"{c['client']} client tool calls; {c['peer_prompts']} prompts sent by another "
+          f"session; {c['sendmessage_replies']} SendMessage messages shown as LLM text"
+          + (f", {failed} of them with a client error" if failed else "") + ")",
+          file=sys.stderr)
     return 0
 
 

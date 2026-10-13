@@ -618,3 +618,398 @@ def test_a_labels_file_that_is_not_a_string_map_is_an_error(tmp_path):
     with pytest.raises(SystemExit, match="--labels"):
         conv.main(["--call-log", str(_call_log(tmp_path)), "--labels", str(labels),
                    "--out", str(tmp_path / "out.json")])
+
+
+# ---------------------------------------------------------------------------
+# Prompts sent by another session, and the answers sent back
+# ---------------------------------------------------------------------------
+
+PEER_FROM = "bridge:session_01TEST"
+PEER_NAME = "Paper session"
+PEER_BODY = "Train a classifier on /d/peaks.bed.\nReport the ROC-AUC."
+PEER_ATTRS = f'from="{PEER_FROM}" from-name="{PEER_NAME}" from-mode="prompting"'
+HARNESS_ADVICE = ("This came from another Claude session, not typed by your user. "
+                  "After completing your current task, reply via SendMessage.")
+
+
+def _wrapped(body, attrs=PEER_ATTRS):
+    return f"<cross-session-message {attrs}>\n{body}\n</cross-session-message>"
+
+
+def _peer_origin(**fields):
+    origin = {"kind": "peer", "from": PEER_FROM, "name": PEER_NAME, "fromMode": "prompting",
+              "body": PEER_BODY, **fields}
+    return {k: v for k, v in origin.items() if v is not None}
+
+
+def _peer_line(ts, origin, wrapped_body=PEER_BODY, as_blocks=False):
+    """A prompt from another session as Claude Code writes it: a meta user line."""
+    content = ("Another Claude session sent a message:\n" + _wrapped(wrapped_body)
+               + "\n\n" + HARNESS_ADVICE)
+    if as_blocks:
+        content = [{"type": "text", "text": content}]
+    return _entry("user", ts, content, isMeta=True, origin=origin)
+
+
+def _queued_peer(ts, origin, wrapped_body=PEER_BODY, **att_fields):
+    """A prompt from another session that arrived while the session was working."""
+    attrs = f'from="{PEER_FROM}" hop-chain="a1,b2" from-name="{PEER_NAME}" from-mode="prompting"'
+    return {"type": "attachment", "timestamp": ts, "isSidechain": False, "version": "2.1.0",
+            "attachment": {"type": "queued_command", "prompt": _wrapped(wrapped_body, attrs),
+                           "commandMode": "prompt", "isMeta": True, "origin": origin,
+                           **att_fields}}
+
+
+def _queue_op(ts, operation, **fields):
+    """A queue-operation line, as Claude Code writes it for queued prompts."""
+    return {"type": "queue-operation", "operation": operation, "timestamp": ts,
+            "sessionId": "s1", **fields}
+
+
+def _send(uid, ts, tool_input, text=None):
+    blocks = [{"type": "text", "text": text}] if text else []
+    blocks.append({"type": "tool_use", "id": uid, "name": "SendMessage", "input": tool_input})
+    return _entry("assistant", ts, blocks)
+
+
+def _reply_input(message):
+    return {"to": PEER_FROM, "summary": "results", "message": message, "type": "message",
+            "content": message[:12] if isinstance(message, str) else ""}
+
+
+def _convert(conv, tmp_path, records):
+    transcript = _write_jsonl(tmp_path / "session.jsonl", records)
+    return conv.convert(_write_jsonl(tmp_path / "calls.jsonl", []), transcript)
+
+
+def test_a_prompt_from_another_session_is_a_user_step_with_its_body(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _peer_line("2026-10-09T10:00:00.000Z", _peer_origin(), wrapped_body="Wrapper copy."),
+        _entry("assistant", "2026-10-09T10:00:05.000Z", [{"type": "text", "text": "On it."}]),
+        _entry("user", "2026-10-09T10:00:09.000Z", "Typed prompt."),
+    ])
+    peer, llm, typed = out["steps"]
+    # origin.body verbatim: no wrapper, no harness advice.
+    assert peer == {"role": "user", "text": PEER_BODY, "source": "peer", "peer": PEER_NAME,
+                    "peer_from": PEER_FROM, "timestamp": "2026-10-09T10:00:00.000+00:00"}
+    assert llm == {"role": "llm", "text": "On it.", "timestamp": "2026-10-09T10:00:05.000+00:00"}
+    assert typed == {"role": "user", "text": "Typed prompt.",
+                     "timestamp": "2026-10-09T10:00:09.000+00:00"}
+    assert out["converted_from"]["peer_prompts"] == 1
+    assert out["recorded_at"] == "2026-10-09T10:00:00+00:00"
+
+
+@pytest.mark.parametrize("origin", [None, {"kind": "task-notification"}, {"kind": "human"},
+                                    "peer"])
+def test_a_meta_line_without_a_peer_origin_is_still_skipped(tmp_path, origin):
+    conv = _converter()
+    extra = {"isMeta": True} if origin is None else {"isMeta": True, "origin": origin}
+    out = _convert(conv, tmp_path, [
+        _entry("user", "2026-10-09T10:00:00.000Z", "Real prompt."),
+        _entry("user", "2026-10-09T10:00:01.000Z",
+               "Another Claude session sent a message:\n" + _wrapped(PEER_BODY), **extra),
+    ])
+    assert [s["text"] for s in out["steps"]] == ["Real prompt."]
+    assert out["converted_from"]["peer_prompts"] == 0
+
+
+@pytest.mark.parametrize("body", [None, "", " \n"])
+@pytest.mark.parametrize("as_blocks", [False, True])
+def test_without_a_body_the_prompt_is_the_text_inside_the_wrapper(tmp_path, body, as_blocks):
+    conv = _converter()
+    origin = _peer_origin(body=body)
+    assert ("body" in origin) is (body is not None)
+    out = _convert(conv, tmp_path, [
+        _peer_line("2026-10-09T10:00:00.000Z", origin, wrapped_body="Wrapped prompt.\nLine two.",
+                   as_blocks=as_blocks),
+    ])
+    (step,) = out["steps"]
+    assert step["text"] == "Wrapped prompt.\nLine two."
+    assert (step["source"], step["peer"], step["peer_from"]) == ("peer", PEER_NAME, PEER_FROM)
+
+
+def test_a_peer_line_with_neither_body_nor_wrapper_is_skipped(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _entry("user", "2026-10-09T10:00:00.000Z", "Real prompt."),
+        _entry("user", "2026-10-09T10:00:01.000Z", "Another Claude session sent a message.",
+               isMeta=True, origin=_peer_origin(body="")),
+    ])
+    assert [s["text"] for s in out["steps"]] == ["Real prompt."]
+    assert out["converted_from"]["peer_prompts"] == 0
+
+
+def test_a_prompt_that_arrived_mid_turn_is_a_user_step_at_its_own_time(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _peer_line("2026-10-09T10:00:00.000Z", _peer_origin()),
+        _entry("assistant", "2026-10-09T10:00:05.000Z",
+               [{"type": "tool_use", "id": "e1", "name": "Edit", "input": {"file_path": "/w/a"}}]),
+        _entry("user", "2026-10-09T10:00:12.000Z",
+               [{"type": "tool_result", "tool_use_id": "e1", "content": "ok"}]),
+        # Written after the Edit's lines, stamped with the time it arrived.
+        _queued_peer("2026-10-09T10:00:08.000Z", _peer_origin(body="Now validate it.")),
+        _queued_peer("2026-10-09T10:00:20.000Z", _peer_origin(body=None),
+                     wrapped_body="Then report the numbers."),
+        {"type": "attachment", "timestamp": "2026-10-09T10:00:21.000Z", "isSidechain": False,
+         "attachment": {"type": "deferred_tools_record", "entries": []}},
+    ])
+    assert [(s["role"], s.get("tool"), s.get("text")) for s in out["steps"]] == [
+        ("user", None, PEER_BODY),
+        ("tool", "Edit", None),
+        ("user", None, "Now validate it."),
+        ("user", None, "Then report the numbers."),
+    ]
+    queued = out["steps"][2]
+    assert queued["timestamp"] == "2026-10-09T10:00:08.000+00:00"
+    assert (queued["source"], queued["peer"], queued["peer_from"]) == ("peer", PEER_NAME, PEER_FROM)
+    assert out["converted_from"]["peer_prompts"] == 3
+
+
+def test_a_sendmessage_answer_is_an_llm_step_not_a_client_step(tmp_path):
+    conv = _converter()
+    answer = "The model reached ROC-AUC 0.93.\n\nCheckpoint: /w/run1/best.ckpt"
+    out = _convert(conv, tmp_path, [
+        _peer_line("2026-10-09T10:00:00.000Z", _peer_origin()),
+        _send("m1", "2026-10-09T10:00:10.000Z", _reply_input(answer), text="Sending the results."),
+        _entry("user", "2026-10-09T10:00:10.300Z",
+               [{"type": "tool_result", "tool_use_id": "m1", "content": "Message sent."}]),
+        _entry("assistant", "2026-10-09T10:00:11.000Z",
+               [{"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/w/n"}}]),
+        _entry("user", "2026-10-09T10:00:11.100Z",
+               [{"type": "tool_result", "tool_use_id": "r1", "content": "notes"}]),
+    ])
+    steps = out["steps"]
+    assert [(s["role"], s.get("tool")) for s in steps] == [
+        ("user", None), ("llm", None), ("llm", None), ("tool", "Read")]
+    assert steps[1]["text"] == "Sending the results." and "via" not in steps[1]
+    # The full message, not the client's short "content" preview.
+    assert steps[2] == {"role": "llm", "text": answer, "via": "SendMessage", "to": PEER_FROM,
+                        "timestamp": "2026-10-09T10:00:10.000+00:00"}
+    assert not any(s.get("tool") == "SendMessage" for s in steps)
+    c = out["converted_from"]
+    assert (c["client"], c["peer_prompts"], c["sendmessage_replies"]) == (1, 1, 1)
+
+
+def test_converted_from_counts_peer_prompts_and_sendmessage_replies(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _peer_line("2026-10-09T10:00:00.000Z", _peer_origin()),
+        _send("m1", "2026-10-09T10:00:10.000Z", _reply_input("First answer.")),
+        _queued_peer("2026-10-09T10:00:20.000Z", _peer_origin(body="Second prompt.")),
+        _send("m2", "2026-10-09T10:00:30.000Z", _reply_input("Second answer.")),
+        _send("m3", "2026-10-09T10:00:31.000Z", _reply_input("")),
+        _entry("user", "2026-10-09T10:00:40.000Z", "A typed follow-up."),
+    ])
+    c = out["converted_from"]
+    assert (c["peer_prompts"], c["sendmessage_replies"], c["client"]) == (2, 2, 1)
+    assert [s.get("source") for s in out["steps"] if s["role"] == "user"] == ["peer", "peer", None]
+    # Without a transcript there are neither.
+    plain = conv.convert(_call_log(tmp_path))["converted_from"]
+    assert (plain["peer_prompts"], plain["sendmessage_replies"]) == (0, 0)
+
+
+@pytest.mark.parametrize("tool_input", [
+    {"to": PEER_FROM, "summary": "s", "message": ""},
+    {"to": PEER_FROM, "summary": "s", "message": "  \n"},
+    {"to": PEER_FROM, "summary": "s"},
+    {"to": PEER_FROM, "message": {"type": "shutdown_request"}},
+])
+def test_a_sendmessage_without_message_text_stays_a_client_step(tmp_path, tool_input):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _send("m1", "2026-10-09T10:00:10.000Z", tool_input),
+        _entry("user", "2026-10-09T10:00:10.300Z",
+               [{"type": "tool_result", "tool_use_id": "m1", "content": "sent"}]),
+    ])
+    (step,) = out["steps"]
+    assert (step["role"], step["kind"], step["tool"]) == ("tool", "client", "SendMessage")
+    assert step["arguments"] == tool_input and step["phase"] == "Client"
+    c = out["converted_from"]
+    assert (c["client"], c["sendmessage_replies"]) == (1, 0)
+
+
+def test_the_summary_line_names_peer_prompts_and_sendmessage_replies(tmp_path, capsys):
+    conv = _converter()
+    transcript = _write_jsonl(tmp_path / "session.jsonl", [
+        _peer_line("2026-10-09T10:00:00.000Z", _peer_origin()),
+        _send("m1", "2026-10-09T10:00:10.000Z", _reply_input("Done.")),
+    ])
+    assert conv.main(["--call-log", str(_write_jsonl(tmp_path / "calls.jsonl", [])),
+                      "--transcript", str(transcript), "--out", str(tmp_path / "out.json")]) == 0
+    err = capsys.readouterr().err
+    assert "1 prompts sent by another session" in err
+    assert "1 SendMessage messages shown as LLM text)" in err
+
+
+# A prompt that arrived mid-turn stands where the model received it.
+
+def test_a_queued_prompt_stands_where_the_client_handed_it_to_the_model(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _peer_line("2026-10-09T10:00:00.000Z", _peer_origin()),
+        _queue_op("2026-10-09T10:00:08.000Z", "enqueue", content=_wrapped("Now validate it.")),
+        _entry("assistant", "2026-10-09T10:00:09.000Z",
+               [{"type": "text", "text": "Notes updated."},
+                {"type": "tool_use", "id": "e1", "name": "Edit", "input": {"file_path": "/w/a"}}]),
+        _entry("user", "2026-10-09T10:00:12.000Z",
+               [{"type": "tool_result", "tool_use_id": "e1", "content": "ok"}]),
+        _queue_op("2026-10-09T10:00:12.500Z", "remove", reason="absorbed_mid_turn",
+                  commandUuid="cmd-1", deliveryId="dlv-1", content=_wrapped("Now validate it.")),
+        _queued_peer("2026-10-09T10:00:08.000Z", _peer_origin(body="Now validate it."),
+                     source_uuid="cmd-1", delivery_id="dlv-1"),
+        _entry("assistant", "2026-10-09T10:00:20.000Z",
+               [{"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "ls"}}]),
+    ])
+    assert [(s["role"], s.get("tool"), s.get("text")) for s in out["steps"]] == [
+        ("user", None, PEER_BODY),
+        ("llm", None, "Notes updated."),
+        ("tool", "Edit", None),
+        ("user", None, "Now validate it."),
+        ("tool", "Bash", None),
+    ]
+    queued = out["steps"][3]
+    assert queued == {"role": "user", "text": "Now validate it.", "source": "peer",
+                      "peer": PEER_NAME, "peer_from": PEER_FROM,
+                      "arrived_at": "2026-10-09T10:00:08.000+00:00",
+                      "timestamp": "2026-10-09T10:00:12.500+00:00"}
+    assert "arrived_at" not in out["steps"][0]
+    assert out["converted_from"]["peer_prompts"] == 2
+
+
+@pytest.mark.parametrize("op, fields, att_fields", [
+    ("dequeue", {"commandUuid": "cmd-1"}, {"source_uuid": "cmd-1"}),
+    ("remove", {"deliveryId": "dlv-1"}, {"delivery_id": "dlv-1"}),
+])
+def test_a_queued_prompt_is_matched_by_command_or_delivery_id(tmp_path, op, fields, att_fields):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _queue_op("2026-10-09T10:00:06.000Z", op, commandUuid="other", deliveryId="other"),
+        _queue_op("2026-10-09T10:00:12.500Z", op, **fields),
+        _queued_peer("2026-10-09T10:00:08.000Z", _peer_origin(body="Now validate it."),
+                     **att_fields),
+    ])
+    (step,) = out["steps"]
+    assert step["timestamp"] == "2026-10-09T10:00:12.500+00:00"
+    assert step["arrived_at"] == "2026-10-09T10:00:08.000+00:00"
+
+
+def test_without_a_matching_queue_line_a_queued_prompt_stands_at_its_arrival(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        # An enqueue is not a delivery, and the remove names another command.
+        _queue_op("2026-10-09T10:00:08.000Z", "enqueue", commandUuid="cmd-1"),
+        _queue_op("2026-10-09T10:00:12.500Z", "remove", commandUuid="cmd-2"),
+        _queued_peer("2026-10-09T10:00:08.000Z", _peer_origin(body="Now validate it."),
+                     source_uuid="cmd-1"),
+    ])
+    (step,) = out["steps"]
+    assert step["timestamp"] == "2026-10-09T10:00:08.000+00:00"
+    assert "arrived_at" not in step
+
+
+# Each prompt is expected once.
+
+def test_a_prompt_written_as_both_a_user_line_and_an_attachment_is_one_step(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _queued_peer("2026-10-09T10:00:08.000Z", _peer_origin()),
+        _peer_line("2026-10-09T10:00:09.000Z", _peer_origin()),
+    ])
+    (step,) = out["steps"]
+    assert step["timestamp"] == "2026-10-09T10:00:08.000+00:00"
+    assert out["converted_from"]["peer_prompts"] == 1
+
+
+def test_a_delivered_copy_is_judged_by_the_delivery_time_too(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _queue_op("2026-10-09T10:00:30.000Z", "remove", commandUuid="cmd-1"),
+        _queued_peer("2026-10-09T10:00:08.000Z", _peer_origin(), source_uuid="cmd-1"),
+        # Written when the prompt was handed over, 22 s after it arrived.
+        _peer_line("2026-10-09T10:00:30.100Z", _peer_origin()),
+    ])
+    (step,) = out["steps"]
+    assert step["timestamp"] == "2026-10-09T10:00:30.000+00:00"
+
+
+@pytest.mark.parametrize("second", [
+    {"ts": "2026-10-09T10:00:09.000Z", "origin": {"body": "Another prompt."}},
+    {"ts": "2026-10-09T10:00:09.000Z", "origin": {"from": "bridge:session_02OTHER"}},
+    {"ts": "2026-10-09T10:00:20.000Z", "origin": {}},
+])
+def test_different_or_later_prompts_are_kept(tmp_path, second):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _queued_peer("2026-10-09T10:00:08.000Z", _peer_origin()),
+        _peer_line(second["ts"], _peer_origin(**second["origin"])),
+    ])
+    assert [s["role"] for s in out["steps"]] == ["user", "user"]
+    assert out["converted_from"]["peer_prompts"] == 2
+
+
+# The wrapper fallback.
+
+def test_a_quoted_gt_in_an_attribute_does_not_end_the_opening_tag(tmp_path):
+    conv = _converter()
+    attrs = f'from="{PEER_FROM}" from-name="A>B" from-mode="prompting"'
+    line = _entry("user", "2026-10-09T10:00:00.000Z",
+                  "Another Claude session sent a message:\n" + _wrapped("q", attrs)
+                  + "\n\n" + HARNESS_ADVICE,
+                  isMeta=True, origin=_peer_origin(body=None, name="A>B"))
+    (step,) = _convert(conv, tmp_path, [line])["steps"]
+    assert (step["text"], step["peer"]) == ("q", "A>B")
+
+
+def test_a_prompt_that_quotes_the_closing_tag_is_kept_whole(tmp_path):
+    conv = _converter()
+    body = "Explain why the converter stops at </cross-session-message> here."
+    (step,) = _convert(conv, tmp_path, [
+        _peer_line("2026-10-09T10:00:00.000Z", _peer_origin(body=None), wrapped_body=body),
+    ])["steps"]
+    assert step["text"] == body
+
+
+def test_a_sendmessage_to_a_session_that_sent_no_prompt_is_an_llm_step_too(tmp_path):
+    conv = _converter()
+    out = _convert(conv, tmp_path, [
+        _entry("user", "2026-10-09T10:00:00.000Z", "Tell the helper to start."),
+        _send("m1", "2026-10-09T10:00:10.000Z",
+              {"to": "helper", "summary": "start", "message": "Please start."}),
+    ])
+    assert out["steps"][1] == {"role": "llm", "text": "Please start.", "via": "SendMessage",
+                               "to": "helper", "timestamp": "2026-10-09T10:00:10.000+00:00"}
+    c = out["converted_from"]
+    assert (c["peer_prompts"], c["sendmessage_replies"], c["client"]) == (0, 1, 0)
+
+
+# A SendMessage whose tool_result is an error.
+
+def test_a_failed_sendmessage_keeps_the_client_error_on_its_llm_step(tmp_path, capsys):
+    conv = _converter()
+    transcript = _write_jsonl(tmp_path / "session.jsonl", [
+        _peer_line("2026-10-09T10:00:00.000Z", _peer_origin()),
+        _send("m1", "2026-10-09T10:00:10.000Z", _reply_input("First try.")),
+        _entry("user", "2026-10-09T10:00:10.300Z",
+               [{"type": "tool_result", "tool_use_id": "m1", "is_error": True,
+                 "content": "No session named bridge:session_01TEST."}]),
+        _send("m2", "2026-10-09T10:00:20.000Z", _reply_input("Second try.")),
+        _entry("user", "2026-10-09T10:00:20.300Z",
+               [{"type": "tool_result", "tool_use_id": "m2", "content": "Message sent."}]),
+    ])
+    calls = _write_jsonl(tmp_path / "calls.jsonl", [])
+    out = conv.convert(calls, transcript)
+    failed, sent = out["steps"][1:]
+    assert failed == {"role": "llm", "text": "First try.", "via": "SendMessage", "to": PEER_FROM,
+                      "is_error": True,
+                      "client_error_text": "No session named bridge:session_01TEST.",
+                      "timestamp": "2026-10-09T10:00:10.000+00:00"}
+    assert sent == {"role": "llm", "text": "Second try.", "via": "SendMessage", "to": PEER_FROM,
+                    "timestamp": "2026-10-09T10:00:20.000+00:00"}
+    c = out["converted_from"]
+    assert (c["client"], c["sendmessage_replies"]) == (0, 2)
+    assert conv.main(["--call-log", str(calls), "--transcript", str(transcript),
+                      "--out", str(tmp_path / "out.json")]) == 0
+    assert ("2 SendMessage messages shown as LLM text, 1 of them with a client error)"
+            in capsys.readouterr().err)
