@@ -1,0 +1,699 @@
+[
+ {
+  "role": "tool",
+  "tool": "tfbs_server_info",
+  "phase": "Setup",
+  "arguments": {},
+  "note": "Reports the environment the run uses: on_slurm true, gpu_count 1, default_partition equal to @PARTITION, project_root equal to @PROJECT, call_log set, and all four reference_files with exists true."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_list_models",
+  "phase": "Setup",
+  "arguments": {},
+  "note": "Lists the models loaded in a fresh server, which is an empty object."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_extract_loci",
+  "phase": "Data prep",
+  "arguments": {
+   "bed_path": "@DATA/nkx2-1_chipatlas.bed",
+   "in_window": 24,
+   "negatives": "gc_matched",
+   "output_dir": "@WORK/chipatlas_loci_24bp_gc"
+  },
+  "note": "Extracts 24 bp windows of every ChIP-Atlas peak with the genome taken from TFBS_GENOME_FASTA (no genome_fasta argument), plus one GC-matched negative per peak; good is num_peaks_extracted close to num_peaks_input (34,700 in the 2026-10-13 run), has_scores true and unfilled_bins empty."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_prepare_classification",
+  "phase": "Data prep",
+  "arguments": {
+   "positive_path": {
+    "$ref": "2.files.sequences"
+   },
+   "negative_path": {
+    "$ref": "2.files.negatives"
+   }
+  },
+  "note": "Combines the peak windows (label 1) and the GC-matched windows (label 0) into one balanced set; good is num_positive equal to num_negative."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_prepare_dataset",
+  "phase": "Data prep",
+  "arguments": {
+   "sequences_path": {
+    "$ref": "3.files.sequences"
+   },
+   "labels_path": {
+    "$ref": "3.files.labels"
+   }
+  },
+  "note": "Splits the classification set 64/16/20 into train, val and test; good is three non-zero counts and an output_dir ending in chipatlas_24bp_gc_dataset."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_prepare_regression",
+  "phase": "Data prep",
+  "arguments": {
+   "sequences_path": {
+    "$ref": "2.files.sequences"
+   },
+   "scores_path": {
+    "$ref": "2.files.scores"
+   },
+   "score_transform": "log2"
+  },
+  "note": "Turns the MACS2 scores of BED column 5 (scores.pt of the extraction) into log2(x+1) regression labels; good is num_sequences equal to the extracted peaks and a smaller spread in score_stats_after than in score_stats_before."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_preprocess",
+  "phase": "Data prep",
+  "arguments": {
+   "sequences": [
+    "GGCTGGAAGTTCAAGTTCTTACTC",
+    "GGGCTCCTCACTTGACCTTTGCTG",
+    "TACCCTGACACTTCAAATGACTGT",
+    "GGGAGGGAGCTCCAGTGTCAGCCA"
+   ],
+   "labels": [
+    10.37,
+    12.06,
+    10.36,
+    8.99
+   ],
+   "add_rc": true,
+   "output_path": "@WORK/preprocess"
+  },
+  "note": "One-hot encodes four inline 24 bp sites with labels and their reverse complements; good is shape [8, 4, 24] and files with seqs and labels."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_extract_loci",
+  "phase": "Data prep",
+  "arguments": {
+   "genome_fasta": "@GENOME",
+   "variants": [
+    "chr8:132862782:T>G"
+   ],
+   "in_window": 24,
+   "output_dir": "@WORK/variant_24bp"
+  },
+  "note": "Cuts the ref and alt 24 bp windows of chr8:132862782 T>G (the CACG core mutant of the TG promoter site, demo_chr8:830 in the bundled demo) from the explicit genome_fasta; good is num_extracted 1 and no ref_mismatches, which also confirms the genome is GRCh38 with chr names."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_extract_loci",
+  "phase": "Data prep",
+  "arguments": {
+   "bed_path": "@DATA/nkx2-1_chipatlas.bed",
+   "in_window": 24,
+   "max_sequences": 200,
+   "score_column": null,
+   "negatives": "gc_matched",
+   "random_seed": 7,
+   "output_dir": "@WORK/eval_loci_24bp_gc"
+  },
+  "note": "Samples 200 peaks (seed 7) with 200 GC-matched negatives as a small scoring set for tfbs_predict and tfbs_classify_metrics; good is 200 extracted windows and 200 negatives."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_extract_loci",
+  "phase": "Data prep",
+  "arguments": {
+   "bed_path": "@DATA/nkx2-1_chipatlas.bed",
+   "in_window": 300,
+   "max_sequences": 1000,
+   "score_column": null,
+   "output_dir": "@WORK/clinvar_loci_300bp"
+  },
+  "note": "Samples 1000 ChIP-Atlas peaks as 300 bp windows; its regions.bed is the small peak set that bounds the FoldX work of tfbs_disease_variant_validation; good is 1000 extracted windows."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_config",
+  "phase": "Training",
+  "arguments": {
+   "model_type": "VCNNBpnet",
+   "data_path": {
+    "$ref": "4.output_dir"
+   }
+  },
+  "note": "Writes the VCNNBpnet config for the dataset with classify inferred from the 0/1 labels; good is classify true, scaling_method none, input_length 24 and checkpoint_path @PROJECT/saved_models/chipatlas_24bp_gc/none/best_VCNNBpnet.ckpt."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_train",
+  "phase": "Training",
+  "arguments": {
+   "config_path": {
+    "$ref": "10.files.config"
+   },
+   "local": true,
+   "extra_args": [
+    "--trainer.max_epochs 6"
+   ],
+   "local_timeout": 1800
+  },
+  "note": "Trains the classifier on this node's GPU, capped at 6 epochs through extra_args; good is exit_code 0, checkpoint_exists true, epochs_run 6 or fewer, no warning and metrics.val_auc near 0.78 (0.787 at best epoch 2 on 2026-10-13)."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_config",
+  "phase": "Training",
+  "arguments": {
+   "model_type": "VCNNBpnet",
+   "data_path": {
+    "$ref": "4.output_dir"
+   },
+   "output_path": "@WORK/slurm_train/VCNNBpnet.yaml",
+   "checkpoint_dir": "@WORK/slurm_train/checkpoints",
+   "max_epochs": 3,
+   "patience": 2
+  },
+  "note": "Writes a second config with an explicit output_path, checkpoint_dir, max_epochs and patience, so the SLURM training job cannot overwrite the checkpoint the later steps use; good is checkpoint_path under @WORK/slurm_train/checkpoints."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_train",
+  "phase": "Training",
+  "arguments": {
+   "config_path": {
+    "$ref": "12.files.config"
+   },
+   "partition": "@PARTITION",
+   "max_time": "00:30:00",
+   "job_name": "tfbs_smoke_train",
+   "cpus_per_task": 4,
+   "mem": "16G",
+   "extra_args": [
+    "--data.num_workers 3"
+   ]
+  },
+  "note": "Submits the second config as a SLURM GPU job (config mode) with 3 DataLoader workers through extra_args; good is mode config, a job_id, and a generated_script with --partition=@PARTITION, --gres=gpu:1, --cpus-per-task=4 and --mem=16G."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_validate",
+  "phase": "Training",
+  "arguments": {
+   "checkpoint_path": {
+    "$ref": "11.checkpoint_path"
+   },
+   "data_path": {
+    "$ref": "4.output_dir"
+   },
+   "model_name": "VCNNBpnet",
+   "scaling_method": "none",
+   "output_file": "@WORK/validate/validation_smoke.csv",
+   "max_time": "00:30:00",
+   "job_name": "tfbs_smoke_validate"
+  },
+  "note": "Submits a test-split evaluation of the trained checkpoint to the partition from TFBS_SLURM_PARTITION (no partition argument); good is a job_id and an sbatch_script with --partition=@PARTITION whose command writes @WORK/validate/validation_smoke.csv."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_sweep",
+  "phase": "Training",
+  "arguments": {
+   "sweep_config": "@PROJECT/wandb_sweep_config.yaml",
+   "project_name": "tfbs-mcp-smoke",
+   "model": "VCNNBpnet",
+   "data_path": {
+    "$ref": "4.output_dir"
+   },
+   "data_name": "chipatlas_24bp_gc",
+   "scaling_method": "none",
+   "n_trials": 1
+  },
+  "note": "Checks the sweep tool up to its WandB requirement; without the tracking extra or a wandb login the answer is an error that names the fix and creates no sweep, and with a login it creates a one-trial sweep and submits one agent job.",
+  "expect_error": true
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_load_model",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "checkpoint_path": {
+    "$ref": "11.checkpoint_path"
+   },
+   "model_type": "VCNNBpnet"
+  },
+  "note": "Loads the Lightning checkpoint trained above; good is checkpoint_format lightning, classify true, input_length 24 and device cuda."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_load_model",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "flank",
+   "checkpoint_path": "@RELEASE/models/flank/vcnnbpnet.pt",
+   "model_type": "VCNNBpnet"
+  },
+  "note": "Loads the released FLANK inference checkpoint, the one format training here cannot produce and the only regression model of the run; good is checkpoint_format inference, classify false and scaling_params from the file."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_list_models",
+  "phase": "Analysis",
+  "arguments": {},
+  "note": "Lists the two loaded models; good is the keys trained and flank."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_predict",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "sequences_path": {
+    "$ref": "8.files.sequences"
+   }
+  },
+  "note": "Scores the 200 sampled peak windows from their .pt file; good is 200 scores between 0 and 1."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_predict",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "sequences_path": {
+    "$ref": "8.files.negatives"
+   }
+  },
+  "note": "Scores the 200 GC-matched negative windows; good is 200 scores, on average lower than the peak scores."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_classify_metrics",
+  "phase": "Analysis",
+  "arguments": {
+   "positive_scores": {
+    "$ref": "19.scores"
+   },
+   "negative_scores": {
+    "$ref": "20.scores"
+   }
+  },
+  "note": "Computes ROC-AUC and PR-AUC from the two score lists; good is roc_auc clearly above 0.5 (the sampled peaks overlap the training set, so it is optimistic)."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_predict",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "sequences": [
+    "TGACAAGTGTGGAAATCTGGGCTCCTCACTTGACCTTTGCTGGCCTGGTGGGGTTAGAGA"
+   ],
+   "window_mode": true
+  },
+  "note": "Scores a 60 bp sequence in window_mode; good is one best_scores value and a 24 bp best_sequences entry."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_predict",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "flank",
+   "sequences_path": {
+    "$ref": "7.files.ref_sequences"
+   }
+  },
+  "note": "Scores the variant's ref window with FLANK; good is units label (log2 fold change) and a score near 1.07, the value of the same window in the bundled demo."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_predict",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "flank",
+   "sequences_path": {
+    "$ref": "7.files.alt_sequences"
+   }
+  },
+  "note": "Scores the variant's alt window with FLANK; good is a score near -0.54, about 1.6 log2 units below the ref window."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_analyze",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "sequences": [
+    "GGCTGGAAGTTCAAGTTCTTACTC",
+    "GGGCTCCTCACTTGACCTTTGCTG",
+    "TACCCTGACACTTCAAATGACTGT",
+    "GGGAGGGAGCTCCAGTGTCAGCCA"
+   ],
+   "n_shuffles": 10
+  },
+  "note": "Runs DeepLiftShap with 10 shuffles on the four sites; good is shape [4, 4, 24] and an attributions.pt file."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_mutagenesis",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "sequences_path": {
+    "$ref": "6.files.seqs"
+   }
+  },
+  "note": "Runs saturation mutagenesis on the .pt file tfbs_preprocess wrote (sites plus reverse complements); good is shape [8, 4, 24] and an ism_scores.pt file."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_marginalize",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "sequences": null,
+   "motif": "CACTTGA",
+   "n_background": 20
+  },
+  "note": "Inserts the NKX2-1 core CACTTGA into 20 random backgrounds; good is 20 delta_predictions and, for a classifier that learned the motif, a positive mean_delta."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_seqlets",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "sequences": [
+    "GGCTGGAAGTTCAAGTTCTTACTC",
+    "GGGCTCCTCACTTGACCTTTGCTG",
+    "TACCCTGACACTTCAAATGACTGT",
+    "GGGAGGGAGCTCCAGTGTCAGCCA"
+   ],
+   "n_shuffles": 10,
+   "motif_file": "@MOTIF"
+  },
+  "note": "Calls seqlets on the four sites and annotates them against @MOTIF with TOMTOM; good is a seqlets.tsv file and no annotation_error (num_seqlets may be 0 with a note)."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_epistasis",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "flank",
+   "sequence": {
+    "$ref": "7.variants.records.0.ref_window"
+   },
+   "positions": [
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+   ]
+  },
+  "note": "Scores pairwise epistasis over positions 8 to 15 of the variant's ref window with FLANK; good is num_pairs_analyzed 28, num_double_mutants 252 and units label."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_conv_filters",
+  "phase": "Analysis",
+  "arguments": {
+   "model_id": "trained",
+   "sequences": [
+    "GGCTGGAAGTTCAAGTTCTTACTC",
+    "GGGCTCCTCACTTGACCTTTGCTG",
+    "TACCCTGACACTTCAAATGACTGT",
+    "GGGAGGGAGCTCCAGTGTCAGCCA"
+   ],
+   "top_n_filters": 10,
+   "top_k_subsequences": 5
+  },
+  "note": "Summarises the first-layer filters on the four sites; good is num_pfms above 0 and the three files filter_summary, meme and top_subsequences."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_fimo",
+  "phase": "Analysis",
+  "arguments": {
+   "sequences": [
+    "GGCTGGAAGTTCAAGTTCTTACTC",
+    "GGGCTCCTCACTTGACCTTTGCTG",
+    "TACCCTGACACTTCAAATGACTGT",
+    "GGGAGGGAGCTCCAGTGTCAGCCA",
+    "TGACAAGTGTGGAAATCTGGGCTCCTCACTTGACCTTTGCTGGCCTGGTGGGGTTAGAGA"
+   ],
+   "motif_file": "@MOTIF",
+   "threshold": 0.001
+  },
+  "note": "Scans the four sites and the 60 bp sequence with @MOTIF at p < 1e-3; good is backend meme on the cluster (memelite without the fimo program) and total_hits above 0."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_fetch_structure",
+  "phase": "Structure",
+  "arguments": {
+   "pdb_id": "9U19",
+   "uniprot_id": "P43699"
+  },
+  "note": "Downloads PDB 9U19 from RCSB, with AlphaFold DB P43699 as the fallback; good is source pdb and has_dna true, while a node without outbound HTTPS returns an error listing both attempts."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_binding_energy",
+  "phase": "Structure",
+  "arguments": {
+   "structure_path": "@PDB",
+   "repair": false,
+   "chains_protein": "A",
+   "chains_dna": "C,D"
+  },
+  "note": "Runs FoldX AnalyseComplex on the registered repaired complex without repairing it again, protein chain A against DNA chains C and D (the chain IDs of the repaired NKX2-1 complex of the study; 9U19 from RCSB has protein C and DNA A,B); good is a negative interaction_energy and repaired_structure_path null."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_binding_scan",
+  "phase": "Structure",
+  "arguments": {
+   "structure_path": "@PDB",
+   "genome_fasta": "@GENOME",
+   "region": "chr8:132862776-132862800",
+   "output_dir": "@WORK/binding_scan"
+  },
+  "note": "Scores the one window of the 24 bp region (window = the 11 bp DNA of the structure, step 50), CTCACTTGACC at the TG promoter, which holds the NKX2-1 core CACTTGA and the step 7 variant position, with FoldX BuildModel and AnalyseComplex; good is num_windows 1, num_scored 1 and a bigWig file."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_chipseq_benchmark",
+  "phase": "Validation",
+  "arguments": {
+   "intersect_dir": "@DATA/chipatlas_intersect",
+   "output_dir": "@WORK/chipseq_benchmark",
+   "pos_tf": "NKX2-1",
+   "neg_tfs": [
+    "GATA1",
+    "MYOD1",
+    "NKX2-5",
+    "RXRA"
+   ],
+   "models_dir": "saved_models",
+   "datasets": [
+    "chipatlas_24bp_gc"
+   ],
+   "model_type": "VCNNBpnet",
+   "max_sequences": 2000,
+   "slurm": false
+  },
+  "note": "Runs the NN-only ChIP-Atlas benchmark directly, finding the trained checkpoint through the models_dir lookup (saved_models/chipatlas_24bp_gc, falling back from standardize to none with a warning); good is mode direct and classification_vs_negatives.csv among the files."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_chipseq_method_comparison",
+  "phase": "Validation",
+  "arguments": {
+   "intersect_dir": "@DATA/chipatlas_intersect",
+   "output_dir": "@WORK/method_comparison",
+   "pos_tf": "NKX2-1",
+   "neg_tfs": [
+    "GATA1"
+   ],
+   "checkpoints": {
+    "trained": {
+     "$ref": "11.checkpoint_path"
+    }
+   },
+   "model_type": "VCNNBpnet",
+   "n_per_tf": 20,
+   "foldx_workers": 24,
+   "slurm": false
+  },
+  "note": "Runs NN, FIMO and FoldX on 20 windows each of NKX2-1 and GATA1 directly, with the motif and PDB taken from TFBS_MOTIF_FILE and TFBS_FOLDX_PDB; good is mode direct and an auc_summary.csv with a FoldX row (or at least non-empty FoldX values in raw_scores.csv), since the pipeline skips FoldX without an error when foldx is not on the server's PATH and turns a failed FoldX run into NaN, so is_error false alone does not show that FoldX ran."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_remap_validation",
+  "phase": "Validation",
+  "arguments": {
+   "remap_bed": "@DATA/nkx2-1_remap2022.bed",
+   "output_dir": "@WORK/remap_validation",
+   "checkpoints": {
+    "trained": {
+     "$ref": "11.checkpoint_path"
+    }
+   },
+   "score_min": 4,
+   "max_positives": 20,
+   "negative_mode": "shuffle",
+   "model_type": "VCNNBpnet",
+   "foldx_workers": 24,
+   "slurm": false
+  },
+  "note": "Runs the ReMap validation directly on 20 peaks seen in at least 4 experiments against their shuffled copies, with motif, PDB and genome from the environment; good is a summary with rows NN trained, FIMO and FoldX, each with n_pos 20 and n_neg 20, and the stdout line FoldX OK reporting pos 20/20 and neg 20/20, since a failed FoldX run becomes NaN without an error (the FoldX row needs at least 5 scored on each side)."
+ },
+ {
+  "role": "tool",
+  "tool": "tfbs_disease_variant_validation",
+  "phase": "Validation",
+  "arguments": {
+   "peaks_bed": {
+    "$ref": "9.files.regions"
+   },
+   "output_dir": "@WORK/clinvar_validation",
+   "clinvar_vcf": "@CLINVAR",
+   "nn_models": {
+    "trained": {
+     "$ref": "11.checkpoint_path"
+    }
+   },
+   "model_type": "VCNNBpnet",
+   "peak_confidence": 1,
+   "foldx_workers": 24,
+   "slurm": false
+  },
+  "note": "Runs the ClinVar check directly on the 1000 sampled peak windows with NN, FIMO (motif from the environment) and FoldX (PDB from the environment); good is mode direct with clinvar_snvs.csv, summary_all_methods.csv and non-NaN foldx_ddG values in combined_results.csv, since the pipeline writes NaN FoldX columns without an error when foldx is not on the server's PATH or a FoldX run fails; the summary has rows only for methods with at least 10 scored variants and both classes present."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_status",
+  "phase": "SLURM",
+  "arguments": {
+   "job_id": {
+    "$ref": "13.job_id"
+   }
+  },
+  "note": "Asks the scheduler about the training job submitted about half an hour earlier; good is a state such as COMPLETED, RUNNING or PENDING (a long GPU queue)."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_logs",
+  "phase": "SLURM",
+  "arguments": {
+   "job_id": {
+    "$ref": "13.job_id"
+   },
+   "log_type": "both",
+   "tail": 20
+  },
+  "note": "Reads both logs of the training job; good is log_sources naming where each file was found and, once the job has run, Lightning output in the content."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_watch",
+  "phase": "SLURM",
+  "arguments": {
+   "job_id": {
+    "$ref": "14.job_id"
+   },
+   "check_interval": "10m",
+   "context": "tfbs_validate smoke test of the trained classifier"
+  },
+  "note": "Requests monitoring of the validation job; good is check_interval_seconds 600, a next_check slurm_status call and the list of terminal_states."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_logs",
+  "phase": "SLURM",
+  "arguments": {
+   "job_id": {
+    "$ref": "14.job_id"
+   },
+   "log_type": "both",
+   "tail": 20
+  },
+  "note": "Reads both logs of the validation job, which tfbs_validate writes next to its CSV; good is paths under @WORK/validate."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_submit",
+  "phase": "SLURM",
+  "arguments": {
+   "script_path": "@SCRIPT",
+   "args": [
+    "20"
+   ],
+   "sbatch_flags": [
+    "--job-name=tfbs_smoke_submit"
+   ]
+  },
+  "note": "Submits the trivial @SCRIPT with one argument and a job name flag; good is a job_id and a submit_command that ends in the script path and 20."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_status",
+  "phase": "SLURM",
+  "arguments": {
+   "job_id": {
+    "$ref": "43.job_id"
+   }
+  },
+  "note": "Checks the trivial job right after submission; good is a state, usually PENDING or RUNNING."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_submit",
+  "phase": "SLURM",
+  "arguments": {
+   "script_body": "#SBATCH --job-name=tfbs_smoke_cancel\n#SBATCH --time=00:15:00\n#SBATCH --mem=100M\n#SBATCH --cpus-per-task=1\nsleep 600\n",
+   "working_dir": "@WORK"
+  },
+  "note": "Submits a ten-minute sleep given as script_body (without a #! line, which the tool adds) from @WORK; good is a job_id and a script_path of the temporary file."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_cancel",
+  "phase": "SLURM",
+  "arguments": {
+   "job_id": {
+    "$ref": "45.job_id"
+   }
+  },
+  "note": "Cancels the sleep job; good is cancelled true."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_status",
+  "phase": "SLURM",
+  "arguments": {
+   "job_id": {
+    "$ref": "45.job_id"
+   }
+  },
+  "note": "Checks the cancelled job; good is state CANCELLED (or a completing state seconds after the cancel)."
+ },
+ {
+  "role": "tool",
+  "tool": "slurm_logs",
+  "phase": "SLURM",
+  "arguments": {
+   "job_id": {
+    "$ref": "43.job_id"
+   },
+   "log_type": "stdout",
+   "tail": 20
+  },
+  "note": "Reads the stdout of the trivial job; good is its log path in the script's directory, with content once the job has run and a not-found note while it is still pending."
+ }
+]
