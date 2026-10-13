@@ -468,10 +468,10 @@
   "arguments": {
    "structure_path": "@PDB",
    "repair": false,
-   "chains_protein": "C",
-   "chains_dna": "A,B"
+   "chains_protein": "A",
+   "chains_dna": "C,D"
   },
-  "note": "Runs FoldX AnalyseComplex on the registered repaired complex without repairing it again, protein chain C against DNA chains A and B (the 9U19 chain IDs); good is a negative interaction_energy and repaired_structure_path null."
+  "note": "Runs FoldX AnalyseComplex on the registered repaired complex without repairing it again, protein chain A against DNA chains C and D (the chain IDs of the repaired NKX2-1 complex of the study; 9U19 from RCSB has protein C and DNA A,B); good is a negative interaction_energy and repaired_structure_path null."
  },
  {
   "role": "tool",

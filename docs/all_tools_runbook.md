@@ -1,6 +1,6 @@
 # Smoke test of all 33 tools on a SLURM cluster
 
-`docs/all_tools_plan.json` is a plan of 49 tool calls that calls each of the 33 tools of the server at least once, on real NKX2-1 data, in about half an hour on one GPU node. `scripts/record_demo_session.py` plays it: it starts `tfbs-mcp` over the stdio protocol as an AI app does, sends the calls in order, takes later arguments from earlier results (`$ref`), and writes every argument, result and wall time to one JSON log. No LLM is involved, so a failure in the log is a failure of the server, its pipelines or the environment, never of a client's choice of arguments.
+`docs/all_tools_plan.json` is a plan of 49 tool calls that calls each of the 33 tools of the server at least once, on real NKX2-1 data, in about 50 minutes on one GPU node. `scripts/record_demo_session.py` plays it: it starts `tfbs-mcp` over the stdio protocol as an AI app does, sends the calls in order, takes later arguments from earlier results (`$ref`), and writes every argument, result and wall time to one JSON log. No LLM is involved, so a failure in the log is a failure of the server, its pipelines or the environment, never of a client's choice of arguments.
 
 This page says what to stage before the run, the command, what each phase proves, which steps are expected to fail where, and how to read the log. It was written for the BIH cluster (GPU partition `gpu`, the NKX2-1 project data under `/sc-projects/sc-proj-cc17-P09_TFBS`); the paths below are the ones that the 2026-10-13 recording session reported, so check them before you use them.
 
@@ -181,7 +181,7 @@ env | grep -i _proxy
 ```
 
 - The genome slice must read `TGGGCTCCTCACTTGACCTTTGCT` (upper or lower case). It is the 24 bp window of the variant chr8:132862782 T>G that step 7 extracts; it equals position 830 of the bundled demo genome, so a different slice means another genome build and step 7 reports a `ref_mismatch`.
-- The chain listing must show protein residues (ALA, ARG, ...) on chain C and DNA residues (DA, DC, DG, DT) on chains A and B: step 33 passes `chains_protein="C"`, `chains_dna="A,B"`, the chain IDs of PDB entry 9U19. If the file uses other IDs, change those two values in step 33 of the plan.
+- The chain listing must show protein residues (ALA, ARG, ...) on chain A and DNA residues on chains C and D (in the repaired file they are named A, C, G, T, not DA, DC, DG, DT): step 33 passes `chains_protein="A"`, `chains_dna="C,D"`, the chain IDs of the repaired NKX2-1 complex, which differ from those of PDB entry 9U19 (protein C, DNA A and B). If the file uses other IDs, change those two values in step 33 of the plan.
 - If the proxy listing prints anything, step 32 needs it to reach RCSB; the command in section 3 passes the usual proxy variables on, because the recorder starts the server with a minimal environment.
 
 ## 3. The run
@@ -296,23 +296,25 @@ If a check fails, look at steps 33 and 34, which call FoldX directly and return 
 
 For the validations, also look at the files under `$T/work/<step>/` (for example `remap_validation/summary.csv`, `clinvar_validation/summary_all_methods.csv`); for the SLURM jobs, `squeue -u $USER` after the run shows what is still queued.
 
-## 7. Expected runtime
+## 7. Runtime
 
-On a GPU node with 32 CPUs like the L40S node of 2026-10-13, estimated from that session's timings and the FoldX cost of about 2.5 to 3 minutes per run with 24 runs in parallel:
+Measured on 2026-10-13 on node s-sc-gpu011 of the BIH cluster (one NVIDIA A100 40 GB, 25 cores, allocation 11178554) with tfbs-mcp 6fbec08 and the INTERSECTIONS directory linked unmerged (3.69 million weighted lines, about 132 s of merging by the formula of 2.3); every one of the 49 steps succeeded, WandB was logged in, so step 15 created a one-trial sweep:
 
-| Steps | Expected time |
+| Steps | Measured time |
 |---|---|
-| server start | under 1 minute |
-| 0 to 9, data prep (34,700 windows and negatives) | under 1 minute |
-| 10 to 15, training (6 epochs of 44,416 windows) and submissions | about 1 minute |
-| 16 to 31, analysis | about 1 minute (on the workstation the seqlet step took 50 s in a first run and 4 s in the next, the other analysis calls under 2 s each) |
-| 32 to 34, structure (one AnalyseComplex, one BuildModel window) | 2 to 5 minutes |
-| 35, benchmark (5 TFs, up to 2,000 windows each) | an estimate, not measured on the cluster files: about 1 minute for loading and scoring, plus the merging of the intersect files, which depends on their size and not on `max_sequences` (2.3) |
-| 36, method comparison (two FoldX batches of 20) | 5 to 8 minutes, plus merging the NKX2-1 and GATA1 files once (2.3) |
-| 37, ReMap (two FoldX batches of 20) | 5 to 8 minutes |
-| 38, ClinVar (two FoldX runs per variant; about 10 to 40 variants expected in 1,000 windows) | 5 to 12 minutes |
-| 39 to 48, SLURM | under 1 minute |
-| total | about 25 to 40 minutes, plus the merge time of 2.3 if the intersect files are large and not pre-merged |
+| server start | 22.6 s |
+| 0 to 9, data prep (34,700 windows and negatives) | about 12 s (the GC-matched extraction 10.8 s) |
+| 10 to 15, training (6 epochs of 44,416 windows) and submissions | 52 s (local training 45.4 s, the sweep 6.2 s) |
+| 16 to 31, analysis | about 48 s (seqlets 45.6 s, every other call under 1.1 s) |
+| 32 to 34, structure | 272 s (one BuildModel window 270.5 s, AnalyseComplex 1.0 s) |
+| 35, benchmark (4 negative TFs, 2,000 windows each) | 135.8 s |
+| 36, method comparison (two FoldX batches of 20) | 689.8 s |
+| 37, ReMap (two FoldX batches of 20) | 677.1 s |
+| 38, ClinVar (44 variants in the 1,000 sampled windows, two FoldX runs each) | 1098.0 s |
+| 39 to 48, SLURM | under 1 s each; the submitted jobs finished on their own within a minute |
+| total | about 50 minutes |
+
+The estimate made before that run (25 to 40 minutes) was too low for the three FoldX validations, which took 11 to 18 minutes each; a node with fewer than 24 cores stretches them further.
 
 ## 8. The local dry run
 
