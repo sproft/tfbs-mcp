@@ -82,7 +82,7 @@ The server imports PyTorch, Lightning, scikit-learn, captum, tangermeme and the 
 
 ## Recording a session
 
-`scripts/record_demo_session.py` (in a clone; it is not installed) starts `tfbs-mcp` over the stdio protocol as an AI app does, runs a plan of user messages, the assistant's stated plan and tool calls, and writes every call's arguments, full result and wall time to a JSON log, together with the seconds from launch to the server's first answer. The startup time quoted in the README was measured this way. The application note's Figure 2 is the session log recorded this way with the released FLANK checkpoint (doi:10.5281/zenodo.21399578) and the bundled demo data, so no part of it is typed in by hand.
+`scripts/record_demo_session.py` (in a clone; it is not installed) starts `tfbs-mcp` over the stdio protocol as an AI app does, runs a plan of user messages, the assistant's stated plan and tool calls, and writes every call's arguments, full result and wall time to a JSON log, together with the seconds from launch to the server's first answer. The startup time quoted in the README was measured this way, and so was an earlier draft of the application note's Figure 2, with the released FLANK checkpoint (doi:10.5281/zenodo.21399578) and the bundled demo data; the published Figure 2 is a Claude Code session converted by `scripts/session_from_call_log.py` (below).
 
 The demo directory is found with `python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())"`. Asking `tfbs.data.demo` itself does not work: it is a namespace package (it has no `__init__.py`), so its `__file__` is `None`.
 
@@ -93,7 +93,7 @@ python scripts/record_demo_session.py --server "$(which tfbs-mcp)" --plan plan.j
 
 The plan is a JSON list of steps: `{"role": "user", "text": ...}`, `{"role": "llm", "text": ...}` or `{"role": "tool", "tool": ..., "arguments": {...}}`. A tool argument `{"$ref": "3.files.sequences"}` takes that value from the result of step 3. `--set KEY=VALUE` (repeatable) replaces `@KEY` by `VALUE` in every string of the plan before the references are resolved, so one plan runs on any machine, e.g. `"@DEMO/demo_peaks.bed"`. `--env KEY=VALUE` sets a variable for the server; with `TFBS_CALL_LOG` the server's own call log, which holds every call's arguments and result, is copied into the recording. A step that fails, such as a `$ref` naming a key the earlier result does not have (the log entry then lists the keys it does have) or an MCP protocol error, is logged as an error entry and the run goes on, and the log is written even when the run crashes.
 
-The plan behind the application note's Figure 2 is `docs/demo_session_plan.json`. It needs three `--set` values: `DEMO`, the demo directory; `RELEASE`, the unpacked Zenodo archive (doi:10.5281/zenodo.21399578) or a clone of the nkx2-1-tfbs-variants repository, from which it loads `models/flank/vcnnbpnet.pt`; and `WORK`, a directory for the files the tools write. Its last call fetches PDB entry 9U19 from RCSB, so it needs internet access. Run from the repository root:
+The scripted demo session is `docs/demo_session_plan.json`. It needs three `--set` values: `DEMO`, the demo directory; `RELEASE`, the unpacked Zenodo archive (doi:10.5281/zenodo.21399578) or a clone of the nkx2-1-tfbs-variants repository, from which it loads `models/flank/vcnnbpnet.pt`; and `WORK`, a directory for the files the tools write. Its last call fetches PDB entry 9U19 from RCSB, so it needs internet access. Run from the repository root:
 
 ```bash
 RUN=/tmp/figure2 && mkdir -p "$RUN/project" "$RUN/work"
@@ -105,6 +105,10 @@ python scripts/record_demo_session.py --server "$(which tfbs-mcp)" \
     --set RELEASE=/path/to/nkx2-1-tfbs-variants --set WORK="$RUN/work" \
     --timeout 900
 ```
+
+### The smoke-test plan
+
+`docs/all_tools_plan.json` is a plan for the same recorder that calls every one of the 33 tools at least once, in 49 steps, on the NKX2-1 data of a SLURM cluster (a ChIP-Atlas and a ReMap peak BED, the ChIP-Atlas intersect files, hg38, the JASPAR motif, the ClinVar VCF, the repaired NKX2-1 complex, FoldX and fimo on PATH); later steps take their inputs from earlier results. `docs/all_tools_runbook.md` says what to stage, gives the command with every `--set` and `--env`, lists which steps are expected to fail in which environment, and shows how to read the log; `tests/test_all_tools_plan.py` checks the plan against the live tool schemas. On 2026-10-13 all 49 steps succeeded on the BIH cluster in about 50 minutes (the runbook has the per-phase times). A failed step in such a run is a failure of the server, a pipeline or the environment, never of a client's choice of arguments.
 
 ### The call log
 
@@ -231,7 +235,9 @@ docs/troubleshooting.md   Symptoms, causes and fixes
 docs/tools.md             All 33 tools by layer, one line each
 docs/figure1.png          The task figure at the top of the README
 docs/architecture.png     The layer diagram on docs/tools.md
-docs/demo_session_plan.json The plan behind the application note's Figure 2
+docs/demo_session_plan.json A scripted demo session on the bundled data
+docs/all_tools_plan.json  A smoke test that calls all 33 tools (see The smoke-test plan)
+docs/all_tools_runbook.md How to run that plan on a SLURM cluster
 tests/                    pytest suite
 ```
 

@@ -159,7 +159,9 @@ def test_development_docs_say_how_to_find_the_demo_and_what_figure_2_is():
     text = " ".join((REPO / "docs" / "development.md").read_text(encoding="utf-8").split())
     assert 'python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())"' in text
     assert "namespace package" in text and "`__file__` is `None`" in text
-    assert "Figure 2 is the session log recorded this way with the released FLANK checkpoint" in text
+    assert ("an earlier draft of the application note's Figure 2, with the released FLANK checkpoint" in text)
+    assert "the published Figure 2 is a Claude Code session converted by `scripts/session_from_call_log.py`" in text
+    assert "`docs/all_tools_plan.json` is a plan for the same recorder" in text
     assert demo.__file__ is None and (demo_dir() / "demo_peaks.bed").is_file()
 
 
@@ -191,7 +193,7 @@ def test_development_docs_give_the_command_that_records_figure_2():
 
     plan_text = (REPO / "docs" / "demo_session_plan.json").read_text(encoding="utf-8")
     text = " ".join((REPO / "docs" / "development.md").read_text(encoding="utf-8").split())
-    section = text.split("The plan behind the application note's Figure 2 is")[1]
+    section = text.split("The scripted demo session is `docs/demo_session_plan.json`.")[1]
     command = section.split("```bash")[1].split("```")[0]
     assert '--server "$(which tfbs-mcp)"' in command
     assert "--plan docs/demo_session_plan.json" in command

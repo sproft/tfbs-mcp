@@ -541,6 +541,26 @@ def test_binding_scan_missing_inputs():
     assert result["fix"]
 
 
+def test_binding_scan_region_format(scan_inputs, fake_foldx, fake_bigwig, tmp_path):
+    """Any contig name is accepted before the colon; malformed regions are refused."""
+    from tfbs.mcp.foldx_tools import tfbs_binding_scan
+
+    pdb, fasta, seq = scan_inputs
+    # The same genome under an Ensembl-style contig name, without the chr prefix.
+    fasta8 = os.path.join(str(tmp_path), "genome8.fa")
+    with open(fasta, encoding="utf-8") as src, open(fasta8, "w", newline="\n") as dst:
+        dst.write(src.read().replace(">chr1\n", ">8\n", 1))
+    result = _run(tfbs_binding_scan(structure_path=pdb, genome_fasta=fasta8, region="8:100-1100",
+                                    output_dir=str(tmp_path / "scan8")))
+    assert "error" not in result, result
+    assert result["num_windows"] >= 1
+    for bad in ("chr1", "chr1:100", "chr1:a-b", "chr1:100-", "chr:1:100-1100", "chr1 :100-1100"):
+        result = _run(tfbs_binding_scan(structure_path=pdb, genome_fasta=fasta, region=bad,
+                                        output_dir=str(tmp_path / "bad")))
+        assert result.get("error", "").startswith("Invalid region format"), (bad, result)
+        assert "chrom:start-end" in result["error"]
+
+
 def test_binding_scan_no_foldx():
     """If FoldX is NOT installed, verify the error message."""
     if _foldx_installed():

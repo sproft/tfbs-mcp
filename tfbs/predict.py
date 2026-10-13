@@ -2,11 +2,11 @@ import argparse
 import os
 from pathlib import Path
 
-import pandas as pd
 import torch
 from tangermeme.io import extract_loci
 
 import tfbs.nn.models as models
+from tfbs.bedio import read_bed
 from tfbs.prediction import analysis, utils
 
 
@@ -70,12 +70,8 @@ def main() -> None:
 
     # --- 2. Load and Prepare Sequence Data ---
     print(f"Processing peaks from: {args.peak_file}")
-    peaks_df = pd.read_csv(
-        args.peak_file,
-        sep="\t",
-        usecols=(0, 1, 2),
-        names=['chrom', 'start', 'end']
-    )
+    # Only whole comment, track and browser lines are skipped (tfbs.bedio).
+    peaks_df = read_bed(args.peak_file, usecols=[0, 1, 2], names=['chrom', 'start', 'end'])
 
     print(f"Extracting DNA loci from genome: {config['genome_fasta_path']}")
     # Extract loci (one-hot encoded DNA windows)
