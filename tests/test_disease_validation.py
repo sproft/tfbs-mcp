@@ -739,3 +739,40 @@ def test_disease_pipeline_exits_cleanly_on_a_file_it_cannot_load(tmp_path):
             dv.score_with_nn(df, {"flank": str(path)}, genome, window=10, device="cpu",
                              model_type="VCNNBpnet")
         assert f"--models flank={path}" in stop.value.code and expected in stop.value.code
+
+
+# ---------------------------------------------------------------------------
+# (i) the coding filter reads ClinVar's MC labels and SO accessions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mc, coding", [
+    ("SO:0001627|intron_variant", False),
+    ("SO:0001624|3_prime_UTR_variant", False),
+    ("SO:0001619|non-coding_transcript_variant", False),
+    ("", False),
+    ("SO:0001587|nonsense", True),           # ClinVar's label for stop_gained
+    ("nonsense", True),
+    ("SO:0001587", True),
+    ("SO:0001583|missense_variant", True),
+    ("SO:0001819|synonymous_variant", True),
+    ("SO:0001627|intron_variant,SO:0001587|nonsense", True),
+    ("SO:0001627|intron_variant|SO:0001583|missense_variant", True),
+])
+def test_coding_consequence_reads_labels_and_accessions(mc, coding):
+    assert dv.coding_consequence(mc) is coding
+
+
+def test_extraction_drops_clinvar_nonsense_variants(monkeypatch):
+    """The 2026-10-12 session kept 65 stop-gained variants because ClinVar
+    writes them as "nonsense", which the label list did not contain."""
+    nonsense = _Rec(155, "Pathogenic")
+    nonsense.info["MC"] = ("SO:0001587|nonsense",)
+    two_terms = _Rec(156, "Likely_benign")
+    two_terms.info["MC"] = ("SO:0001627|intron_variant", "SO:0001583|missense_variant")
+    no_mc = _Rec(157, "Benign")
+    no_mc.info["MC"] = ()
+    vcf = _FakeVcf(["chr1"], {"chr1": [_Rec(150, "Pathogenic"), nonsense, two_terms, no_mc]})
+    _fake_pysam(monkeypatch, vcf)
+    peaks = pd.DataFrame([{"chrom": "chr1", "start": 100, "end": 200, "num": 1}])
+    hits = dv.extract_clinvar_snvs(peaks, "clinvar.vcf.gz")
+    assert hits["pos"].tolist() == [150, 157]

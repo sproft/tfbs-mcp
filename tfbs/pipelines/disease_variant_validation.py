@@ -86,13 +86,44 @@ COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
 
 PATHOGENIC_TERMS = {"Pathogenic", "Likely_pathogenic", "Pathogenic/Likely_pathogenic"}
 BENIGN_TERMS = {"Benign", "Likely_benign", "Benign/Likely_benign"}
+# Coding consequences, by Sequence Ontology label and accession.  ClinVar's
+# MC field writes "SO:0001587|nonsense" for a stop-gained variant (its label
+# differs from the SO name), so a record is excluded when any of its terms
+# matches either set; EXCLUDE_SO also lists ClinVar's own label spellings.
 EXCLUDE_SO = {
     "missense_variant", "synonymous_variant",
-    "stop_gained", "stop_lost", "start_lost",
-    "frameshift_variant", "inframe_insertion", "inframe_deletion",
+    "stop_gained", "nonsense", "stop_lost", "start_lost",
+    "frameshift_variant", "inframe_insertion", "inframe_deletion", "inframe_indel",
     "splice_acceptor_variant", "splice_donor_variant",
-    "initiator_codon_variant",
+    "initiator_codon_variant", "initiatior_codon_variant",
 }
+EXCLUDE_SO_ACCESSIONS = {
+    "SO:0001583",  # missense_variant
+    "SO:0001819",  # synonymous_variant
+    "SO:0001587",  # stop_gained (ClinVar label: nonsense)
+    "SO:0001578",  # stop_lost
+    "SO:0002012",  # start_lost
+    "SO:0001589",  # frameshift_variant
+    "SO:0001821",  # inframe_insertion
+    "SO:0001822",  # inframe_deletion
+    "SO:0001820",  # inframe_indel
+    "SO:0001574",  # splice_acceptor_variant
+    "SO:0001575",  # splice_donor_variant
+    "SO:0001582",  # initiator_codon_variant
+}
+
+
+def coding_consequence(mc_terms: str) -> bool:
+    """True when a ClinVar MC string names a coding consequence.
+
+    MC holds comma-separated "SO:accession|label" pairs (pysam may give a
+    tuple of them); either half of a pair decides.
+    """
+    for term in mc_terms.replace(",", "|").split("|"):
+        term = term.strip()
+        if term in EXCLUDE_SO or term in EXCLUDE_SO_ACCESSIONS:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +289,9 @@ def _fetch_peak(vcf, contigs, chrom: str, start: int, end: int) -> list:
 def extract_clinvar_snvs(peaks: pd.DataFrame, clinvar_vcf: str) -> pd.DataFrame:
     """Find non-coding pathogenic and benign SNVs in the given peaks.
 
+    Likely pathogenic and likely benign count.  A variant whose ClinVar
+    molecular consequence (MC) is coding is dropped (coding_consequence);
+    a variant without MC is kept.
     The BED may name chromosomes chr1 or 1 and the VCF either way too (the
     ClinVar VCF uses 1, 2, ..., X, MT); see contig_candidates.
     """
@@ -285,13 +319,7 @@ def extract_clinvar_snvs(peaks: pd.DataFrame, clinvar_vcf: str) -> pd.DataFrame:
                     continue
                 mc = rec.info.get("MC", ())
                 mc_terms = "|".join(mc) if isinstance(mc, tuple) else str(mc)
-                so_terms = set()
-                for term in mc_terms.replace(",", "|").split("|"):
-                    if "|" in term:
-                        so_terms.add(term.split("|")[-1])
-                    else:
-                        so_terms.add(term)
-                if so_terms & EXCLUDE_SO:
+                if coding_consequence(mc_terms):
                     continue
                 gene = rec.info.get("GENEINFO", "").split(":")[0] if rec.info.get("GENEINFO") else "?"
                 hits.append({
