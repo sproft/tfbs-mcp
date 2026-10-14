@@ -7899,7 +7899,10 @@ async def tfbs_disease_variant_validation(
     Pipeline (works for any transcription factor):
     1. Merge a BED of TF binding peaks (optional confidence filter).
     2. Pull non-coding pathogenic and benign SNVs from ClinVar that
-       overlap those peaks.
+       overlap those peaks (likely pathogenic and likely benign count;
+       a variant whose ClinVar molecular consequence, MC, is coding,
+       such as missense, synonymous or nonsense, is dropped by its SO
+       label or accession; a variant without MC is kept).
     3. Score reference and alternative alleles per variant with one or
        more NN models, with FIMO against a JASPAR PWM, and optionally
        with FoldX on a TF-DNA crystal structure.
