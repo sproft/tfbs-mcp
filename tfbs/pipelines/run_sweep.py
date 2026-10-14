@@ -13,6 +13,7 @@ import argparse
 import functools
 import os
 import sys
+import types
 
 # Third-party Imports
 import torch
@@ -25,6 +26,11 @@ from tfbs.dataloaders.SeqDataset import TFBSDataModule
 from tfbs.nn import models
 
 # --- Configuration Constants ---
+
+# The errors of the trials that failed in this process. wandb.agent catches a
+# trial's exception and goes on, so run_agent reads this list to exit nonzero
+# and make the SLURM job fail when a trial did.
+FAILED_TRIALS: list[str] = []
 
 # Default training settings
 MAX_EPOCHS = 100
@@ -99,12 +105,19 @@ def train_sweep_agent(fixed_config: dict | None = None):
     """
     import wandb
 
-    # 1. Start the trial's run; the agent supplies the sampled hyperparameters,
-    # and the task's fixed values replace the sweep YAML's placeholders.
+    # 1. Start the trial's run; the agent supplies the sampled hyperparameters.
+    # wandb locks every key the sweep YAML defines, and the YAML holds
+    # placeholders for the task's fixed values (model, data_path, ...), so
+    # wandb.config.update cannot replace them: it ignores a locked key with a
+    # warning. The trial therefore reads a merge in which the task's values
+    # replace the placeholders, and records them in the run as task_<key>.
     run = wandb.init()
+    values = {key: wandb.config[key] for key in wandb.config.keys()}
     if fixed_config:
-        wandb.config.update(fixed_config, allow_val_change=True)
-    config = wandb.config
+        values.update(fixed_config)
+        wandb.config.update({f"task_{key}": value for key, value in fixed_config.items()},
+                            allow_val_change=True)
+    config = types.SimpleNamespace(**values)
 
     try:
         # 2. Extract specific model parameters
@@ -179,6 +192,7 @@ def train_sweep_agent(fixed_config: dict | None = None):
     except Exception as e:
         # Log error to WandB and re-raise
         print(f"Error during training sweep: {e}", file=sys.stderr)
+        FAILED_TRIALS.append(f"{type(e).__name__}: {e}")
         if wandb.run is not None:
             wandb.log({"error": str(e), "status": "failed"})
         raise
@@ -226,6 +240,7 @@ def run_agent(args):
     print(f"Starting WandB agent for Sweep ID: {sweep_id} (Task: {args.model}/{args.data_name}, Project: {project_name})")
     
     # The `count` argument ensures the agent only runs for the specified number of trials
+    FAILED_TRIALS.clear()
     wandb.agent(
         sweep_id, 
         function=functools.partial(train_sweep_agent, fixed_config),
@@ -233,6 +248,9 @@ def run_agent(args):
         project=project_name,  # Use the dynamic project name here
         entity=entity_name,
     )
+    if FAILED_TRIALS:
+        sys.exit(f"{len(FAILED_TRIALS)} of {args.n_trials} trials failed; "
+                 f"the last one with {FAILED_TRIALS[-1]}")
 
 
 def build_parser() -> argparse.ArgumentParser:

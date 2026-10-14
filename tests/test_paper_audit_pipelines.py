@@ -56,6 +56,17 @@ class _StrictConfig(dict):
         super().update(values)
 
 
+class _SweepConfig(_StrictConfig):
+    """A trial's wandb.config: the keys the sweep defines are locked.
+
+    wandb ignores an update of a locked key (with a warning), also with
+    allow_val_change=True, so only new keys are added.
+    """
+
+    def update(self, values, allow_val_change=False):
+        super().update({k: v for k, v in values.items() if k not in self})
+
+
 def _fake_wandb(config):
     fake = types.ModuleType("wandb")
     fake.run = None
@@ -138,12 +149,14 @@ def test_get_model_params_builds_each_model_from_the_bundled_yaml(model, pick, m
 
 @pytest.mark.parametrize("model", SWEEP_MODELS)
 def test_a_trial_of_the_bundled_sweep_trains_each_model(model, tmp_path, monkeypatch):
-    config = _trial_config(monkeypatch, model, "low")
     fixed = _fixed_config(monkeypatch, model)
     fixed["checkpoint_dir"] = str(tmp_path / "ckpt")
-    # The trial's config holds the YAML's sampled values; the agent then
-    # applies the task's fixed values, as wandb.config.update does.
-    fake = _fake_wandb(_StrictConfig({k: v for k, v in config.items() if k not in fixed}))
+    # The trial's config holds every key of the YAML, the placeholders of the
+    # task's fixed values (data_path /path/, ...) included, locked as wandb
+    # locks sweep parameters; the agent must still use the task's values.
+    sampled = {k: _sample(v, "low") for k, v in _sweep_parameters().items()}
+    assert {"model", "data_path", "checkpoint_dir"} <= set(sampled)
+    fake = _fake_wandb(_SweepConfig(sampled))
     monkeypatch.setitem(sys.modules, "wandb", fake)
     seen = {}
 
@@ -171,7 +184,37 @@ def test_a_trial_of_the_bundled_sweep_trains_each_model(model, tmp_path, monkeyp
              if type(c).__name__ == "EarlyStopping"]
     assert early and early[0].patience == 10
     assert (tmp_path / "ckpt" / "n" / "standardize" / model).is_dir()
+    assert seen["data"]["data_path"] == "/d"
+    assert seen["data"]["scaling_method"] == "standardize"
+    assert fake.config["task_data_path"] == "/d" and fake.config["data_path"] == sampled["data_path"]
     assert fake.logged == []
+
+
+def test_the_agent_exits_nonzero_when_a_trial_failed(monkeypatch):
+    """wandb.agent swallows a trial's exception, so the job must fail on its own."""
+    fake = _fake_wandb(_SweepConfig())
+
+    def agent(sweep_id, function, count, **kw):
+        for _ in range(count):
+            try:
+                function()
+            except Exception:
+                pass
+
+    fake.agent = agent
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    monkeypatch.setattr(run_sweep, "get_model_class",
+                        lambda name: (_ for _ in ()).throw(RuntimeError("boom")))
+    argv = ["--model", "VCNNBpnet", "--data-path", "/d", "--data-name", "n",
+            "--scaling-method", "none", "--project-name", "p", "--sweep-id", "sw1",
+            "--n-trials", "2"]
+    with pytest.raises(SystemExit) as stop:
+        run_sweep.main(argv)
+    assert "2 of 2 trials failed" in str(stop.value) and "RuntimeError: boom" in str(stop.value)
+
+    monkeypatch.setattr(run_sweep, "train_sweep_agent", lambda fixed: None)
+    run_sweep.main(argv)  # every trial finished: no exit
+    assert run_sweep.FAILED_TRIALS == []
 
 
 def test_the_agent_defaults_are_the_documented_ones():
