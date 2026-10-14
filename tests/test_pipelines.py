@@ -121,7 +121,9 @@ def test_remap_validation_without_foldx_stops_with_the_tools_error(monkeypatch, 
     with pytest.raises(SystemExit) as stop:
         rv.main(["--remap-bed", str(tmp_path / "peaks.bed"), "--output-dir", str(tmp_path / "out")])
     tool_error = json.loads(_foldx_missing_error())
-    assert stop.value.code == f"{tool_error['error']} {tool_error['fix']}"
+    assert stop.value.code == (f"{tool_error['error']} {tool_error['fix']} "
+                               f"{tfbs.pipelines.SKIP_FOLDX_HINT}")
+    assert "skip_foldx=true" in stop.value.code
     assert not (tmp_path / "out").exists()
 
 

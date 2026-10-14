@@ -37,6 +37,7 @@ from typing import Any, NamedTuple
 
 import tfbs.mcp.server as _server
 from tfbs.mcp.server import mcp
+from tfbs.pipelines import FOLDX_MISSING, FOLDX_MISSING_FIX
 
 logger = logging.getLogger(__name__)
 
@@ -254,12 +255,9 @@ def _repaired_dir(pdb: Path, output_dir: str | None) -> Path:
     return structures / _server._safe_name(pdb.stem)
 
 
-_FOLDX_MISSING = "FoldX binary not found on PATH."
-_FOLDX_MISSING_FIX = (
-    "Install FoldX (https://foldxsuite.crg.eu/, free academic licence), put "
-    "'foldx' or 'foldx5' on the PATH of the MCP server process, and restart "
-    "the server."
-)
+# Shared with the validation pipelines, which stop with the same text.
+_FOLDX_MISSING = FOLDX_MISSING
+_FOLDX_MISSING_FIX = FOLDX_MISSING_FIX
 
 
 def _foldx_missing_error() -> str:
@@ -623,10 +621,14 @@ async def tfbs_binding_energy(
         sequences:      Optional DNA sequences (placeholder for future
                         mutation support).
         repair:         Run FoldX RepairPDB first and keep the repaired
-                        file (recommended).  Pass false only for a
-                        structure FoldX has already repaired.
-        chains_protein: Protein chain ID(s), e.g. ``"A"``.
-        chains_dna:     DNA chain ID(s), comma-separated, e.g. ``"C,D"``.
+                        file (default true, recommended).  Pass false
+                        only for a structure FoldX has already repaired.
+        chains_protein: Protein chain ID(s) (default ``"A"``).  The
+                        chains are not detected from the file: pass the
+                        protein chain of the structure given.
+        chains_dna:     DNA chain ID(s), comma-separated (default
+                        ``"C,D"``); pass the DNA chains of the structure
+                        given.
         output_dir:     Directory for the repaired file.  Default: the
                         structure's own directory when it lies in
                         <results>/structures/<id>/, where
@@ -1143,7 +1145,7 @@ async def tfbs_binding_scan(
         slurm:          Submit a SLURM array job (one CSV per chunk of
                         windows, completed chunks skipped on resubmission)
                         plus a dependent merge job that writes the bigWig,
-                        instead of scanning in-process.
+                        instead of scanning in-process (default false).
         partition:      SLURM partition name.  Default None submits
                         without --partition, so the scheduler's default
                         partition is used, because FoldX runs on CPUs

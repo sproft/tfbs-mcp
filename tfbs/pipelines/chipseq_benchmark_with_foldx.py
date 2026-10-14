@@ -7,6 +7,12 @@ and FoldX (TF-DNA crystal complex), and computes ROC-AUC for each method.
 
 Uses the same subsample across methods so AUCs are directly comparable.
 
+FoldX scores the sequences on the structure given by --foldx-pdb.  With a
+structure the pipeline needs the FoldX binary ($TFBS_FOLDX_BIN, else foldx
+or foldx5 on PATH) and stops at startup, before any sequence is read or
+scored, when there is none; without --foldx-pdb the FoldX leg is skipped
+and only the NN and FIMO scores are compared.
+
 For NKX2.1 with the 11 bp C+A+B complex:
   ~3 min per FoldX call × 500 seq × 5 TFs / 32 cores ≈ 80 min total.
 
@@ -43,6 +49,7 @@ import torch.nn.functional as F
 from sklearn.metrics import auc, roc_curve
 
 from tfbs.nn.loading import load_checkpoint
+from tfbs.pipelines import find_foldx, foldx_required_message
 from tfbs.pipelines.checkpoints import (
     DEFAULT_SCALING, describe_problems, parse_named_paths, resolve_checkpoints,
 )
@@ -234,7 +241,10 @@ def main(argv=None):
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--genome", required=True)
     parser.add_argument("--motif-file", required=True)
-    parser.add_argument("--foldx-pdb", required=True)
+    parser.add_argument("--foldx-pdb", default=None,
+                        help="Repaired TF-DNA complex PDB for the FoldX leg; needs "
+                             "FoldX ($TFBS_FOLDX_BIN, else foldx or foldx5 on PATH). "
+                             "Without it the FoldX leg is skipped")
     parser.add_argument("--pos-tf", default="NKX2-1")
     parser.add_argument("--neg-tfs", nargs="+",
                         default=["GATA1", "MYOD1", "NKX2-5", "RXRA"])
@@ -258,6 +268,14 @@ def main(argv=None):
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--foldx-workers", type=int, default=32)
     args = parser.parse_args(argv)
+
+    # A structure means a FoldX leg: without the binary, stop before any work
+    # rather than leave the FoldX rows out of the AUC tables.
+    foldx_bin = None
+    if args.foldx_pdb:
+        foldx_bin = find_foldx()
+        if not foldx_bin:
+            sys.exit(foldx_required_message())
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -291,7 +309,6 @@ def main(argv=None):
         loaded[name] = load_model(str(ckpt), args.model_type, args.device)
 
     # 3. Score sequences with all methods
-    foldx_bin = shutil.which("foldx") or shutil.which("foldx5")
     all_scores = {}  # (tf, method) -> np.ndarray
     for tf, seqs in tf_seqs.items():
         print(f"\n=== Scoring {tf} ({len(seqs)} sequences) ===")

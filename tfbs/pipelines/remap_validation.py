@@ -48,6 +48,7 @@ import torch
 from sklearn.metrics import auc, roc_curve
 
 from tfbs.bedio import read_bed
+from tfbs.pipelines import find_foldx, foldx_required_message
 from tfbs.pipelines.checkpoints import (
     DEFAULT_SCALING, describe_problems, parse_named_paths, resolve_checkpoints,
 )
@@ -88,12 +89,6 @@ def load_model(checkpoint_path, model_type, device="cuda"):
     if hasattr(model, "freeze"):
         model.freeze()
     return model
-
-
-def find_foldx(explicit=None):
-    """The FoldX binary: --foldx-bin, else $TFBS_FOLDX_BIN, else foldx or foldx5 on PATH."""
-    return (explicit or os.environ.get("TFBS_FOLDX_BIN", "").strip()
-            or shutil.which("foldx") or shutil.which("foldx5"))
 
 
 def gc_content(seq):
@@ -354,8 +349,7 @@ def main(argv=None):
     if not args.skip_foldx:
         args.foldx_bin = find_foldx(args.foldx_bin)
         if not args.foldx_bin:
-            from tfbs.mcp.foldx_tools import _FOLDX_MISSING, _FOLDX_MISSING_FIX
-            sys.exit(f"{_FOLDX_MISSING} {_FOLDX_MISSING_FIX}")
+            sys.exit(foldx_required_message())
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

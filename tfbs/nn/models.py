@@ -186,7 +186,7 @@ class FlexibleCNN(BaseModel):
     """
     A simple 1D Convolutional Neural Network. This can be useful if your data has some sequential nature.
     """
-    def __init__(self, input_channels=1, num_channels=[32, 64], kernel_sizes=[3, 3], dense_size=128, **kwargs):
+    def __init__(self, input_channels=4, num_channels=[32, 64], kernel_sizes=[3, 3], dense_size=128, **kwargs):
         super().__init__(**kwargs)
         self.save_hyperparameters()
         

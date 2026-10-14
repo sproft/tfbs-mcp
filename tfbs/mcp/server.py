@@ -36,6 +36,7 @@ from mcp.server.fastmcp import FastMCP
 
 from tfbs.bedio import BedReadError, read_bed
 from tfbs.mcp.cli import SETUP_VARIABLES
+from tfbs.pipelines import SKIP_FOLDX_HINT as _SKIP_FOLDX_HINT
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,11 @@ def _detect_environment() -> dict[str, Any]:
       - on_slurm: True if running inside a SLURM job
       - slurm_job_id: str or None
       - slurm_partition: partition of the job the server runs in, or None
-      - default_partition: partition the SLURM tools submit to unless the
-        call passes partition=...; $TFBS_SLURM_PARTITION, else "gpu"
+      - default_partition: partition of the tools that take a partition
+        argument and default to it (tfbs_train in config mode, tfbs_sweep,
+        tfbs_validate, the two ChIP-seq tools, tfbs_remap_validation)
+        unless the call passes partition=...; $TFBS_SLURM_PARTITION, else
+        "gpu".  slurm_submit adds no partition
       - gpu_count: detected number of GPUs (0 if none found)
       - default_device: "cuda" or "cpu"
       - default_batch_size: larger on GPU nodes
@@ -584,6 +588,35 @@ def _fimo_binary_error(tool: str, skip_hint: str) -> str | None:
         "Install the MEME Suite (https://meme-suite.org/meme/doc/download.html, or "
         "conda install -c bioconda meme), put its bin directory on the PATH of the "
         f"MCP server and restart it{skip_hint}.",
+    )
+
+
+def _with_skip_foldx_hint(err: str) -> str:
+    """A missing-structure error JSON whose fix also offers skip_foldx=true."""
+    data = json.loads(err)
+    data["fix"] = f"{data.get('fix', '')} {_SKIP_FOLDX_HINT}".strip()
+    return json.dumps(data)
+
+
+def _foldx_missing_failure(stderr: str, **extra: Any) -> str | None:
+    """Error JSON when a validation pipeline stopped because FoldX is missing, else None.
+
+    The method-comparison, ReMap and ClinVar pipelines need FoldX whenever
+    they are given a structure, and stop at startup with the FoldX-missing
+    message of tfbs.mcp.foldx_tools when they find no binary (--foldx-bin
+    where the pipeline has it, else $TFBS_FOLDX_BIN, else foldx or foldx5
+    on PATH).
+    """
+    from tfbs.mcp.foldx_tools import _FOLDX_MISSING, _FOLDX_MISSING_FIX
+
+    if _FOLDX_MISSING not in (stderr or ""):
+        return None
+    return _error(
+        f"{_FOLDX_MISSING} A FoldX structure is set (foldx_pdb or TFBS_FOLDX_PDB), so the "
+        "pipeline needs FoldX, and it stopped before scoring anything.",
+        f"{_FOLDX_MISSING_FIX} The pipeline also takes the binary from the "
+        f"TFBS_FOLDX_BIN environment variable. {_SKIP_FOLDX_HINT}",
+        stderr=stderr[-1500:], **extra,
     )
 
 
@@ -1907,13 +1940,15 @@ async def tfbs_predict(
         model_id: Identifier of a model loaded via tfbs_load_model.
         sequences: List of DNA sequences (e.g. ["ACGTACGT..."]).  Give
                    exactly one of sequences and sequences_path.
-        window_mode: Use sliding-window scoring for long sequences.
+        window_mode: Use sliding-window scoring for long sequences
+                     (default false).
         window_size: Window length for sliding-window mode.  Default: the
                      model's input length (70 when the model reports
                      none).  It must equal the input length when that is
                      known, and must not exceed the sequence length.
-        batch_size: Batch size for processing.  Auto-detected if omitted
-                    (512 on GPU, 64 on CPU).
+        batch_size: Batch size for processing.  Default null: the
+                    server's default batch size (512 on GPU, 64 on CPU;
+                    see tfbs_server_info).
         inverse_transform: Default null, because predictions are meant
                            to be read in the original label units (e.g.
                            log2 fold change): the scores of a regression
@@ -2057,7 +2092,8 @@ async def tfbs_preprocess(
     Args:
         sequences: Raw DNA strings (A/C/G/T only).
         labels: Optional numeric labels for each sequence.
-        add_rc: Whether to append reverse-complement augmentation.
+        add_rc: Whether to append reverse-complement augmentation
+                (default false).
         output_path: Directory for seqs.pt and labels.pt.  Default
                      <results>/tfbs_preprocess/<digest>/, with <results>
                      the results_dir of tfbs_server_info and <digest> a
@@ -2122,6 +2158,63 @@ async def tfbs_preprocess(
 # ---------------------------------------------------------------------------
 # Tool 4: tfbs_analyze (attribution)
 # ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def _gradient_mode(model):
+    """Eval mode for an attribution pass, with recurrent layers in train mode.
+
+    cuDNN runs an RNN's backward pass only in train mode, so the recurrent
+    layers are put in train mode with their inter-layer dropout set to 0;
+    every other module (Dropout, BatchNorm) stays in eval mode, so the
+    attributions do not change from one call to the next.
+    """
+    model.eval()
+    rnns = [m for m in model.modules() if isinstance(m, _torch.nn.RNNBase)]
+    dropouts = [m.dropout for m in rnns]
+    try:
+        for m in rnns:
+            m.dropout = 0.0
+            m.train()
+        yield
+    finally:
+        for m, p in zip(rnns, dropouts):
+            m.dropout = p
+        model.eval()
+
+
+def _dinucleotide_references(shuffle, X_chunk, n: int, seed: int, first: int,
+                             ids: list[str] | None) -> tuple[Any, str | None]:
+    """((b, n, 4, L) shuffles of X_chunk, None), or (None, error JSON).
+
+    X_chunk holds the input's sequences first, first + 1, ...; tangermeme
+    seeds sequence j of a call with random_state + j, so random_state =
+    seed + first gives sequence i the shuffles of seed + i however the
+    input is chunked.  end is the full length (tangermeme 0.4 reads -1 as
+    a slice end and would leave the last base out of the shuffle).
+    """
+    L = int(X_chunk.shape[-1])
+    try:
+        return shuffle(X_chunk, start=0, end=L, n=n, random_state=seed + first), None
+    except Exception as exc:  # tangermeme raises ValueError; report any failure the same way
+        bad, reason = first, exc
+        for j in range(X_chunk.shape[0]):
+            try:
+                shuffle(X_chunk[j:j + 1], start=0, end=L, n=n, random_state=seed + first + j)
+            except Exception as one:
+                bad, reason = first + j, one
+                break
+        name = f"Record {ids[bad]}" if ids else f"Sequence {bad}"
+        return None, _error(
+            f"DeepLiftShap uses dinucleotide shuffles of each sequence as its references, "
+            f"and {name} cannot be shuffled: {reason}",
+            "Use method=\"input_x_gradient\", which needs no references, or remove that "
+            "sequence. Every column of a .pt input must be one-hot (no N). tangermeme "
+            "rejects a set of shuffles that are all identical: a repeat such as ACGTACGT "
+            "has no other shuffle, and for a short sequence a larger n_shuffles (e.g. "
+            "the default 20) makes identical draws unlikely.",
+            sequence_index=bad,
+        )
+
+
 @mcp.tool(
     name="tfbs_analyze",
     annotations={
@@ -2141,11 +2234,32 @@ async def tfbs_analyze(
     sequences_path: str | None = None,
     output_dir: str | None = None,
     batch_size: int | None = None,
+    seed: int = 42,
 ) -> str:
     """Run attribution analysis to identify important sequence positions.
 
     Uses Captum to compute per-base importance scores for a loaded model.
-    Requires the viz extras: pip install 'tfbs-mcp[viz]'
+    Requires the viz extras: pip install 'tfbs-mcp[viz]'.  Both methods
+    run the model in eval mode with only its recurrent layers in train
+    mode (their dropout set to 0), which cuDNN needs for their backward
+    pass, so dropout does not make the attributions random.
+
+    DeepLiftShap (the default method) explains each sequence against
+    n_shuffles dinucleotide shuffles of that sequence (tangermeme's
+    dinucleotide_shuffle, which keeps its dinucleotide counts and its
+    first and last base).  The shuffles are drawn with seed: sequence i
+    of the input gets those of seed + i, so the result does not depend
+    on batch_size or on which other sequences are in the call.  Captum's
+    DeepLift scores each sequence against each of its own shuffles with
+    tangermeme's hypothetical_attributions, and the n_shuffles results
+    are averaged.  With hypothetical=false they are then projected onto
+    the observed bases (multiplied by the one-hot input); with
+    hypothetical=true the hypothetical contributions of all four bases
+    are returned.  A sequence the shuffle cannot handle (a column that
+    is not one-hot, such as an N in a .pt input, or too little
+    diversity: tangermeme rejects shuffles that all come out identical,
+    as every shuffle of a repeat such as ACGTACGT does) returns an
+    error that suggests method="input_x_gradient".
 
     The attributions are saved as attributions.pt (N x 4 x L) in
     output_dir.  Inline sequences also get them in the JSON; a
@@ -2160,9 +2274,13 @@ async def tfbs_analyze(
                 attributions for ReLU CNNs by averaging over many
                 references) or "input_x_gradient" (one backward pass:
                 faster, noisier).
-        n_shuffles: Number of shuffled baselines for DeepLiftShap.
-        hypothetical: Return hypothetical attributions for all bases
-                      (DeepLiftShap only).
+        n_shuffles: Dinucleotide shuffles of each sequence used as its
+                    DeepLiftShap references (default 20).
+        hypothetical: DeepLiftShap only (default false).  false returns
+                      the attributions projected onto the observed bases
+                      (the hypothetical contributions times the one-hot
+                      input); true returns the hypothetical
+                      contributions of all four bases at each position.
         sequences_path: One-hot .pt tensor (N, 4, L) as written by
                         tfbs_extract_loci or tfbs_preprocess, or a FASTA
                         file of equal-length A/C/G/T records.
@@ -2170,12 +2288,17 @@ async def tfbs_analyze(
                     <results>/<model_id>/tfbs_analyze/<digest>/, with
                     <results> the results_dir of tfbs_server_info and
                     <digest> a hash of the inputs and settings.
-        batch_size: Sequences per input_x_gradient batch (DeepLiftShap
-                    batches sequence/reference pairs, 256 at a time).
-                    Auto-detected if omitted (512 on GPU, 64 on CPU).
+        batch_size: Sequences per input_x_gradient batch; DeepLiftShap
+                    scores at most max(batch_size, 256) sequence and
+                    reference pairs per pass.  Default null: the
+                    server's default batch size (512 on GPU, 64 on CPU;
+                    see tfbs_server_info).
+        seed: Random seed of the dinucleotide shuffles (default 42, as
+              in tfbs_seqlets).
 
     Returns:
-        JSON with "shape", method info, "files" (attributions: the .pt
+        JSON with "shape", "method" (and for DeepLiftShap "n_shuffles",
+        "hypothetical" and "seed"), "files" (attributions: the .pt
         path) and, for inline sequences, "attributions" (N x 4 x L);
         for a sequences_path input "attribution_sums" (one total per
         sequence) and, for FASTA, "ids"; "warnings" lists the distinct
@@ -2186,8 +2309,8 @@ async def tfbs_analyze(
         path such as C:/data/x.pt stays whole.
     """
     try:
-        from captum.attr import DeepLiftShap, InputXGradient
-        from tangermeme.utils import random_one_hot
+        from captum.attr import DeepLift, InputXGradient
+        from tangermeme.ersatz import dinucleotide_shuffle
         from tangermeme.deep_lift_shap import hypothetical_attributions
     except ImportError:
         return _error(
@@ -2199,6 +2322,15 @@ async def tfbs_analyze(
     if method not in ("deepliftshap", "input_x_gradient"):
         return _error(f"Unknown method '{method}'.",
                       "Use method='deepliftshap' or method='input_x_gradient'.")
+    if method == "deepliftshap" and n_shuffles < 1:
+        return _error(f"n_shuffles must be at least 1, got {n_shuffles}.",
+                      "Pass n_shuffles=20 (the default) or another positive number.")
+    if seed < 0:
+        return _error(f"seed must be a non-negative integer, got {seed}.",
+                      "Pass seed=42 (the default) or another non-negative integer.")
+    if batch_size is not None and batch_size < 1:
+        return _error(f"batch_size must be at least 1, got {batch_size}.",
+                      "Omit batch_size to use the server's default, or pass a positive number.")
     X, ids, err = _load_sequence_input(sequences, sequences_path)
     if err:
         return err
@@ -2212,7 +2344,7 @@ async def tfbs_analyze(
 
     out = _analysis_dir(
         output_dir, model_id, "tfbs_analyze",
-        _input_key(sequences, sequences_path), method, n_shuffles, hypothetical,
+        _input_key(sequences, sequences_path), method, n_shuffles, hypothetical, seed,
     )
     N, C, L = X.shape
 
@@ -2223,60 +2355,47 @@ async def tfbs_analyze(
             "ignore", message="Input Tensor .* did not already require gradients")
         if method == "input_x_gradient":
             parts = []
-            model.train()  # cuDNN RNN backward fix
-            try:
+            with _gradient_mode(model):
                 ixg = InputXGradient(model)
                 for k in range(0, N, batch_size):
                     parts.append(ixg.attribute(X[k:k + batch_size].to(device), target=0).detach().cpu())
-            finally:
-                model.eval()
             avg = _torch.cat(parts)
             info: dict[str, Any] = {"method": "input_x_gradient"}
         else:
-            max_pairs = 256
-            result_sum = _torch.zeros((N, C, L), dtype=X.dtype, device="cpu")
-
-            i = 0
-            while i < N:
-                batch_N = min(N - i, max_pairs)
-                shuffles_per_call = max(1, max_pairs // batch_N)
-                shuffles_per_call = min(shuffles_per_call, n_shuffles)
-                X_batch = X[i : i + batch_N].to(device)
-
-                s0 = 0
-                while s0 < n_shuffles:
-                    s = min(shuffles_per_call, n_shuffles - s0)
-                    baselines = random_one_hot((s, C, L)).float().to(device)
-                    baselines_rep = _torch.cat([baselines] * batch_N, dim=0)
-                    X_rep = X_batch.repeat_interleave(s, dim=0)
-
-                    custom_fn = None if hypothetical else hypothetical_attributions
-
-                    model.train()  # cuDNN RNN backward fix
-                    try:
-                        dl = DeepLiftShap(model)
+            # Each sequence is paired with its own shuffles only (DeepLift on
+            # (sequence, shuffle) pairs), not with every reference of the
+            # batch as captum's DeepLiftShap would pair them.
+            max_pairs = max(batch_size, 256)
+            seqs_per_chunk = max(1, max_pairs // n_shuffles)
+            parts = []
+            with _gradient_mode(model):
+                dl = DeepLift(model)
+                for i0 in range(0, N, seqs_per_chunk):
+                    X_chunk = X[i0:i0 + seqs_per_chunk]
+                    refs, err = _dinucleotide_references(
+                        dinucleotide_shuffle, X_chunk, n_shuffles, seed, i0, ids)
+                    if err:
+                        return err
+                    b = X_chunk.shape[0]
+                    X_rep = X_chunk.repeat_interleave(n_shuffles, dim=0)
+                    R = refs.reshape(b * n_shuffles, C, L).to(X.dtype)
+                    pieces = []
+                    for p0 in range(0, b * n_shuffles, max_pairs):
                         a = dl.attribute(
-                            X_rep, baselines=baselines_rep, target=0,
+                            X_rep[p0:p0 + max_pairs].to(device),
+                            baselines=R[p0:p0 + max_pairs].to(device),
+                            target=0,
                             return_convergence_delta=False,
-                            custom_attribution_func=custom_fn,
+                            custom_attribution_func=hypothetical_attributions,
                         )
-                    finally:
-                        model.eval()
+                        pieces.append(a.detach().cpu())
+                    parts.append(_torch.cat(pieces).reshape(b, n_shuffles, C, L).mean(dim=1))
 
-                    if a.dim() == 3 and a.shape == (batch_N, C, L):
-                        chunk_sum = a * s
-                    else:
-                        chunk_sum = a.reshape(batch_N, s, C, L).sum(dim=1)
-
-                    result_sum[i : i + batch_N] += chunk_sum.cpu().detach()
-                    s0 += s
-                i += batch_N
-
-            avg = result_sum / float(n_shuffles)
+            avg = _torch.cat(parts)
             if not hypothetical:
                 avg = avg * X
             info = {"method": "deepliftshap", "n_shuffles": n_shuffles,
-                    "hypothetical": hypothetical}
+                    "hypothetical": hypothetical, "seed": seed}
 
     avg = avg.detach().cpu()
     mkdir_err = _mkdir_error(out, "output_dir")
@@ -2350,10 +2469,14 @@ async def tfbs_mutagenesis(
         sequences: DNA sequences to mutagenize (A/C/G/T).  Give exactly
                    one of sequences and sequences_path.
         start: First position to mutagenize (0-indexed, default 0).
-        end: Last position (exclusive, -1 = full length).
+        end: Position after the last one to mutagenize (exclusive;
+             default -1, the full length).
         raw_outputs: If true, return original and per-mutant predictions
-                     instead of aggregated attribution scores.
-        batch_size: Batch size for predictions.  Auto-detected if omitted.
+                     instead of aggregated attribution scores (default
+                     false).
+        batch_size: Mutants per prediction batch.  Default null: the
+                    server's default batch size (512 on GPU, 64 on CPU;
+                    see tfbs_server_info).
         sequences_path: One-hot .pt tensor (N, 4, L) as written by
                         tfbs_extract_loci or tfbs_preprocess, or a FASTA
                         file of equal-length A/C/G/T records.
@@ -2363,9 +2486,12 @@ async def tfbs_mutagenesis(
                     <digest> a hash of the inputs and settings.
 
     Returns:
-        JSON with "scores" (shape N x 4 x L attribution matrix: the
-        prediction change of each substitution, mean-centred across the
-        four bases at each position) and "shape", or with
+        JSON with "scores" (shape N x 4 x (end - start), the whole length
+        by default: per sequence, for each position and each of the four
+        bases the change in prediction when that base is put there (0
+        for the observed base), mean-centred across the four bases at
+        each position; all four bases are kept, nothing is projected onto
+        the observed base) and "shape", or with
         raw_outputs=true: "original_scores" and "mutant_scores"; always
         "files" with the paths written, "inverse_transformed" and
         "units".  For a
@@ -2403,10 +2529,14 @@ async def tfbs_mutagenesis(
         _input_key(sequences, sequences_path), start, end, raw_outputs,
     )
 
+    # hypothetical=True keeps the mean-centred change of all four bases;
+    # tangermeme's default multiplies it by the one-hot input, which would
+    # keep only the observed base's entry.
     result = saturation_mutagenesis(
         model, X,
         start=start, end=end,
         batch_size=batch_size,
+        hypothetical=True,
         raw_outputs=raw_outputs,
         device=device,
     )
@@ -2843,6 +2973,8 @@ async def tfbs_fimo(
     Args:
         sequences: DNA sequences to scan (A/C/G/T).
         motif_file: Absolute path to a MEME-format motif file.
+                    Default "": $TFBS_MOTIF_FILE; with neither the call
+                    returns an error naming the setup command.
         threshold: FIMO p-value threshold (default 1e-4).
         output_dir: Directory for the FASTA and the hit table.  Default
                     <results>/fimo/<digest>/, with <results> the
@@ -2997,8 +3129,13 @@ async def tfbs_server_info() -> str:
     Returns:
         JSON with on_slurm, slurm_job_id, slurm_partition (partition of the
         job the server itself runs in, null outside a job),
-        default_partition ($TFBS_SLURM_PARTITION, else "gpu"; used by the
-        SLURM tools unless a call passes partition=...), gpu_count,
+        default_partition ($TFBS_SLURM_PARTITION, else "gpu"; the
+        partition of tfbs_train in config mode, tfbs_sweep, tfbs_validate,
+        tfbs_chipseq_benchmark, tfbs_chipseq_method_comparison and
+        tfbs_remap_validation unless a call passes partition=...;
+        slurm_submit adds no partition, tfbs_disease_variant_validation
+        defaults to "compute" and tfbs_binding_scan to the scheduler's
+        default), gpu_count,
         default_device, default_batch_size, call_log (the $TFBS_CALL_LOG
         file, or null; when set, every tool call appends one JSON line
         with its timestamp, tool, arguments, seconds, is_error and result),
@@ -3206,6 +3343,9 @@ async def slurm_status(
 
     Tries squeue first (for running/pending jobs), then falls back to
     sacct (for completed/failed jobs) to retrieve status information.
+    A nonzero squeue exit on its own is not a failure, because squeue
+    exits 1 for a job the controller has already purged, which sacct
+    still knows.
 
     Args:
         job_id: The SLURM job ID to query.
@@ -3214,20 +3354,24 @@ async def slurm_status(
         JSON with job_id, state, node, elapsed, submit_time, and
         exit_code (exit_code only available from sacct).  On a machine
         without SLURM (neither squeue nor sacct on PATH) it returns an
-        error saying so; state NOT_FOUND means SLURM answered but does not
-        know the job.
+        error saying so.  State NOT_FOUND means SLURM answered and
+        neither squeue nor sacct lists the job.  When neither lists it
+        and sacct failed (nonzero exit, not on PATH) or timed out, the
+        result is an error naming that failure, with sacct's stderr,
+        instead of NOT_FOUND, because the job may well exist.
     """
     unavailable = _slurm_unavailable()
     if unavailable:
         return unavailable
 
     # Try squeue first (running / pending jobs)
+    squeue_problem = None
     try:
         sq = subprocess.run(
             ["squeue", "-j", job_id, "--noheader", "--format=%i|%T|%N|%M|%V"],
             capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
         )
-        line = sq.stdout.strip()
+        line = (sq.stdout or "").strip()
         if line:
             parts = line.split("|")
             return json.dumps({
@@ -3238,10 +3382,14 @@ async def slurm_status(
                 "submit_time": parts[4].strip() if len(parts) > 4 else None,
                 "exit_code": None,
             })
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    except FileNotFoundError:
+        squeue_problem = "squeue is not on PATH"
+    except subprocess.TimeoutExpired:
+        squeue_problem = "squeue timed out after 30 s"
 
     # Fall back to sacct (completed / historical jobs)
+    sacct_problem = None
+    sacct_stderr = ""
     try:
         sa = subprocess.run(
             [
@@ -3250,7 +3398,7 @@ async def slurm_status(
             ],
             capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
         )
-        for raw_line in sa.stdout.strip().splitlines():
+        for raw_line in (sa.stdout or "").strip().splitlines():
             parts = raw_line.split("|")
             # Filter to main job line (skip .batch / .extern steps)
             if parts and parts[0].strip() == job_id:
@@ -3262,9 +3410,27 @@ async def slurm_status(
                     "submit_time": parts[4].strip() if len(parts) > 4 else None,
                     "exit_code": parts[5].strip() if len(parts) > 5 else None,
                 })
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+        sacct_stderr = (sa.stderr or "").strip()
+        if sa.returncode != 0:
+            sacct_problem = f"sacct failed (exit {sa.returncode})"
+    except FileNotFoundError:
+        sacct_problem = "sacct is not on PATH"
+    except subprocess.TimeoutExpired as exc:
+        sacct_problem = "sacct timed out after 30 s"
+        stderr = exc.stderr
+        sacct_stderr = (stderr.decode(errors="replace") if isinstance(stderr, bytes)
+                        else stderr or "").strip()
 
+    if sacct_problem:
+        also = f"; {squeue_problem}" if squeue_problem else ""
+        return _error(
+            f"squeue does not list job {job_id} and {sacct_problem}{also}, so its "
+            "state is unknown.",
+            "Read stderr: usually the SLURM accounting database (slurmdbd) or the "
+            "controller cannot be reached. Retry slurm_status later, or run sacct "
+            f"-j {job_id} on a login node.",
+            job_id=job_id, stderr=sacct_stderr,
+        )
     return json.dumps({"job_id": job_id, "state": "NOT_FOUND", "error": "Job not found in squeue or sacct"})
 
 
@@ -3298,8 +3464,10 @@ async def slurm_logs(
 
     Args:
         job_id: The SLURM job ID whose logs to read.
-        log_type: Which log to read: "stdout", "stderr", or "both".
-        tail: Number of lines to read from the end of each log file.
+        log_type: Which log to read: "stdout", "stderr" (default) or
+                  "both".  Any other value is an error.
+        tail: Number of lines to read from the end of each log file
+              (default 100).
 
     Returns:
         JSON with job_id, log_paths ({stdout, stderr}: the file found, or
@@ -3530,7 +3698,7 @@ async def slurm_watch(
     Args:
         job_id: The SLURM job ID to monitor.
         check_interval: How often to check: a number with unit s, m, h or
-                        d (e.g. "30m", "1h", "2h").
+                        d (default "1h"; e.g. "30m", "2h").
         context: Optional description of what the job is doing, to
                  include in status check messages.
 
@@ -4514,7 +4682,8 @@ async def tfbs_validate(
     file: model, scaling and dataset, then every metric the test
     reports, which is test_loss for a regression model and test_loss,
     test_acc (accuracy) and test_auc (ROC-AUC) for a classifier.  The
-    job's .o/.e logs are written next to that file.
+    job's .o/.e logs are written next to that file.  The job requests one
+    GPU, 8 CPUs and 64 GB of memory.
 
     Args:
         checkpoint_path: Path to the model checkpoint.  Both formats are
@@ -4526,7 +4695,8 @@ async def tfbs_validate(
             saved with torch.save(model.state_dict())), are an error
             before anything is submitted.
         data_path: Path to the dataset (tensor directory or CSV).
-        model_name: Model class name (e.g. "VCNNBpnet", "RNN"); one that
+        model_name: Model class name (default "VCNNBpnet"; e.g. "RNN"),
+            also used as the class of a Lightning checkpoint; one that
             names no model class in tfbs.nn.models is an error before
             anything is submitted.
         scaling_method: Label scaling the test labels are put on before
@@ -4539,7 +4709,10 @@ async def tfbs_validate(
             records none: "none" for a classifier (its classify flag, else
             0/1 labels in data_path) and "standardize" otherwise.  A value
             that contradicts the checkpoint, or label scaling for a
-            classifier, is an error before anything is submitted.
+            classifier whose checkpoint records none, is an error before
+            anything is submitted.  A classifier checkpoint that records
+            label scaling (standardize or normalize) is validated on
+            that scale, with a caution saying so.
         output_file: CSV file to append results to.  Defaults to
                      validation_results.csv in the results directory
                      (results_dir in tfbs_server_info).  Jobs that may
@@ -4777,7 +4950,9 @@ async def tfbs_config(
       EquiNet     reverse-complement equivariant network; needs equirc.
       MultiCNN    CNN plus numerical covariates; the default data module
                   does not supply covariates, so it cannot train as is.
-    Other templates' values are the class defaults.  The result echoes
+    Other templates' values are the class defaults (input_length,
+    learning_rate and classify come from the arguments, as for every
+    template).  The result echoes
     the resolved init_args, so the hyperparameters actually used are
     visible.  An unknown model_type returns the list of valid names.
 
@@ -4787,10 +4962,12 @@ async def tfbs_config(
         windows it is trained on.  Pass it to request a window (e.g. 51);
         a mismatch with the dataset is reported as a warning.
       classify: omitted means true when every label in
-        <data_path>/train/labels.pt is 0 or 1 (the result then carries a
-        "note" saying so), because such labels come from
-        tfbs_prepare_classification, and false otherwise.  An explicit
-        classify=false on 0/1 labels is kept and reported as a "warning".
+        <data_path>/train/labels.pt is 0 or 1 and scaling_method is
+        omitted or "none" (the result then carries a "note" saying so),
+        because such labels come from tfbs_prepare_classification, and
+        false otherwise; with standardize or normalize on 0/1 labels it
+        stays false and a "warning" says so.  An explicit classify=false
+        on 0/1 labels is kept and reported as a "warning".
       scaling_method: "standardize" (z-score) for regression, because
         zero-mean unit-variance labels keep MSE gradients well scaled;
         "none" for classification, because BCE needs 0/1 labels.
@@ -5189,8 +5366,8 @@ async def tfbs_extract_loci(
         bed_path: Path to a BED file (tab-separated, at least 3 columns).
                   Needed for peaks and negatives; optional with variants.
         output_dir: Output directory (default above).
-        genome_fasta: Path to reference genome FASTA file. Falls back
-                      to $TFBS_GENOME_FASTA.
+        genome_fasta: Path to reference genome FASTA file.  Default "":
+                      $TFBS_GENOME_FASTA.
         in_window: Window size in bp (default 200, see above).
         max_sequences: If set, randomly sample this many peaks before
                        extraction (useful for large ChIP-Atlas files).
@@ -5689,7 +5866,8 @@ async def tfbs_prepare_dataset(
         output_dir: Base directory for the split dataset (default above).
         test_size: Fraction for test set (default 0.2).
         val_size: Fraction of remaining for validation (default 0.2).
-        add_rc: Add reverse complement augmentation (doubles dataset).
+        add_rc: Add reverse complement augmentation (doubles dataset;
+                default false).
         random_seed: Random seed for reproducible splits (default 42).
 
     Returns:
@@ -5931,8 +6109,9 @@ async def tfbs_prepare_regression(
         scores_path: Path to scores.pt (N, 1) from tfbs_extract_loci.
         output_dir: Directory to save sequences.pt and labels.pt
                     (default above).
-        score_transform: Transform to apply: "log2" (log2(x+1)),
-                         "log10" (log10(x+1)), "zscore", or "none".
+        score_transform: Transform to apply: "log2" (log2(x+1), the
+                         default), "log10" (log10(x+1)), "zscore", or
+                         "none".
         min_score: If set, filter out sequences with score below this.
         random_seed: Random seed (default 42).
 
@@ -6055,7 +6234,8 @@ async def tfbs_seqlets(
     Args:
         model_id: Identifier of a loaded model.
         sequences: DNA sequences to analyze.
-        n_shuffles: Number of shuffled baselines for DeepLiftShap.
+        n_shuffles: Dinucleotide shuffles of each sequence used as its
+                    DeepLiftShap references (default 20).
         min_seqlet_len: Minimum seqlet length (default 5).
         max_seqlet_len: Maximum seqlet length (default 15).
         motif_file: Optional path to a MEME-format motif file for
@@ -6113,14 +6293,10 @@ async def tfbs_seqlets(
 
     X = X.to(device)
 
-    model.train()
-    try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            attr = tangermeme_dls(model, X, n_shuffles=n_shuffles, device=str(device),
-                                  random_state=seed)
-    finally:
-        model.eval()
+    with _gradient_mode(model), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        attr = tangermeme_dls(model, X, n_shuffles=n_shuffles, device=str(device),
+                              random_state=seed)
     raised = _warning_messages(caught)
 
     if isinstance(attr, _torch.Tensor):
@@ -6243,6 +6419,7 @@ async def tfbs_epistasis(
     sequence: str,
     positions: list[int] | None = None,
     output_dir: str | None = None,
+    batch_size: int | None = None,
 ) -> str:
     """Compute pairwise epistasis scores for a DNA sequence.
 
@@ -6279,6 +6456,10 @@ async def tfbs_epistasis(
                     <results>/<model_id>/tfbs_epistasis/<digest>/, with
                     <results> the results_dir of tfbs_server_info and
                     <digest> a hash of the sequence and positions.
+        batch_size: Mutants scored per forward pass, on the device of the
+                    loaded model.  Default null: the server's default
+                    batch size (512 on GPU, 64 on CPU; see
+                    tfbs_server_info).
 
     Returns:
         JSON with original_prediction, num_positions,
@@ -6295,6 +6476,9 @@ async def tfbs_epistasis(
     if not sequence:
         return _error("tfbs_epistasis got no sequence.",
                       "Pass one DNA sequence (A/C/G/T) as sequence.")
+    if batch_size is not None and batch_size < 1:
+        return _error(f"batch_size must be at least 1, got {batch_size}.",
+                      "Omit batch_size to use the server's default, or pass a positive number.")
     X, _, err = _load_sequence_input([sequence], None)
     if err:
         return err
@@ -6317,7 +6501,8 @@ async def tfbs_epistasis(
         })
 
     ref = {p: int(X[0, :, p].argmax()) for p in pos}
-    batch_size = _ENV["default_batch_size"]
+    if batch_size is None:
+        batch_size = _ENV["default_batch_size"]
 
     def _predict(mutants: list[tuple[tuple[int, int], ...]]) -> list[float]:
         preds: list[float] = []
@@ -6430,8 +6615,11 @@ async def tfbs_conv_filters(
     """Summarise what the convolutional filters learned.
 
     Runs input sequences through the model, captures activations at
-    each Conv1d layer, finds the maximally activating positions of each
-    filter, and for the filters of layers that read the one-hot input
+    each Conv1d layer, ranks the filters of each layer by their maximum
+    activation over all sequences and positions and summarises the
+    top_n_filters highest (each record keeps its filter index), finds
+    the maximally activating positions of each of them, and for the
+    filters of layers that read the one-hot input
     directly builds a position frequency matrix (PFM) from the input
     windows behind the activations of at least 0.8 x the filter's
     maximum (at most 10 per sequence; the window accounts for the
@@ -6452,7 +6640,8 @@ async def tfbs_conv_filters(
     Writes to output_dir:
       filter_summary.json: one record per analysed filter (layer,
         filter_id, kernel_size, max_activation, num_activating,
-        pfm_sites, pfm_width, in_meme).
+        pfm_sites, pfm_width, in_meme), layer by layer and within a
+        layer by max_activation, highest first.
       filters.meme: the PFMs in MEME format (one MOTIF <layer>_f<id>
         per filter with a PFM; letter-probability rows, nsites = the
         fewest windows behind any covered column), ready for TOMTOM
@@ -6468,7 +6657,11 @@ async def tfbs_conv_filters(
                     <results>/<model_id>/tfbs_conv_filters/<digest>/,
                     with <results> the results_dir of tfbs_server_info
                     and <digest> a hash of the sequences and settings.
-        top_n_filters: Max filters to analyze per layer (default 50).
+        top_n_filters: Filters summarised per layer (default 50): those
+                       with the highest maximum activation over all
+                       sequences and positions, so a layer with more
+                       filters keeps its strongest ones, whatever their
+                       index.
         top_k_subsequences: Subsequences kept per filter (default 10).
 
     Returns:
@@ -6547,7 +6740,11 @@ async def tfbs_conv_filters(
         if layer_name not in activations:
             continue
         act = activations[layer_name]  # (N, C_out, L_out)
-        n_filters = min(act.shape[1], top_n_filters)
+        # The top_n_filters filters with the highest maximum activation over
+        # all sequences and positions, highest first (ties by filter index).
+        filter_max = act.amax(dim=(0, 2)).tolist()
+        ranked = sorted(range(act.shape[1]), key=lambda f: (-filter_max[f], f))
+        selected = ranked[:max(0, top_n_filters)]
         kernel_size = module.kernel_size[0]
         dilation = module.dilation[0]
         stride = module.stride[0]
@@ -6570,7 +6767,7 @@ async def tfbs_conv_filters(
                 return None
             return _np.flatnonzero(inside), cols[inside]
 
-        for f_idx in range(n_filters):
+        for f_idx in selected:
             f_act = act[:, f_idx, :]  # (N, L_out)
             max_act = float(f_act.max())
             threshold = max_act * 0.8
@@ -6957,9 +7154,18 @@ async def tfbs_chipseq_benchmark(
 ) -> str:
     """Run ChIP-seq benchmark analysis comparing NN models against ChIP-Atlas data.
 
-    Evaluates models in two ways:
-    1. Classification: distinguish pos TF binding from neg TFs (ROC curves)
-    2. Regression: correlate NN score with experiment overlap count
+    Evaluates the NN models in three ways, on the merged peaks of each TF
+    (windows centred on the peak midpoints):
+    1. Classification against negative TFs: the positive TF's peaks
+       against the peaks of each negative TF (ROC curves,
+       classification_vs_negatives.csv).
+    2. Classification at experiment-count cutoffs: the positive TF's
+       peaks supported by at least cutoff experiments against the rest
+       of its peaks (ROC curves per cutoff,
+       classification_cutoff_results.csv).
+    3. Regression: correlation (Pearson and Spearman) of the NN score
+       with the experiment overlap count of the positive TF's peaks
+       (regression_results.csv).
 
     Input: ChIP-Atlas intersection BED files (*.allintersect.bed).
 
@@ -6969,9 +7175,13 @@ async def tfbs_chipseq_benchmark(
         pos_tf: Positive transcription factor name (default NKX2-1).
         neg_tfs: Negative TF names (default GATA1, MYOD1, NKX2-5, RXRA).
         datasets: Model dataset names (default all_mean, core_mean, flank_mean).
-        cutoffs: Experiment-count cutoffs for classification (default 1,3,5,8).
+        cutoffs: Experiment-count cutoffs of analysis 2 (default 1, 3, 5,
+            8): at each, the positive TF's peaks with at least that many
+            experiments are the positives and its other peaks the
+            negatives.
         model_type: Architecture class name (default VCNNBpnet).
-        models_dir: Base checkpoint directory; a relative path resolves
+        models_dir: Base checkpoint directory (default
+            "saved_models_final"); a relative path resolves
             against the project root (TFBS_PROJECT_ROOT, see
             tfbs_server_info), where the pipeline runs.  Each dataset's
             checkpoint is <models_dir>/<dataset>/<scaling_method>/
@@ -7000,18 +7210,22 @@ async def tfbs_chipseq_benchmark(
             model_type.  The NN scores are the model's raw outputs, in
             the training scale for a standardized model, which leaves
             the AUCs unchanged.
-        genome_fasta: Reference genome FASTA path. Falls back to
+        genome_fasta: Reference genome FASTA path.  Default "":
             $TFBS_GENOME_FASTA.
-        max_sequences: Max sequences per TF for speed.
+        max_sequences: Merged peaks scored per TF (default 15000): a TF
+            with more is a random subsample of this many (seed 42), drawn
+            before windows that fall off a chromosome or contain a base
+            other than A/C/G/T are dropped.
         device: "cuda" or "cpu" for NN inference.  If omitted: "cuda" for
             a SLURM job (the job requests one GPU), otherwise the server's
             detected default device (see tfbs_server_info).
-        slurm: Submit as SLURM job instead of running directly.
+        slurm: Submit as SLURM job instead of running directly (default
+            false).
         partition: SLURM partition.  Defaults to the server's
             default_partition: $TFBS_SLURM_PARTITION, else "gpu"
             (see tfbs_server_info), because the job requests a GPU and
             "gpu" is the usual name of a cluster's GPU partition.
-        max_time: SLURM wall time.
+        max_time: SLURM wall time (default "04:00:00").
 
     Returns:
         JSON with output_dir, checkpoints (the file used per dataset) and
@@ -7148,6 +7362,7 @@ async def tfbs_chipseq_method_comparison(
     genome_fasta: str = "",
     n_per_tf: int = 500,
     foldx_workers: int = 32,
+    skip_foldx: bool = False,
     device: str | None = None,
     slurm: bool = True,
     partition: str | None = None,
@@ -7166,23 +7381,32 @@ async def tfbs_chipseq_method_comparison(
     Recommended for SLURM (FoldX is ~3 min per sequence; default 500
     sequences per TF takes ~4 hours on 32 cores).
 
+    The FoldX leg needs the FoldX binary: the pipeline takes
+    $TFBS_FOLDX_BIN, else foldx or foldx5 on PATH (on the compute node
+    for slurm=true), and stops with an error that suggests
+    skip_foldx=true when it finds none, before it scores anything,
+    instead of leaving the FoldX leg out.
+
     Args:
         intersect_dir: Directory with *.allintersect.bed files.
         output_dir: Where to save plots, raw scores, and AUC tables.
         motif_file: JASPAR/MEME motif file for FIMO (e.g. MA1994.1.meme
-            for NKX2-1). Falls back to $TFBS_MOTIF_FILE. The FIMO leg runs
+            for NKX2-1). Default "": $TFBS_MOTIF_FILE. The FIMO leg runs
             the MEME Suite's fimo program (no tangermeme fallback here), so
             the call returns an error before anything runs or is submitted
             when fimo is not on the server's PATH.
-        foldx_pdb: Repaired TF-DNA complex PDB, or $TFBS_FOLDX_PDB. The
-            DNA length in the
-            PDB defines the FoldX scoring window (must be <= the
-            sequence window, typically 11 bp for NKX2-1).
-        pos_tf: Positive transcription factor name.
-        neg_tfs: Negative TF names.
-        datasets: NN dataset names (subdirectories of models_dir).
-        model_type: Model architecture class name.
-        models_dir: Base checkpoint directory; a relative path resolves
+        foldx_pdb: Repaired TF-DNA complex PDB.  Default "":
+            $TFBS_FOLDX_PDB; with neither the call returns an error
+            unless skip_foldx is true.  The DNA length in the PDB defines
+            the FoldX scoring window (must be <= the sequence window,
+            typically 11 bp for NKX2-1).
+        pos_tf: Positive transcription factor name (default "NKX2-1").
+        neg_tfs: Negative TF names (default GATA1, MYOD1, NKX2-5, RXRA).
+        datasets: NN dataset names (subdirectories of models_dir;
+            default all_mean, core_mean, flank_mean).
+        model_type: Model architecture class name (default "VCNNBpnet").
+        models_dir: Base checkpoint directory (default
+            "saved_models_final"); a relative path resolves
             against the project root (TFBS_PROJECT_ROOT, see
             tfbs_server_info), where the pipeline runs.  Each dataset's
             checkpoint is <models_dir>/<dataset>/<scaling_method>/
@@ -7211,23 +7435,29 @@ async def tfbs_chipseq_method_comparison(
             model_type.  The NN scores are the model's raw outputs, in
             the training scale for a standardized model, which leaves
             the AUCs unchanged.
-        genome_fasta: Reference genome FASTA. Falls back to
+        genome_fasta: Reference genome FASTA.  Default "":
             $TFBS_GENOME_FASTA.
-        n_per_tf: Sequences sampled per TF (FoldX bottleneck).
-        foldx_workers: Parallel CPU workers for FoldX.
+        n_per_tf: Sequences sampled per TF (default 500; FoldX is the
+            bottleneck).
+        foldx_workers: Parallel CPU workers for FoldX (default 32).
+        skip_foldx: Run NN and FIMO only (default false): no structure
+            is resolved or passed to the pipeline, so neither foldx_pdb
+            nor FoldX is needed, and the AUC tables have no FoldX rows.
         device: "cuda" or "cpu" for NN inference.  If omitted: "cuda" for
             a SLURM job (the job requests one GPU), otherwise the server's
             detected default device (see tfbs_server_info).
-        slurm: Submit as SLURM job (recommended).
+        slurm: Submit as SLURM job (default true, recommended).
         partition: SLURM partition.  Defaults to the server's
             default_partition: $TFBS_SLURM_PARTITION, else "gpu"
             (see tfbs_server_info), because the job requests a GPU and
             "gpu" is the usual name of a cluster's GPU partition.
-        max_time: SLURM wall time.
+        max_time: SLURM wall time (default "12:00:00").
 
     Returns:
         JSON with output_dir, checkpoints (the file used per dataset),
-        file list, and (if slurm) job_id.
+        foldx_pdb (the structure used, null with skip_foldx),
+        skip_foldx, file list, and (if slurm) job_id.  In direct mode a
+        run that stopped because FoldX is missing returns that error.
     """
     if neg_tfs is None:
         neg_tfs = ["GATA1", "MYOD1", "NKX2-5", "RXRA"]
@@ -7243,9 +7473,13 @@ async def tfbs_chipseq_method_comparison(
     motif_path, err = _resolve_reference(motif_file, "motif_file")
     if err:
         return err
-    foldx_path, err = _resolve_reference(foldx_pdb, "foldx_pdb")
-    if err:
-        return err
+    # Only the FoldX leg opens the structure, so skip_foldx runs neither
+    # need one nor pass it on.
+    foldx_path = None
+    if not skip_foldx:
+        foldx_path, err = _resolve_reference(foldx_pdb, "foldx_pdb")
+        if err:
+            return _with_skip_foldx_hint(err)
 
     err = _pipeline_requirements_error(
         "chipseq_benchmark_with_foldx", "tfbs_chipseq_method_comparison")
@@ -7273,7 +7507,6 @@ async def tfbs_chipseq_method_comparison(
         "--output-dir", str(out),
         "--genome", str(genome_path),
         "--motif-file", str(motif_path),
-        "--foldx-pdb", str(foldx_path),
         "--pos-tf", pos_tf,
         "--neg-tfs", *neg_tfs,
         *_checkpoint_args(found),
@@ -7282,7 +7515,11 @@ async def tfbs_chipseq_method_comparison(
         "--foldx-workers", str(foldx_workers),
         "--device", device,
     ]
+    if foldx_path is not None:
+        cmd_parts.extend(["--foldx-pdb", str(foldx_path)])
     cmd = shlex.join(cmd_parts)
+    foldx_used = {"foldx_pdb": str(foldx_path) if foldx_path is not None else None,
+                  "skip_foldx": skip_foldx}
 
     if slurm:
         partition = _resolve_partition(partition)
@@ -7311,6 +7548,7 @@ async def tfbs_chipseq_method_comparison(
         submit_result["command"] = cmd
         submit_result["output_dir"] = str(out)
         submit_result["checkpoints"] = found
+        submit_result.update(foldx_used)
         if ckpt_warning:
             submit_result["warning"] = ckpt_warning
         return json.dumps(submit_result)
@@ -7319,6 +7557,9 @@ async def tfbs_chipseq_method_comparison(
     if err:
         return err
     if result.returncode != 0:
+        missing = _foldx_missing_failure(result.stderr, output_dir=str(out), command=cmd)
+        if missing:
+            return missing
         return json.dumps({
             "error": f"Method comparison failed (exit {result.returncode})",
             "fix": "Read stderr for the cause; a checkpoint missing under "
@@ -7328,7 +7569,7 @@ async def tfbs_chipseq_method_comparison(
         })
     files = [str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()]
     return json.dumps({
-        "mode": "direct", "output_dir": str(out), "checkpoints": found,
+        "mode": "direct", "output_dir": str(out), "checkpoints": found, **foldx_used,
         **({"warning": ckpt_warning} if ckpt_warning else {}),
         "files": files, "stdout": result.stdout[-1000:],
     })
@@ -7394,24 +7635,31 @@ async def tfbs_remap_validation(
             Column 5 must encode the experiment count.
         output_dir: Where the script writes summary.csv, the two scores
             CSVs, and roc_all_methods.png.
-        motif_file: JASPAR / MEME motif file for FIMO. Falls back to
+        motif_file: JASPAR / MEME motif file for FIMO.  Default "":
             $TFBS_MOTIF_FILE.  The FIMO leg always runs and needs the
             MEME Suite's fimo program on the server's PATH (also on the
             compute node for slurm=true); without it the call returns an
             error before anything runs or is submitted.  The tangermeme
             fallback of tfbs_fimo does not apply here.
         foldx_pdb: Repaired TF-DNA complex PDB for FoldX scoring.
-            Falls back to $TFBS_FOLDX_PDB. Not required when
-            skip_foldx is true.
-        score_min: Minimum experiment count in the ReMap BED.
+            Default "": $TFBS_FOLDX_PDB; with neither the call returns
+            an error unless skip_foldx is true.  With a structure the
+            pipeline needs FoldX ($TFBS_FOLDX_BIN, else foldx or foldx5
+            on PATH, on the compute node for slurm=true) and stops with
+            an error that suggests skip_foldx=true when it finds none.
+        score_min: Minimum experiment count in the ReMap BED (default
+            4).
         max_positives: Subsample the high-confidence set to this many
             peaks (FoldX is the bottleneck; default 500).
-        negative_mode: "shuffle" for dinucleotide-shuffled positives or
-            "genomic" for length+GC matched random regions.
-        datasets: NN dataset names (subdirectories of models_dir).
-        model_type: Model architecture class name in tfbs.nn.models; an
-            unknown one is an error before anything runs or is submitted.
-        models_dir: Base checkpoint directory; a relative path resolves
+        negative_mode: "shuffle" (default) for dinucleotide-shuffled
+            positives or "genomic" for length+GC matched random regions.
+        datasets: NN dataset names (subdirectories of models_dir;
+            default all_mean, core_mean, flank_mean).
+        model_type: Model architecture class name in tfbs.nn.models
+            (default "VCNNBpnet"); an unknown one is an error before
+            anything runs or is submitted.
+        models_dir: Base checkpoint directory (default
+            "saved_models_final"); a relative path resolves
             against the project root (TFBS_PROJECT_ROOT, see
             tfbs_server_info), where the pipeline runs.  Each dataset's
             checkpoint is <models_dir>/<dataset>/<scaling_method>/
@@ -7440,28 +7688,35 @@ async def tfbs_remap_validation(
             model_type.  The NN scores are the model's raw outputs, in
             the training scale for a standardized model, which leaves
             the AUCs unchanged.
-        genome_fasta: Reference genome FASTA. Falls back to
+        genome_fasta: Reference genome FASTA.  Default "":
             $TFBS_GENOME_FASTA.
-        foldx_workers: Parallel CPU workers for FoldX.
-        foldx_window: DNA window for FoldX (must match the PDB).
-        nn_window: Tile size for the NN score.
-        max_region_len: Cap on the per-peak region length for tiling.
-        skip_foldx: Skip the FoldX leg (useful for quick NN+FIMO runs).
+        foldx_workers: Parallel CPU workers for FoldX (default 32).
+        foldx_window: DNA window for FoldX in bp (default 11; must match
+            the PDB).
+        nn_window: Tile size for the NN score in bp (default 24).
+        max_region_len: Cap on the per-peak region length for tiling, in
+            bp (default 500).
+        skip_foldx: Skip the FoldX leg (default false; true is useful for
+            quick NN+FIMO runs and needs neither foldx_pdb nor FoldX).
         device: "cuda" or "cpu" for NN inference.  If omitted: "cuda" for
             a SLURM job (the job requests one GPU), otherwise the server's
             detected default device (see tfbs_server_info).
-        seed: Random seed for negative sampling and shuffle.
-        slurm: Submit as a SLURM job (recommended when FoldX is on).
+        seed: Random seed for negative sampling and shuffle (default
+            42).
+        slurm: Submit as a SLURM job (default true; recommended when
+            FoldX is on).
         partition: SLURM partition.  Defaults to the server's
             default_partition: $TFBS_SLURM_PARTITION, else "gpu"
             (see tfbs_server_info), because the job requests a GPU and
             "gpu" is the usual name of a cluster's GPU partition.
-        max_time: SLURM wall time.
+        max_time: SLURM wall time (default "12:00:00").
 
     Returns:
         JSON with output_dir, checkpoints (the file used per dataset),
         file list, and either job_id (slurm=true) or the parsed AUC summary (slurm=false, summary.csv read back
-        as a list of {method, auc, n_pos, n_neg} entries).
+        as a list of {method, auc, n_pos, n_neg} entries).  In direct
+        mode a run that stopped because FoldX is missing returns that
+        error.
     """
     if datasets is None:
         datasets = ["all_mean", "core_mean", "flank_mean"]
@@ -7478,7 +7733,7 @@ async def tfbs_remap_validation(
     if not skip_foldx:
         foldx_path, err = _resolve_reference(foldx_pdb, "foldx_pdb")
         if err:
-            return err
+            return _with_skip_foldx_hint(err)
 
     err = _fimo_binary_error("tfbs_remap_validation", "")
     if err:
@@ -7565,6 +7820,9 @@ async def tfbs_remap_validation(
     if err:
         return err
     if result.returncode != 0:
+        missing = _foldx_missing_failure(result.stderr, output_dir=str(out), command=cmd)
+        if missing:
+            return missing
         return json.dumps({
             "error": f"ReMap validation failed (exit {result.returncode})",
             "fix": "Read stderr for the cause; a checkpoint missing under "
@@ -7634,6 +7892,7 @@ async def tfbs_disease_variant_validation(
     partition: str = "compute",
     max_time: str = "06:00:00",
     model_type: str = "VCNNBpnet",
+    skip_foldx: bool = False,
 ) -> str:
     """Validate TF-binding models against ClinVar disease variants.
 
@@ -7656,9 +7915,9 @@ async def tfbs_disease_variant_validation(
             every peak counts 1.
         output_dir: Directory to write results, plots, and summary CSV.
         clinvar_vcf: Indexed ClinVar VCF (.vcf.gz with its .tbi, or .csi,
-            next to it). Falls back to $TFBS_CLINVAR_VCF.  Without the
+            next to it).  Default "": $TFBS_CLINVAR_VCF.  Without the
             index the call returns an error before anything runs.
-        genome_fasta: Reference genome FASTA file. Falls back to
+        genome_fasta: Reference genome FASTA file.  Default "":
             $TFBS_GENOME_FASTA.
         peak_confidence: Minimum value of the BED 4th column to keep
             (e.g. ChIP-Atlas overlap >= 3). Default 1.  Above 1 every
@@ -7692,26 +7951,34 @@ async def tfbs_disease_variant_validation(
             tfbs_fimo does not apply here.
         foldx_pdb: Repaired TF-DNA complex PDB for the FoldX leg.  Empty
             or null uses $TFBS_FOLDX_PDB; when that is unset too, the
-            FoldX leg is skipped.  FoldX is computationally expensive;
-            consider slurm=true.
+            FoldX leg is skipped.  With a structure (and skip_foldx
+            false) the pipeline needs FoldX ($TFBS_FOLDX_BIN, else foldx
+            or foldx5 on PATH, on the compute node for slurm=true) and
+            stops with an error that suggests skip_foldx=true when it
+            finds none, before it reads the peaks.  FoldX is
+            computationally expensive; consider slurm=true.
+        skip_foldx: Skip the FoldX leg even when a structure is set
+            (default false): neither foldx_pdb nor $TFBS_FOLDX_PDB is
+            resolved or passed to the pipeline, so FoldX is not needed.
         nn_window: Window size around the variant for NN scoring
             (default 24, matches model input).
-        foldx_workers: Parallel CPU workers for FoldX.
+        foldx_workers: Parallel CPU workers for FoldX (default 16).
         device: "cuda" or "cpu" for NN inference.  If omitted: "cpu" for a
             SLURM job (the job requests no GPU), otherwise the server's
             detected default device (see tfbs_server_info).
-        slurm: Submit as a SLURM job rather than running directly.
-            Strongly recommended when FoldX is enabled.
+        slurm: Submit as a SLURM job rather than running directly
+            (default false).  Strongly recommended when FoldX is enabled.
         partition: SLURM partition (default "compute").  This job requests
             no GPU, so unlike the GPU tools it does not default to the
             server's default_partition; pass the name of a CPU partition
             if the cluster has no partition called "compute".
-        max_time: SLURM wall time (max 48:00:00).
+        max_time: SLURM wall time (default "06:00:00", max 48:00:00).
 
     Returns:
         JSON with mode, output_dir, clinvar_vcf, nn_models (the name to
         checkpoint map used, absolute paths), model_type, motif_file and
-        foldx_pdb (the files used, null for a skipped leg), and command.
+        foldx_pdb (the files used, null for a skipped leg), skip_foldx,
+        and command.
         slurm=true adds job_id and expected_summary (the
         summary_all_methods.csv the job writes).  slurm=false adds files,
         stdout (its last 1000 characters) and summary, the
@@ -7719,7 +7986,8 @@ async def tfbs_disease_variant_validation(
         auc_raw, mwu_p, n_path, n_benign} (method is "NN <name>", "FIMO"
         or "FoldX"; a method with fewer than 10 scored variants or one
         class only has no row).  When no ClinVar variant falls in the
-        peaks the pipeline stops and the call returns an error saying so.
+        peaks the pipeline stops and the call returns an error saying so,
+        as it does when the pipeline stopped because FoldX is missing.
     """
     clinvar_path, err = _resolve_reference(clinvar_vcf, "clinvar_vcf")
     if err:
@@ -7741,9 +8009,13 @@ async def tfbs_disease_variant_validation(
     motif_path, err = _optional_reference(motif_file, "motif_file")
     if err:
         return err
-    foldx_path, err = _optional_reference(foldx_pdb, "foldx_pdb")
-    if err:
-        return err
+    # skip_foldx drops the FoldX leg even when a structure is registered, so
+    # the structure is neither checked nor passed on.
+    foldx_path = None
+    if not skip_foldx:
+        foldx_path, err = _optional_reference(foldx_pdb, "foldx_pdb")
+        if err:
+            return _with_skip_foldx_hint(err)
     if motif_path is not None:
         err = _fimo_binary_error(
             "tfbs_disease_variant_validation",
@@ -7829,6 +8101,7 @@ async def tfbs_disease_variant_validation(
         "model_type": model_type,
         "motif_file": str(motif_path) if motif_path is not None else None,
         "foldx_pdb": str(foldx_path) if foldx_path is not None else None,
+        "skip_foldx": skip_foldx,
         "command": cmd,
     }
 
@@ -7863,6 +8136,9 @@ async def tfbs_disease_variant_validation(
         return err
 
     if result.returncode != 0:
+        missing = _foldx_missing_failure(result.stderr, stdout=result.stdout[-500:], **used)
+        if missing:
+            return missing
         if "No ClinVar variants found" in result.stderr:
             return _error(
                 "No ClinVar variant falls in the peaks, so there is nothing to score.",
