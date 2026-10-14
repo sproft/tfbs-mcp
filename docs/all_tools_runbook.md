@@ -296,23 +296,32 @@ If a check fails, look at steps 33 and 34, which call FoldX directly and return 
 
 For the validations, also look at the files under `$T/work/<step>/` (for example `remap_validation/summary.csv`, `clinvar_validation/summary_all_methods.csv`); for the SLURM jobs, `squeue -u $USER` after the run shows what is still queued.
 
+Step 15 only shows that the sweep was created and its agent job submitted. Whether the trial trained shows in the agent job, which runs in the project directory and writes `sweep_<sweep id>_<job id>.out` and `.err` there; the job fails when a trial fails, and a trained trial leaves `best-<model>-<run name>.ckpt` under `saved_models_tuned/`:
+
+```bash
+read JOB SWEEP < <(python -c "import json, sys; r = [s for s in json.load(open(sys.argv[1]))['steps'] if s.get('tool') == 'tfbs_sweep'][0]['result']; print(r.get('job_id'), r.get('sweep_id'))" "$T/session_log_$RUN.json")
+sacct -j "$JOB" --format=JobID,State,Elapsed,ExitCode
+tail -n 25 "$T/project/sweep_${SWEEP}_${JOB}.err"
+find "$T/project/saved_models_tuned" -name '*.ckpt'
+```
+
 ## 7. Runtime
 
-Measured on 2026-10-13 on node s-sc-gpu011 of the BIH cluster (one NVIDIA A100 40 GB, 25 cores, allocation 11178554) with tfbs-mcp 6fbec08 and the INTERSECTIONS directory linked unmerged (3.69 million weighted lines, about 132 s of merging by the formula of 2.3); every one of the 49 steps succeeded, WandB was logged in, so step 15 created a one-trial sweep:
+Measured on 2026-10-14 on node s-sc-gpu002 of the BIH cluster (one NVIDIA A100 40 GB, 25 CPUs, allocation 11194026) with tfbs-mcp 040496a and the INTERSECTIONS directory linked unmerged (3.69 million weighted lines, about 132 s of merging by the formula of 2.3); every one of the 49 steps succeeded and FoldX ran in all three validations that use it. WandB was logged in, so step 15 created a one-trial sweep; its trial failed on the placeholders of the sweep YAML, which wandb locks (the agent read `data_path` and `checkpoint_dir` as `/path/`), and the agent job still ended COMPLETED. Both were fixed afterwards: the agent now reads the task's values over the placeholders and exits nonzero when a trial fails. A first run on 2026-10-13 at 6fbec08 (node s-sc-gpu011) took the same time to within a minute per step, apart from `tfbs_seqlets` (45.6 s there).
 
 | Steps | Measured time |
 |---|---|
-| server start | 22.6 s |
-| 0 to 9, data prep (34,700 windows and negatives) | about 12 s (the GC-matched extraction 10.8 s) |
-| 10 to 15, training (6 epochs of 44,416 windows) and submissions | 52 s (local training 45.4 s, the sweep 6.2 s) |
-| 16 to 31, analysis | about 48 s (seqlets 45.6 s, every other call under 1.1 s) |
-| 32 to 34, structure | 272 s (one BuildModel window 270.5 s, AnalyseComplex 1.0 s) |
-| 35, benchmark (4 negative TFs, 2,000 windows each) | 135.8 s |
-| 36, method comparison (two FoldX batches of 20) | 689.8 s |
-| 37, ReMap (two FoldX batches of 20) | 677.1 s |
-| 38, ClinVar (44 variants in the 1,000 sampled windows, two FoldX runs each) | 1098.0 s |
-| 39 to 48, SLURM | under 1 s each; the submitted jobs finished on their own within a minute |
-| total | about 50 minutes |
+| server start | 29.9 s |
+| 0 to 9, data prep (34,700 windows and negatives) | 17.6 s (the GC-matched extraction 15.7 s) |
+| 10 to 15, training (6 epochs of 44,416 windows) and submissions | 57.2 s (local training 50.0 s, the sweep 6.8 s) |
+| 16 to 31, analysis | 6.8 s (seqlets 3.5 s, every other call under 2.1 s) |
+| 32 to 34, structure | 269.8 s (one BuildModel window 268.5 s, AnalyseComplex 0.8 s) |
+| 35, benchmark (4 negative TFs, 2,000 windows each) | 137.3 s |
+| 36, method comparison (two FoldX batches of 20) | 686.6 s |
+| 37, ReMap (two FoldX batches of 20) | 674.8 s |
+| 38, ClinVar (44 variants in the 1,000 sampled windows, two FoldX runs each) | 1074.6 s |
+| 39 to 48, SLURM | under 0.1 s each |
+| total | 2955 s from launch to the last step, about 49 minutes |
 
 The estimate made before that run (25 to 40 minutes) was too low for the three FoldX validations, which took 11 to 18 minutes each; a node with fewer than 24 cores stretches them further.
 
