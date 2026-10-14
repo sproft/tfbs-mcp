@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfbs-mcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python library and Model Context Protocol server for transcription factor binding site analysis"
 readme = "README.md"
 license = {text = "MIT"}

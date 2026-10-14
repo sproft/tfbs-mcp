@@ -231,7 +231,7 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 
 - **You need:** a loaded model (released or your own). For motif names, a MEME motif file such as JASPAR.
 - **Say to Claude**, one question at a time:
-  - *Which bases drive the score?* With the flank model, compute DeepLiftShap attributions and an in-silico mutagenesis map for GGGCTCCTCACTTGACCTTTGCTG, and list the five most important positions. (Attributions split the score among the bases by comparing with shuffled copies of the sequence; mutagenesis changes every base to each other base and records the score change.)
+  - *Which bases drive the score?* With the flank model, compute DeepLiftShap attributions and an in-silico mutagenesis map for GGGCTCCTCACTTGACCTTTGCTG, and list the five most important positions. (Attributions split the score among the bases by comparing the sequence with 20 shuffled copies of itself that keep its dinucleotide content; mutagenesis changes every base to each other base and records the score change.)
   - *Does the motif raise the score anywhere?* With the flank model, measure how much inserting CACTTGA into 100 random backgrounds changes the prediction.
   - *Which motifs did the model learn, and do they match JASPAR?* With the flank model, call seqlets in \<sequences> and match them against \<JASPAR.meme> with TOMTOM; also turn the first-layer filters into motifs. (Seqlets are short stretches with high attribution.)
   - *Do two positions act together?* With the flank model, compute pairwise epistasis for GGGCTCCTCACTTGACCTTTGCTG and list the strongest interactions.
@@ -268,22 +268,22 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 
 ### Check ClinVar disease variants in your TF's peaks
 
-- **You need:** a model, a released NKX2-1 `vcnnbpnet.pt` or a `.ckpt` you trained, the indexed ClinVar VCF (`clinvar.vcf.gz` with its `.tbi`), a peak BED and a registered genome; optionally a motif (with the `fimo` program) and a repaired PDB. Linux, macOS or WSL, because pysam has no Windows wheel.
+- **You need:** a model, a released NKX2-1 `vcnnbpnet.pt` or a `.ckpt` you trained, the indexed ClinVar VCF (`clinvar.vcf.gz` with its `.tbi`), a peak BED and a registered genome; optionally a motif (with the `fimo` program) and a repaired PDB (with FoldX). Linux, macOS or WSL, because pysam has no Windows wheel.
 - **Say to Claude:**
   > Run the ClinVar disease-variant check on the peaks in <peaks.bed> with the registered ClinVar file, motif and genome, scoring the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt as "flank" (model type VCNNBpnet), writing to \<project>/results/clinvar_nkx2-1. Report for each method the ROC-AUC for separating pathogenic from benign variants, with the variant counts.
 
   For a model you trained, name its `.ckpt` (e.g. <path/to/best_VCNNBpnet.ckpt>) instead.
-- **What happens:** Claude runs `tfbs_disease_variant_validation`: it takes the non-coding pathogenic and benign single-base ClinVar variants inside the peaks, scores both alleles with the model, with FIMO and with FoldX (when a structure is registered), and tests whether the size of the change separates pathogenic from benign. Always name the checkpoint; without it no network is scored. It runs directly unless you ask for a SLURM job.
+- **What happens:** Claude runs `tfbs_disease_variant_validation`: it takes the non-coding pathogenic and benign single-base ClinVar variants inside the peaks, scores both alleles with the model, with FIMO and with FoldX (when a structure is registered), and tests whether the size of the change separates pathogenic from benign. With a structure registered but FoldX missing, the check stops before it reads the peaks and says so; add "skip FoldX" to run it without the FoldX leg. Always name the checkpoint; without it no network is scored. It runs directly unless you ask for a SLURM job.
 - **You get:** `summary_all_methods.csv` and plots in the output folder, and per method in the reply: `auc_abs` (ROC-AUC of the size of the change, ignoring its direction), `auc_raw` (the same with the signed change), `mwu_p` (Mann-Whitney U p-value for the size of the change) and the counts `n_path` and `n_benign`. A method with fewer than 10 scored variants, or with only pathogenic or only benign ones, has no row.
 
 ### Benchmark against other TFs on ChIP-Atlas
 
-- **You need:** a folder with one intersection file per TF, named `<TF>.allintersect.bed`: the output of `bedtools multiinter -header` over that TF's per-experiment ChIP-Atlas peak files (a header line, then chrom, start, end, the number of experiments, ...). Also a registered genome and a model: a released NKX2-1 `vcnnbpnet.pt` or a `.ckpt` you trained. The method comparison also needs a motif, the `fimo` program (WSL on Windows), FoldX and a repaired PDB.
+- **You need:** a folder with one intersection file per TF, named `<TF>.allintersect.bed`: the output of `bedtools multiinter -header` over that TF's per-experiment ChIP-Atlas peak files (a header line, then chrom, start, end, the number of experiments, ...). Also a registered genome and a model: a released NKX2-1 `vcnnbpnet.pt` or a `.ckpt` you trained. The method comparison also needs a motif, the `fimo` program (WSL on Windows), FoldX and a repaired PDB; without FoldX, ask it to skip FoldX.
 - **Say to Claude:**
   > Benchmark the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt as "flank" (model type VCNNBpnet) on the ChIP-Atlas intersection files in \<folder>: NKX2-1 as the positive TF against GATA1, MYOD1, NKX2-5 and RXRA, writing to \<project>/results/chipseq_benchmark.
 
   For a model you trained, name its `.ckpt` (e.g. <path/to/best_VCNNBpnet.ckpt>) instead.
-- **What happens:** Claude scores the peaks of every TF and asks whether the score separates NKX2-1 peaks from each other TF's peaks, at experiment-count cutoffs 1, 3, 5 and 8, and whether it rises with the number of experiments (`tfbs_chipseq_benchmark`). Ask for "the head-to-head comparison with FIMO and FoldX" to run the same task on 500 peaks per TF with all three methods (`tfbs_chipseq_method_comparison`), as a SLURM job by default, because FoldX makes it take hours.
+- **What happens:** Claude scores the merged peaks of every TF (at most 15,000 per TF, a random subsample of larger sets) and asks three questions (`tfbs_chipseq_benchmark`): whether the score separates NKX2-1 peaks from each other TF's peaks; whether it separates the NKX2-1 peaks seen in at least 1, 3, 5 or 8 experiments from the other NKX2-1 peaks; and whether it rises with the number of experiments. Ask for "the head-to-head comparison with FIMO and FoldX" to run the same task on 500 peaks per TF with all three methods (`tfbs_chipseq_method_comparison`), as a SLURM job by default, because FoldX makes it take hours.
 - **You get:** `classification_cutoff_results.csv`, `classification_vs_negatives.csv`, `regression_results.csv` and ROC and regression plots; the comparison writes `auc_summary.csv`, `auc_pivot.csv` and `roc_by_neg_tf.png`.
 
 ### Run on a SLURM cluster
@@ -325,7 +325,7 @@ Two more variables are optional and not asked by `--setup`; add them to the `--e
 
 | Variable | What it does |
 |---|---|
-| `TFBS_SLURM_PARTITION` | default partition of the GPU jobs (`tfbs_train`, `tfbs_validate`, `tfbs_sweep`, the benchmark and ReMap tools); unset, `gpu`. `tfbs_server_info` reports it as `default_partition` |
+| `TFBS_SLURM_PARTITION` | default partition of the GPU jobs (`tfbs_train` in config mode, `tfbs_validate`, `tfbs_sweep`, the two ChIP-Atlas benchmark tools and `tfbs_remap_validation`); unset, `gpu`. `slurm_submit` adds no partition, `tfbs_disease_variant_validation` defaults to `compute` and `tfbs_binding_scan` to the cluster's default partition. `tfbs_server_info` reports it as `default_partition` |
 | `TFBS_CALL_LOG` | path of a JSON Lines file. When set, every tool call appends one line after it returns, holding the arguments and the result: `timestamp` (start of the call, UTC), `tool`, `arguments` as received, `seconds` (wall time), `is_error` and `result` (the tool's JSON answer; one larger than 1 MB is stored as its size and first 4096 characters). A call that fails is logged too. Unset, nothing is written. `tfbs_server_info` reports the file in use as `call_log` |
 
 ## Uninstall

@@ -660,8 +660,11 @@ class WarningConv(TinyConv):
 def test_analyze_returns_the_warnings_raised_during_attribution(method):
     server._model_registry["tc_wide"] = {**server._model_registry["tc"],
                                          "model": WarningConv().eval()}
-    result = run(server.tfbs_analyze(model_id="tc_wide", sequences=[SEQ], method=method,
-                                     n_shuffles=2))
+    # DeepLiftShap's references are dinucleotide shuffles of the input, and
+    # SEQ (ACGT repeated) has no shuffle other than itself.
+    seq = "ACGGATCCTA" if method == "deepliftshap" else SEQ
+    result = run(server.tfbs_analyze(model_id="tc_wide", sequences=[seq], method=method,
+                                     n_shuffles=5))
     messages = [w["message"] for w in result["warnings"]]
     assert "RuntimeWarning: attribution looks unstable" in messages
     assert len(messages) == len(set(messages))

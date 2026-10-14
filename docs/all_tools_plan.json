@@ -530,7 +530,7 @@
    "foldx_workers": 24,
    "slurm": false
   },
-  "note": "Runs NN, FIMO and FoldX on 20 windows each of NKX2-1 and GATA1 directly, with the motif and PDB taken from TFBS_MOTIF_FILE and TFBS_FOLDX_PDB; good is mode direct and an auc_summary.csv with a FoldX row (or at least non-empty FoldX values in raw_scores.csv), since the pipeline skips FoldX without an error when foldx is not on the server's PATH and turns a failed FoldX run into NaN, so is_error false alone does not show that FoldX ran."
+  "note": "Runs NN, FIMO and FoldX on 20 windows each of NKX2-1 and GATA1 directly, with the motif and PDB taken from TFBS_MOTIF_FILE and TFBS_FOLDX_PDB; good is mode direct and an auc_summary.csv with a FoldX row (or at least non-empty FoldX values in raw_scores.csv), since the pipeline turns a failed FoldX run into NaN, so is_error false alone does not show that FoldX ran (without a FoldX binary the call returns the FoldX-missing error)."
  },
  {
   "role": "tool",
@@ -573,7 +573,7 @@
    "foldx_workers": 24,
    "slurm": false
   },
-  "note": "Runs the ClinVar check directly on the 1000 sampled peak windows with NN, FIMO (motif from the environment) and FoldX (PDB from the environment); good is mode direct with clinvar_snvs.csv, summary_all_methods.csv and non-NaN foldx_ddG values in combined_results.csv, since the pipeline writes NaN FoldX columns without an error when foldx is not on the server's PATH or a FoldX run fails; the summary has rows only for methods with at least 10 scored variants and both classes present."
+  "note": "Runs the ClinVar check directly on the 1000 sampled peak windows with NN, FIMO (motif from the environment) and FoldX (PDB from the environment); good is mode direct with clinvar_snvs.csv, summary_all_methods.csv and non-NaN foldx_ddG values in combined_results.csv, since the pipeline writes NaN FoldX values without an error when a FoldX run fails (without a FoldX binary the call returns the FoldX-missing error); the summary has rows only for methods with at least 10 scored variants and both classes present."
  },
  {
   "role": "tool",

@@ -16,7 +16,6 @@ import sys
 
 # Third-party Imports
 import torch
-import torch.optim as optim
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
@@ -55,12 +54,14 @@ def get_model_params(model_name: str, config: wandb.config) -> dict:
         }
     
     elif model_name == 'VCNNBpnet':
-        # VCNNBpnet requires combining two dense sizes into a list
+        # VCNNBpnet requires combining two dense sizes into a list.
+        # num_channels and pool_output_size are unprefixed, as the bundled
+        # sweep YAML (tfbs/configs/wandb_sweep_config.yaml) names them.
         dense_sizes = [config.VCNN_dense_size_1, config.VCNN_dense_size_2]
         return {
-            'num_channels': config.VCNN_num_channels,
+            'num_channels': config.num_channels,
             'kernel_size': config.VCNN_kernel_size,
-            'pool_output_size': config.VCNN_pool_output_size,
+            'pool_output_size': config.pool_output_size,
             'dense_sizes': dense_sizes,
         }
         
@@ -116,7 +117,6 @@ def train_sweep_agent(fixed_config: dict | None = None):
         model_params.update({
             'input_channels': 4, # Fixed for sequence data
             'input_length': SEQUENCE_LENGTH,
-            'dropout': config.dropout,
             'learning_rate': config.lr,
         })
 
@@ -132,22 +132,7 @@ def train_sweep_agent(fixed_config: dict | None = None):
             scaling_method=config.scaling_method
         )
 
-        # 4. Configure Optimizer (where weight_decay is applied)
-        # Note: PyTorch Lightning allows overriding configure_optimizers() in the model,
-        # but for consistent weight decay application, we'll demonstrate it here 
-        # (assuming TFBSModel uses standard Adam or AdamW)
-        if hasattr(model, 'configure_optimizers'):
-            # If the model handles its own optimizer, it must apply weight_decay
-            # We'll rely on the model for now.
-            pass 
-        else:
-            # Placeholder for models that don't define it (typically base TFBSModel)
-            model.optimizer = optim.AdamW
-            model.optimizer_kwargs = {'lr': config.lr, 'weight_decay': config.weight_decay}
-            # The actual implementation relies on the model's configure_optimizers() method
-            # to pick up model.optimizer_kwargs.
-
-        # 5. Define Callbacks
+        # 4. Define Callbacks
         
         # Checkpointing: Save the best model based on validation loss
         checkpoint_dir = os.path.join(
@@ -175,7 +160,7 @@ def train_sweep_agent(fixed_config: dict | None = None):
             mode='min'
         )
 
-        # 6. Initialize Trainer
+        # 5. Initialize Trainer
         trainer = pl.Trainer(
             max_epochs=MAX_EPOCHS,
             accelerator='gpu',
@@ -188,7 +173,7 @@ def train_sweep_agent(fixed_config: dict | None = None):
             log_every_n_steps=5,
         )
 
-        # 7. Start Training
+        # 6. Start Training
         trainer.fit(model, data_module)
 
     except Exception as e:

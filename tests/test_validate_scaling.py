@@ -166,4 +166,5 @@ def test_an_unknown_scaling_method_is_rejected_before_submission(tmp_path, submi
 def test_the_description_states_the_checkpoint_default():
     doc = " ".join(server.tfbs_validate.__doc__.split())
     assert "It must be the scaling the checkpoint was trained with" in doc
-    assert "label scaling for a classifier, is an error" in doc
+    assert "label scaling for a classifier whose checkpoint records none, is an error" in doc
+    assert "records label scaling (standardize or normalize) is validated on that scale" in doc

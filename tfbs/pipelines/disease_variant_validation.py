@@ -35,9 +35,12 @@ experiment overlap count there); any other columns are ignored.
 pipeline stops and names the first line whose 4th column is not a number.
 The BED and the VCF may each name chromosomes chr1 or 1.  The ClinVar
 VCF must be bgzipped and tabix-indexed (.tbi or .csi next to it).  The
-pipeline exits non-zero with a message when the index or the fimo program
-(needed with --motif-file) is missing, when --model-type names no class in
-tfbs.nn.models, and when no ClinVar variant falls in the peaks.
+pipeline exits non-zero with a message when the index, the fimo program
+(needed with --motif-file) or the FoldX binary (needed with --foldx-pdb:
+$TFBS_FOLDX_BIN, else foldx or foldx5 on PATH) is missing, when
+--model-type names no class in tfbs.nn.models, and when no ClinVar variant
+falls in the peaks.  A leg whose input is not given (--models,
+--motif-file, --foldx-pdb) is skipped.
 
 Checkpoints: --models NAME=PATH takes a PyTorch Lightning checkpoint or an
 inference checkpoint such as the NKX2-1 study's released
@@ -76,6 +79,7 @@ from sklearn.metrics import roc_auc_score, roc_curve
 
 from tfbs.bedio import numbered_bed_lines
 from tfbs.nn.loading import load_checkpoint
+from tfbs.pipelines import find_foldx, foldx_required_message
 
 NUC_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
 COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
@@ -477,18 +481,21 @@ def score_with_fimo(df: pd.DataFrame, genome, motif_file: str, window_factor: in
     return out_df
 
 
-def score_with_foldx(df: pd.DataFrame, genome, foldx_pdb: str, n_workers: int = 16) -> pd.DataFrame:
-    """Add FoldX ΔΔG column. Uses the DNA length encoded in the PDB."""
+def score_with_foldx(df: pd.DataFrame, genome, foldx_pdb: str, n_workers: int = 16,
+                     foldx_bin: str | None = None) -> pd.DataFrame:
+    """Add FoldX ΔΔG column. Uses the DNA length encoded in the PDB.
+
+    foldx_bin defaults to find_foldx() ($TFBS_FOLDX_BIN, else foldx or
+    foldx5 on PATH); without a binary the run stops with the FoldX-missing
+    message instead of returning empty FoldX columns.
+    """
     from tfbs.mcp.foldx_tools import (
         _parse_dna_from_pdb, _build_foldx_mutation_string,
         _run_foldx_energy,
     )
-    foldx_bin = shutil.which("foldx") or shutil.which("foldx5")
-    if foldx_bin is None:
-        df["foldx_ref_dG"] = np.nan
-        df["foldx_alt_dG"] = np.nan
-        df["foldx_ddG"] = np.nan
-        return df
+    foldx_bin = foldx_bin or find_foldx()
+    if not foldx_bin:
+        sys.exit(foldx_required_message())
 
     dna = _parse_dna_from_pdb(foldx_pdb)
     fwd = sorted(dna.keys())[0]
@@ -689,7 +696,10 @@ def main(argv=None):
     parser.add_argument("--models", nargs="*", default=[],
                         help="NN models as name=path (e.g. flank=ckpt.ckpt)")
     parser.add_argument("--motif-file", help="JASPAR/MEME motif file for FIMO")
-    parser.add_argument("--foldx-pdb", help="Repaired TF-DNA complex PDB for FoldX")
+    parser.add_argument("--foldx-pdb",
+                        help="Repaired TF-DNA complex PDB for FoldX; needs FoldX "
+                             "($TFBS_FOLDX_BIN, else foldx or foldx5 on PATH). "
+                             "Without it the FoldX leg is skipped")
     parser.add_argument("--nn-window", type=int, default=24,
                         help="Window size around variant for NN scoring")
     parser.add_argument("--foldx-workers", type=int, default=16)
@@ -706,6 +716,13 @@ def main(argv=None):
     if args.motif_file and shutil.which("fimo") is None:
         from tfbs.pipelines import FIMO_REQUIRED
         sys.exit(FIMO_REQUIRED)
+    # A structure means a FoldX leg: without the binary, stop now rather than
+    # leave the FoldX columns empty after the other legs have run.
+    foldx_bin = None
+    if args.foldx_pdb:
+        foldx_bin = find_foldx()
+        if not foldx_bin:
+            sys.exit(foldx_required_message())
     if args.models:
         model_class(args.model_type)
 
@@ -754,7 +771,7 @@ def main(argv=None):
     if args.foldx_pdb:
         print("\n=== Step 3c: FoldX scoring ===")
         df = score_with_foldx(df, genome, args.foldx_pdb,
-                              n_workers=args.foldx_workers)
+                              n_workers=args.foldx_workers, foldx_bin=foldx_bin)
         print(f"After FoldX scoring: {len(df)} variants")
 
     df.to_csv(output / "combined_results.csv", index=False)

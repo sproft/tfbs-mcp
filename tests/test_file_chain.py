@@ -436,8 +436,10 @@ def test_analyze_file_input_writes_attributions(tmp_path):
 
 def test_analyze_deepliftshap_reads_a_fasta(tmp_path):
     fasta = tmp_path / "s.fa"
-    fasta.write_text("".join(f">r{i}\n{s}\n" for i, s in enumerate(SEQS[:2])))
-    result = run(server.tfbs_analyze(model_id="acg", sequences_path=str(fasta), n_shuffles=2,
+    # DeepLiftShap shuffles each sequence, so these need dinucleotide diversity.
+    fasta.write_text("".join(f">r{i}\n{s}\n"
+                             for i, s in enumerate(["ACGGATCCTA", "GATTACAGCA"])))
+    result = run(server.tfbs_analyze(model_id="acg", sequences_path=str(fasta), n_shuffles=5,
                                      output_dir=str(tmp_path / "attr")))
     assert result["ids"] == ["r0", "r1"]
     assert result["files"]["attributions"] == str((tmp_path / "attr" / "attributions.pt").resolve())
