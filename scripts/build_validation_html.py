@@ -71,7 +71,7 @@ af3_csv    = RESULTS / "alphafold_results.csv"
 
 headline_rows = []
 for label, dir_, n in [
-    ("ReMap score >= 4 (peak in all 4 ChIP-seq experiments) vs shuffled",
+    ("ReMap score >= 4 (maximal support) vs shuffled",
      s4_shuffle, 105),
     ("ReMap score >= 4 vs random GC-matched genomic regions",
      s4_random, 105),
@@ -145,7 +145,11 @@ uniformly reprocessed ChIP-seq experiments. NKX2-1 in ReMap 2022 has four
 experiments across three lung adenocarcinoma cell lines (NCI-H2087,
 NCI-H1819, NCI-H3122) and H9 embryonic stem cells. The non-redundant peak
 list has 124,382 peaks. We focused on the highest-confidence subset:
-peaks called in all four experiments (n = 105). For comparison we also
+peaks with the maximal ReMap score of four (n = 105). The score counts
+the original peaks merged into a non-redundant peak, so it is close to,
+but not the same as, the number of supporting experiments: 100 of the
+105 peaks were called in all four experiments, and the other 5 merge two
+peaks of one experiment with peaks of two others. For comparison we also
 ran a larger but less stringent set (peaks in two or more experiments,
 n = 500).
 </p>

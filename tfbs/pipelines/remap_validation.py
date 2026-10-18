@@ -2,7 +2,9 @@
 External validation of NKX2-1 binding-site models against ReMap 2022.
 
 Positives: ReMap 2022 hg38 NKX2-1 non-redundant peaks. Column 5 (score)
-counts how many of the 4 ChIP-seq experiments support the peak.
+counts the original peaks merged into each non-redundant peak, which is
+close to the number of supporting experiments (one experiment can
+contribute two overlapping peaks).
 
 Negatives: random length-matched, GC-matched genomic regions, excluding
 any ReMap NKX2-1 peak +/- 1 kb.
