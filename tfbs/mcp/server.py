@@ -7615,8 +7615,10 @@ async def tfbs_remap_validation(
 ) -> str:
     """External validation of a TFBS model against a ReMap peak set.
 
-    Positives are ReMap peaks at experiment-count >= score_min (column 5
-    of the ReMap BED). Negatives are either dinucleotide-shuffled
+    Positives are ReMap peaks with score >= score_min (column 5 of the
+    ReMap BED: the number of original peaks merged into the
+    non-redundant peak, close to the number of supporting experiments).
+    Negatives are either dinucleotide-shuffled
     positives (cleanest motif-disrupting control) or length+GC matched
     random genomic regions that do not overlap any ReMap peak +/- 1 kb.
     All three method families are scored on the same regions: the NN
@@ -7632,7 +7634,7 @@ async def tfbs_remap_validation(
 
     Args:
         remap_bed: ReMap 2022 non-redundant BED for the target TF.
-            Column 5 must encode the experiment count.
+            Column 5 must hold the ReMap score (merged peak count).
         output_dir: Where the script writes summary.csv, the two scores
             CSVs, and roc_all_methods.png.
         motif_file: JASPAR / MEME motif file for FIMO.  Default "":
@@ -7647,7 +7649,7 @@ async def tfbs_remap_validation(
             pipeline needs FoldX ($TFBS_FOLDX_BIN, else foldx or foldx5
             on PATH, on the compute node for slurm=true) and stops with
             an error that suggests skip_foldx=true when it finds none.
-        score_min: Minimum experiment count in the ReMap BED (default
+        score_min: Minimum ReMap score, column 5 of the BED (default
             4).
         max_positives: Subsample the high-confidence set to this many
             peaks (FoldX is the bottleneck; default 500).
