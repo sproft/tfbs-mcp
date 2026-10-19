@@ -13,6 +13,7 @@ import contextlib
 import gzip
 import hashlib
 import importlib
+import io
 import json
 import logging
 import math
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from tfbs.bedio import BedReadError, read_bed
 from tfbs.mcp.cli import SETUP_VARIABLES
@@ -158,6 +160,18 @@ def _resolve_device(device: str | None, slurm_gpu: bool | None = None) -> str:
 CALL_LOG_MAX_RESULT_BYTES = 1024 * 1024
 CALL_LOG_HEAD_CHARS = 4096
 
+#: Largest reply text any tool returns as is.  The stdio message carries the text twice
+#: (content and structuredContent), escaped, so it is 2 to 4 times larger, and Claude Code
+#: closes the server once one message exceeds 16 MB, losing every loaded model.  A larger
+#: reply is saved to a file under results_dir/replies and replaced by a short reply naming it.
+#: The tools with per-item results stay far below this (see _bounded_reply).
+REPLY_HARD_CAP_BYTES = 2 * 1024 * 1024
+
+
+def _text_exceeds(text: str, limit: int) -> bool:
+    """len(text.encode("utf-8")) > limit, without encoding text when its length decides."""
+    return len(text) > limit or (4 * len(text) > limit and len(text.encode("utf-8")) > limit)
+
 
 def _call_result_text(result: Any) -> str | None:
     """The text a tool call returned, from any form the tool manager hands back.
@@ -190,9 +204,7 @@ def _call_log_result(result: Any) -> tuple[Any, bool]:
     text = _call_result_text(result)
     if text is None:
         text = str(result)
-    if len(text) > CALL_LOG_MAX_RESULT_BYTES or (
-            4 * len(text) > CALL_LOG_MAX_RESULT_BYTES
-            and len(text.encode("utf-8")) > CALL_LOG_MAX_RESULT_BYTES):
+    if _text_exceeds(text, CALL_LOG_MAX_RESULT_BYTES):
         head = text[:CALL_LOG_HEAD_CHARS]
         is_error = re.match(r'\s*\{\s*"error"\s*:', head) is not None
         return {"truncated": True, "bytes": len(text.encode("utf-8")), "head": head}, is_error
@@ -260,6 +272,40 @@ def _stdout_to_stderr():
             _stdout_saved = None
 
 
+def _capped_reply(tool: str, result: Any) -> Any:
+    """result, or a short JSON reply naming the file that holds it if its text exceeds REPLY_HARD_CAP_BYTES."""
+    if not isinstance(result, str) or not _text_exceeds(result, REPLY_HARD_CAP_BYTES):
+        return result
+    data = result.encode("utf-8")
+    directory = _results_root() / "replies"
+    try:
+        path, sha = _write_content_addressed(directory, _safe_name(tool), ".json", data)
+    except OSError as exc:
+        return _error(
+            f"The reply of {tool} ({len(data)} bytes) exceeds the server's hard cap of "
+            f"{REPLY_HARD_CAP_BYTES} bytes, and it could not be saved to {directory}: "
+            f"{exc.strerror or exc}.",
+            "Ask for less per call (fewer items, a shorter tail), or make results_dir "
+            "(tfbs_server_info) writable; set TFBS_PROJECT_ROOT to move it.",
+        )
+    logger.warning("Reply of %s (%d bytes) saved to %s instead of being returned.", tool, len(data), path)
+    return json.dumps({
+        "inline": False,
+        "reply_file": {"path": str(path), "format": "json", "bytes": len(data), "sha256": sha},
+        "note": (f"The reply ({len(data)} bytes) exceeds the server's hard cap of "
+                 f"{REPLY_HARD_CAP_BYTES} bytes, so it is in reply_file (JSON) instead."),
+    })
+
+
+def _convert_result(name: str, result: Any) -> Any:
+    """What Tool.run(convert_result=True) returns for result (content blocks, structured output)."""
+    tool = mcp._tool_manager.get_tool(name)
+    try:
+        return tool.fn_metadata.convert_result(result)
+    except Exception as e:
+        raise ToolError(f"Error executing tool {name}: {e}") from e
+
+
 _tool_manager_call_tool = mcp._tool_manager.call_tool
 
 
@@ -273,9 +319,14 @@ async def _call_tool_hook(
     t0 = time.perf_counter()
     try:
         with _stdout_to_stderr():
+            # The tool's own return value first, so that its size can be capped before it
+            # is converted into the message content.
             result = await _tool_manager_call_tool(
-                name, arguments, context=context, convert_result=convert_result,
+                name, arguments, context=context, convert_result=False,
             )
+            result = _capped_reply(name, result)
+            if convert_result:
+                result = _convert_result(name, result)
     except BaseException as exc:
         # Logged, then raised unchanged: the MCP layer reports it as before.
         try:
@@ -1004,6 +1055,181 @@ def _digest(*parts: Any) -> str:
         h.update(json.dumps(part, sort_keys=True, default=str).encode("utf-8"))
         h.update(b"\0")
     return h.hexdigest()[:10]
+
+
+# ---------------------------------------------------------------------------
+# Reply size: per-item results that would make a reply too large go to a file
+# ---------------------------------------------------------------------------
+#: Largest JSON reply, in bytes, that a tool returns with its full per-item lists.
+#: Claude Code closes a stdio server once one message exceeds 16 MB ("wrote >16MB to stdout
+#: without a JSON-RPC message boundary"), which loses every model loaded with tfbs_load_model,
+#: and the call log keeps at most 1 MiB of a result.  512 KiB stays below both.
+_DEFAULT_MAX_INLINE_BYTES = 512 * 1024
+
+#: Highest accepted TFBS_MAX_INLINE_BYTES.  The stdio message carries a reply's text twice
+#: (content and structuredContent), escaped, so it is 2 to 4 times larger than the text, and
+#: the call log truncates results above CALL_LOG_MAX_RESULT_BYTES.
+_MAX_INLINE_BYTES_CAP = CALL_LOG_MAX_RESULT_BYTES
+
+#: A reply whose per-item results are already in files is returned whole up to this size,
+#: even when the reply limit is lower (a limit of 0 still gets a short reply naming its files).
+_REPLY_FILE_THRESHOLD = 64 * 1024
+
+
+def _max_inline_bytes() -> int:
+    """The reply limit: TFBS_MAX_INLINE_BYTES if set to an integer, else 512 KiB; within 0 and 1 MiB.
+
+    0 writes every per-item list to a file.  Values above 1 MiB are lowered to 1 MiB.
+    """
+    raw = os.environ.get("TFBS_MAX_INLINE_BYTES", "").strip()
+    try:
+        value = int(raw) if raw else _DEFAULT_MAX_INLINE_BYTES
+    except ValueError:
+        value = _DEFAULT_MAX_INLINE_BYTES
+    return min(max(0, value), _MAX_INLINE_BYTES_CAP)
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _value_summary(values: list[Any]) -> dict[str, Any]:
+    """n, and min, median, mean and max of the finite numbers among values."""
+    nums = [float(v) for v in values if _is_number(v) and math.isfinite(float(v))]
+    out: dict[str, Any] = {"n": len(values)}
+    if nums:
+        nums.sort()
+        mid = len(nums) // 2
+        median = nums[mid] if len(nums) % 2 else (nums[mid - 1] + nums[mid]) / 2
+        out.update(min=nums[0], median=median, mean=sum(nums) / len(nums), max=nums[-1])
+    return out
+
+
+def _write_content_addressed(directory: Path, stem: str, suffix: str, data: bytes) -> tuple[Path, str]:
+    """Write data as <directory>/<stem>-<first 12 hex digits of its sha256><suffix>.
+
+    The name follows the content, so a later call never changes a file that an earlier
+    reply names, and the bytes go to a temporary file that is then moved into place, so a
+    reader never sees a partial file.  Returns the path and the full sha256.
+    """
+    sha = hashlib.sha256(data).hexdigest()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{stem}-{sha[:12]}{suffix}"
+    if path.is_file() and path.stat().st_size == len(data):
+        return path, sha
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{stem}-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return path, sha
+
+
+def _write_table(directory: Path, stem: str, columns: dict[str, list[Any]]) -> dict[str, Any]:
+    """Write equal-length columns as a CSV (floats at full precision); return its description."""
+    import csv
+
+    names = list(columns)
+    lengths = {len(v) for v in columns.values()}
+    if len(lengths) > 1:
+        raise ValueError(f"columns of unequal length: { {k: len(v) for k, v in columns.items()} }")
+    rows = lengths.pop() if lengths else 0
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    writer.writerow(names)
+    for i in range(rows):
+        writer.writerow([repr(v) if isinstance(v, float) else v for v in (columns[k][i] for k in names)])
+    path, sha = _write_content_addressed(directory, stem, ".csv", buf.getvalue().encode("utf-8"))
+    return {"path": str(path), "format": "csv", "rows": rows, "columns": names, "sha256": sha}
+
+
+def _csv_reading(columns: dict[str, list[Any]]) -> str:
+    """How to read a _write_table CSV back exactly."""
+    numeric = [k for k, v in columns.items() if v and _is_number(v[0])]
+    text = [k for k in columns if k not in numeric]
+    args = ["path", 'float_precision="round_trip"', "keep_default_na=False"]
+    if numeric:
+        args.append("na_values={" + ", ".join(f'"{k}": ["nan"]' for k in numeric) + "}")
+    if text:
+        args.append("dtype={" + ", ".join(f'"{k}": str' for k in text) + "}")
+    return ("Read it exactly with the csv module (float() on the numeric columns) or with "
+            f"pandas.read_csv({', '.join(args)}); pandas' defaults round some floats and turn "
+            "ids such as NA into NaN.")
+
+
+def _spill_error(directory: Path, exc: OSError, size: int) -> str:
+    return _error(
+        f"The reply ({size} bytes) exceeds the reply limit of {_max_inline_bytes()} bytes, and "
+        f"its results file could not be written to {directory}: {exc.strerror or exc}.",
+        "Make the directory writable (the default results directory is results_dir in "
+        "tfbs_server_info; set TFBS_PROJECT_ROOT to move it), or pass fewer sequences per call.",
+    )
+
+
+def _bounded_reply(result: dict[str, Any], *, drop: list[str] = (), table_keys: list[str] = (),
+                   table_dir=None, stem: str = "results") -> str:
+    """json.dumps(result), kept within the reply limit.
+
+    Each step runs only while the reply is still larger than the limit:
+    1. drop the inline copies of the arrays in drop, which result["files"] already holds
+       ("omitted_inline" lists them);
+    2. move result[k] for k in table_keys into a CSV in table_dir() (one column per key, in
+       table_keys order, one row per item), named in "results_file" (path, format, rows,
+       columns, sha256), with a "summary" of each numeric column;
+    3. if the reply is still larger than the limit and than 64 KiB, write the whole reply as
+       JSON to a file and return its "reply_file" description with the reply's short scalar
+       fields.
+    Any step sets "inline": false and a "note".  Files are named after their content.
+    """
+    limit = _max_inline_bytes()
+    text = json.dumps(result)
+    if len(text) <= limit:
+        return text
+    size = len(text)
+    notes = []
+    dropped = [k for k in drop if result.pop(k, None) is not None]
+    if dropped:
+        result["omitted_inline"] = dropped
+        notes.append(f"The inline arrays ({', '.join(dropped)}) are omitted; the files listed "
+                     "under files hold them.")
+        text = json.dumps(result)
+    columns = {k: result[k] for k in table_keys if k in result} if len(text) > limit else {}
+    if columns:
+        directory = table_dir()
+        try:
+            result["results_file"] = _write_table(directory, stem, columns)
+        except OSError as exc:
+            return _spill_error(directory, exc, size)
+        for k in columns:
+            del result[k]
+        summary = {k: _value_summary(v) for k, v in columns.items() if v and _is_number(v[0])}
+        if summary:
+            result["summary"] = summary
+        notes.append(f"The per-item results ({result['results_file']['rows']} rows) are in "
+                     "results_file, one column per inline key. " + _csv_reading(columns))
+    if notes:
+        result["inline"] = False
+        result["note"] = (f"The full reply ({size} bytes) would exceed the reply limit of {limit} "
+                          "bytes. " + " ".join(notes))
+        text = json.dumps(result)
+    if len(text) <= max(limit, _REPLY_FILE_THRESHOLD):
+        return text
+    directory = table_dir() if table_dir is not None else _results_root() / "replies"
+    try:
+        path, sha = _write_content_addressed(directory, "reply", ".json", text.encode("utf-8"))
+    except OSError as exc:
+        return _spill_error(directory, exc, size)
+    short = {k: v for k, v in result.items()
+             if (v is None or isinstance(v, (bool, int, float, str))) and len(json.dumps(v)) <= 200
+             and k != "note"}
+    return json.dumps({**short, "reply_file": {"path": str(path), "format": "json", "sha256": sha},
+                       "inline": False,
+                       "note": (f"The reply ({size} bytes) would exceed the reply limit of {limit} "
+                                "bytes even with its per-item results in files, so the whole reply "
+                                "is in reply_file (JSON).")})
 
 
 def _file_identity(path: str) -> list[Any]:
@@ -1905,7 +2131,7 @@ def _missing_scaling_error(model_id: str) -> str:
     name="tfbs_predict",
     annotations={
         "title": "Predict TF Binding",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes a results file when the reply would exceed the limit
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
@@ -1979,7 +2205,16 @@ async def tfbs_predict(
         "training_scale" when a label scaling was left in place; "unknown"
         for a regression inference checkpoint loaded without any scaling
         block or file);
-        for a FASTA input also "ids" (record names, in score order).
+        for a FASTA input also "ids" (record names, in score order).  If the reply would exceed the server's
+        reply limit (TFBS_MAX_INLINE_BYTES, default 512 KiB; see
+        tfbs_server_info),
+        the per-sequence lists (ids, scores; or ids, best_scores,
+        mean_scores and best_sequences) are written to a CSV with
+        those column names, predictions-<sha256 prefix>.csv (named
+        after its content, so a later call never changes it), and the
+        reply gives "results_file" (path, format, rows, columns,
+        sha256), "summary", "inline": false and a "note" with exact
+        reading settings.
     """
     _ensure_imports()
     X, ids, err = _load_sequence_input(sequences, sequences_path)
@@ -2058,7 +2293,11 @@ async def tfbs_predict(
     result["units"] = _units(entry, inverse)
     if ids is not None:
         result["ids"] = ids
-    return json.dumps(result)
+    per_item = ["ids", "best_scores", "mean_scores", "best_sequences"] if window_mode else ["ids", "scores"]
+    return _bounded_reply(
+        result, table_keys=per_item, stem="predictions",
+        table_dir=lambda: _analysis_dir(None, model_id, "tfbs_predict", _input_key(sequences, sequences_path),
+                                        window_mode, window_size, result["inverse_transformed"]))
 
 
 # ---------------------------------------------------------------------------
@@ -2306,7 +2545,12 @@ async def tfbs_analyze(
         each once as {message, count}, with message the warning's
         category and its text before the first ": " (colon and space),
         so tensor values do not split one warning into many while a
-        path such as C:/data/x.pt stays whole.
+        path such as C:/data/x.pt stays whole.  If the reply would exceed the server's
+        reply limit (TFBS_MAX_INLINE_BYTES, default 512 KiB; see
+        tfbs_server_info),
+        inline attributions are left out (the .pt file holds them), and
+        attribution_sums (with ids) go to
+        attribution_sums-<sha256 prefix>.csv, named in "results_file".
     """
     try:
         from captum.attr import DeepLift, InputXGradient
@@ -2415,7 +2659,8 @@ async def tfbs_analyze(
     raised = _warning_messages(caught)
     if raised:
         result["warnings"] = raised
-    return json.dumps(result)
+    return _bounded_reply(result, drop=["attributions"], table_keys=["ids", "attribution_sums"],
+                          table_dir=lambda: out, stem="attribution_sums")
 
 
 # ---------------------------------------------------------------------------
@@ -2496,7 +2741,13 @@ async def tfbs_mutagenesis(
         "files" with the paths written, "inverse_transformed" and
         "units".  For a
         sequences_path input the arrays are only in the files, and FASTA
-        record names are in "ids".
+        record names are in "ids".  If the reply would exceed the server's
+        reply limit (TFBS_MAX_INLINE_BYTES, default 512 KiB; see
+        tfbs_server_info),
+        the inline arrays are left out ("omitted_inline", "inline":
+        false) and only the files hold them; if the FASTA record names
+        still make it too large, they go to ids-<sha256 prefix>.csv,
+        named in "results_file".
     """
     try:
         # tangermeme >= 1.0 moved this out of tangermeme.ism.
@@ -2571,7 +2822,8 @@ async def tfbs_mutagenesis(
     payload["units"] = _units(entry, inverse)
     if ids is not None:
         payload["ids"] = ids
-    return json.dumps(payload)
+    return _bounded_reply(payload, drop=["original_scores", "mutant_scores", "scores"],
+                          table_keys=["ids"], table_dir=lambda: out, stem="ids")
 
 
 # ---------------------------------------------------------------------------
@@ -2581,7 +2833,7 @@ async def tfbs_mutagenesis(
     name="tfbs_marginalize",
     annotations={
         "title": "Motif Marginalization",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes a results file when the reply would exceed the limit
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
@@ -2627,7 +2879,11 @@ async def tfbs_marginalize(
     Returns:
         JSON with per-sequence lists "delta_predictions" (after - before),
         "predictions_before" and "predictions_after", plus "mean_delta",
-        "motif", "inverse_transformed" and "units".
+        "motif", "inverse_transformed" and "units".  If the reply would exceed the server's
+        reply limit (TFBS_MAX_INLINE_BYTES, default 512 KiB; see
+        tfbs_server_info),
+        the three lists go to predictions-<sha256 prefix>.csv, named in
+        "results_file".
     """
     try:
         from tangermeme.marginalize import marginalize
@@ -2709,7 +2965,7 @@ async def tfbs_marginalize(
         before, after = inverse(before), inverse(after)
     delta = after - before
 
-    return json.dumps({
+    result = {
         "predictions_before": before.tolist(),
         "predictions_after": after.tolist(),
         "delta_predictions": delta.tolist(),
@@ -2717,7 +2973,12 @@ async def tfbs_marginalize(
         "motif": motif,
         "inverse_transformed": inverse is not None,
         "units": _units(entry, inverse),
-    })
+    }
+    return _bounded_reply(
+        result, table_keys=["predictions_before", "predictions_after", "delta_predictions"],
+        stem="predictions",
+        table_dir=lambda: _results_root() / _safe_name(model_id) / "tfbs_marginalize"
+        / _digest(motif, start, n_background, sequences))
 
 
 # ---------------------------------------------------------------------------
@@ -2727,7 +2988,7 @@ async def tfbs_marginalize(
     name="tfbs_classify_metrics",
     annotations={
         "title": "Classification Metrics",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes a results file when the reply would exceed the limit
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
@@ -2754,7 +3015,11 @@ async def tfbs_classify_metrics(
     Returns:
         JSON with "roc_auc", "pr_auc", "num_positive", "num_negative",
         and the ROC curve points ("fpr", "tpr") and PR curve points
-        ("precision", "recall").
+        ("precision", "recall").  If the reply would exceed the server's
+        reply limit (TFBS_MAX_INLINE_BYTES, default 512 KiB; see
+        tfbs_server_info),
+        the curve points go to roc_curve-<sha256 prefix>.csv and
+        pr_curve-<sha256 prefix>.csv, named in "results_files".
     """
     from sklearn.metrics import roc_curve, auc, precision_recall_curve
 
@@ -2782,7 +3047,7 @@ async def tfbs_classify_metrics(
     precision, recall, _ = precision_recall_curve(y_true, y_score)
     pr_auc_val = float(auc(recall, precision))
 
-    return json.dumps({
+    result = {
         "roc_auc": roc_auc_val,
         "pr_auc": pr_auc_val,
         "num_positive": int(len(pos)),
@@ -2791,7 +3056,23 @@ async def tfbs_classify_metrics(
         "tpr": tpr.tolist(),
         "precision": precision.tolist(),
         "recall": recall.tolist(),
-    })
+    }
+    text = json.dumps(result)
+    if len(text) <= _max_inline_bytes():
+        return text
+    base = _results_root() / "tfbs_classify_metrics" / _digest(positive_scores, negative_scores, subsample_negatives)
+    roc = {"fpr": result.pop("fpr"), "tpr": result.pop("tpr")}
+    pr = {"precision": result.pop("precision"), "recall": result.pop("recall")}
+    try:
+        result["results_files"] = {"roc_curve": _write_table(base, "roc_curve", roc),
+                                   "pr_curve": _write_table(base, "pr_curve", pr)}
+    except OSError as exc:
+        return _spill_error(base, exc, len(text))
+    result["inline"] = False
+    result["note"] = (f"The curve points would exceed the reply limit of {_max_inline_bytes()} bytes, "
+                      "so they are in results_files (roc_curve: fpr, tpr; pr_curve: precision, "
+                      "recall). " + _csv_reading(roc))
+    return json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -3142,7 +3423,12 @@ async def tfbs_server_info() -> str:
         results_dir (where the model-analysis tools write
         when called without output_dir: <project root>/results for a
         checkout or $TFBS_PROJECT_ROOT, else tfbs_results/ in the server's
-        working directory), project_root (working directory of the
+        working directory), max_inline_bytes (the reply limit, in bytes:
+        tools whose per-item results would make a reply larger write
+        them to a file and name it in the reply; TFBS_MAX_INLINE_BYTES,
+        default 524288, at most 1048576, because the stdio message
+        carries the reply text twice, escaped, and the call log keeps
+        at most 1 MiB of a result), project_root (working directory of the
         validation and benchmark pipelines, against which their relative
         models_dir resolves: $TFBS_PROJECT_ROOT, else the checkout, else the
         server's working directory; it shows that fallback when
@@ -3167,6 +3453,7 @@ async def tfbs_server_info() -> str:
     info = dict(_ENV)  # shallow copy
     info["call_log"] = os.environ.get(CALL_LOG_ENV, "").strip() or None
     info["results_dir"] = str(_results_root())
+    info["max_inline_bytes"] = _max_inline_bytes()
     info["project_root"] = str(_project_root())
     info["reference_files"] = _reference_files()
     info["torch_version"] = _torch.__version__

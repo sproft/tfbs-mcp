@@ -197,7 +197,7 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 
   For a model you trained, say *Load my checkpoint <path/to/best_VCNNBpnet.ckpt> as "mine" (model type VCNNBpnet)* and score with "mine".
 - **What happens:** Claude loads the model with its scaling (`tfbs_load_model`) and scores the sequences (`tfbs_predict`). For a BED it first cuts the 24 bp windows from the genome (`tfbs_extract_loci`). The models score 24 bp, the length of the library construct they were trained on (6 + 14 + 4 bp); to find the best site inside wider peaks, ask for 200 bp windows scored in sliding-window mode.
-- **You get:** one score per sequence, in input order (for a BED, in the order of `regions.bed` in the extraction folder). The released models score in log2 fold change of EMSA-seq enrichment: higher means stronger predicted binding, and a difference of 1 is a 2-fold difference. On the four demo peaks FLANK gives 1.96, 1.39, 2.61 and -0.69. A classifier you trained scores from 0 (no site) to 1 (site).
+- **You get:** one score per sequence, in input order (for a BED, in the order of `regions.bed` in the extraction folder). For many sequences (at the default reply limit, above about 25,000, or about 7,500 in sliding-window mode with 24 bp windows) the scores go to `predictions-<hash>.csv` in `<results>/<model id>/tfbs_predict/<digest>/` instead, and Claude gets the file's path and a summary (count, minimum, median, mean, maximum); Claude Desktop cannot open the file, so there you get only the summary and the path. The released models score in log2 fold change of EMSA-seq enrichment: higher means stronger predicted binding, and a difference of 1 is a 2-fold difference. On the four demo peaks FLANK gives 1.96, 1.39, 2.61 and -0.69. A classifier you trained scores from 0 (no site) to 1 (site).
 
 ### Check what a variant does
 
@@ -215,7 +215,7 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 
   In Claude Code you can name a file instead (*the scores in <scores.tsv>, column 2, with the label in column 3*); Claude reads it and passes the two lists.
 - **What happens:** Claude passes both lists to `tfbs_classify_metrics`. When there are more negatives than positives, it draws as many negatives as positives at random, so both classes weigh the same; say "use all negatives" to keep them all.
-- **You get:** ROC-AUC, PR-AUC, the two counts, and the points of both curves.
+- **You get:** ROC-AUC, PR-AUC, the two counts, and the points of both curves (for very many scores, in `roc_curve-<hash>.csv` and `pr_curve-<hash>.csv`, named under `results_files`).
 
 ### Train your own classifier from ChIP-seq peaks
 
@@ -236,7 +236,7 @@ Each task says what you need, what to type into Claude's chat, what happens and 
   - *Which motifs did the model learn, and do they match JASPAR?* With the flank model, call seqlets in \<sequences> and match them against \<JASPAR.meme> with TOMTOM; also turn the first-layer filters into motifs. (Seqlets are short stretches with high attribution.)
   - *Do two positions act together?* With the flank model, compute pairwise epistasis for GGGCTCCTCACTTGACCTTTGCTG and list the strongest interactions.
 - **What happens:** `tfbs_analyze` and `tfbs_mutagenesis`, `tfbs_marginalize`, `tfbs_seqlets` and `tfbs_conv_filters`, `tfbs_epistasis`, in the order of the questions.
-- **You get:** a summary in Claude's reply (top positions, the mean effect of the motif in score units, matched motif names, the strongest pairs), and the full results as files in `<results>/<model id>/<tool name>/<digest>/` unless you name a folder: `attributions.pt` and `ism_scores.pt` (4 x length per sequence), `seqlets.tsv`, `filters.meme`, `epistasis_matrix.csv`. The tools draw no plots; in Claude Code, ask *Plot attributions.pt as a sequence logo with logomaker and save it as a PNG* (logomaker comes with the `viz` extra).
+- **You get:** a summary in Claude's reply (top positions, the mean effect of the motif in score units, matched motif names, the strongest pairs), and the full results as files in `<results>/<model id>/<tool name>/<digest>/` unless you name a folder: `attributions.pt` and `ism_scores.pt` (4 x length per sequence), `seqlets.tsv`, `filters.meme`, `epistasis_matrix.csv`, and, when a reply would be too large, its per-sequence lists as `<name>-<hash>.csv` (see `TFBS_MAX_INLINE_BYTES` below). The tools draw no plots; in Claude Code, ask *Plot attributions.pt as a sequence logo with logomaker and save it as a PNG* (logomaker comes with the `viz` extra).
 
 ### Scan sequences for a motif
 
@@ -321,12 +321,13 @@ Flags prefill answers, so you are not asked for those variables: `--genome PATH`
 
 This is what `--setup` writes. For Claude Code, first `claude mcp remove tfbs --scope user` (adding a name that already exists is an error), then `claude mcp add tfbs --scope user --env TFBS_GENOME_FASTA=/data/hg38/hg38.fa TFBS_MOTIF_FILE=/data/JASPAR/MA1994.1.meme -- "$(which tfbs-mcp)"`. For Claude Desktop, add to the `tfbs` entry of the config file, after `"args": []` and a comma: `"env": {"TFBS_GENOME_FASTA": "/data/hg38/hg38.fa", "TFBS_MOTIF_FILE": "/data/JASPAR/MA1994.1.meme"}`. On Windows, see [docs/install-windows.md](docs/install-windows.md) for the PowerShell form of these commands.
 
-Two more variables are optional and not asked by `--setup`; add them to the `--env` list or the `env` block the same way:
+Three more variables are optional and not asked by `--setup`; add them to the `--env` list or the `env` block the same way:
 
 | Variable | What it does |
 |---|---|
 | `TFBS_SLURM_PARTITION` | default partition of the GPU jobs (`tfbs_train` in config mode, `tfbs_validate`, `tfbs_sweep`, the two ChIP-Atlas benchmark tools and `tfbs_remap_validation`); unset, `gpu`. `slurm_submit` adds no partition, `tfbs_disease_variant_validation` defaults to `compute` and `tfbs_binding_scan` to the cluster's default partition. `tfbs_server_info` reports it as `default_partition` |
 | `TFBS_CALL_LOG` | path of a JSON Lines file. When set, every tool call appends one line after it returns, holding the arguments and the result: `timestamp` (start of the call, UTC), `tool`, `arguments` as received, `seconds` (wall time), `is_error` and `result` (the tool's JSON answer; one larger than 1 MB is stored as its size and first 4096 characters). A call that fails is logged too. Unset, nothing is written. `tfbs_server_info` reports the file in use as `call_log` |
+| `TFBS_MAX_INLINE_BYTES` | the reply limit, in bytes; unset, 524288 (512 KiB), at most 1048576. A reply of `tfbs_predict`, `tfbs_marginalize`, `tfbs_analyze`, `tfbs_mutagenesis` or `tfbs_classify_metrics` that would be larger keeps its scalar fields and moves its per-item lists to a CSV named after its content (`predictions-<hash>.csv` and the like, next to the tool's other results), named in `results_file` (`results_files` for the two curves) with its rows, columns and sha256, plus a `summary` and `"inline": false`; arrays already saved as `.pt` files are left out instead. 0 sends every per-item list to a file. Any other reply above 2 MiB is saved under `<results>/replies/` and replaced by a reply naming that file. Claude Code closes a server whose message exceeds 16 MB, losing the loaded models, and each message carries the reply twice. `tfbs_server_info` reports the limit as `max_inline_bytes` |
 
 ## Uninstall
 
