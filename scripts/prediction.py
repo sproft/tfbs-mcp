@@ -55,6 +55,10 @@ def extract_best_windows(
         window_size (int): The size of the sliding window.
         batch_size (int): The number of sequences to process in a single chunk.
                                   Lower this value if you encounter out-of-memory errors.
+                                  The windows of a chunk are scored in forward passes
+                                  small enough that no activation is expected to exceed
+                                  2**29 elements, so the scores do not depend on this
+                                  value beyond floating-point rounding.
         device (str): The device to run computations on ('cuda' or 'cpu').
 
     Returns:
@@ -65,6 +69,8 @@ def extract_best_windows(
         - np.ndarray: The mean score of all windows for each sequence, shape (N,).
         - np.ndarray: The start indices of the best windows within their original sequence, shape (N,).
     """
+    from tfbs.prediction.analysis import forward_in_chunks, safe_forward_batch_size
+
     model.eval()
     model.to(device)
 
@@ -80,6 +86,7 @@ def extract_best_windows(
         "best_indices": [],
     }
 
+    max_windows = None
     with torch.no_grad():
         for i in range(0, n_sequences, batch_size):
             x_chunk = x_sequences[i:i + batch_size].to(device)
@@ -90,8 +97,11 @@ def extract_best_windows(
             windows_permuted = windows.permute(0, 2, 1, 3)
             windows_batch = windows_permuted.reshape(-1, n_channels, window_size)
 
-            # 2. Score all windows in a single pass for the chunk
-            scores_chunk = model(windows_batch).view(chunk_n, num_windows)
+            # 2. Score all windows of the chunk, in forward passes small enough that no
+            # activation reaches 2**31 elements (CUDA's 32-bit index limit)
+            if max_windows is None:
+                max_windows = safe_forward_batch_size(model, windows_batch[:1])
+            scores_chunk = forward_in_chunks(model, windows_batch, max_windows).view(chunk_n, num_windows)
 
             # 3. Find the best score and index for each sequence in the chunk
             best_scores_chunk, best_indices_chunk = torch.max(scores_chunk, dim=1)
