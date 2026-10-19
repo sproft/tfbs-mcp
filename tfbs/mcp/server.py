@@ -632,6 +632,8 @@ _F = None
 _np = None
 _models = None
 _find_best_windows_fast = None
+_forward_in_chunks = None
+_safe_forward_batch_size = None
 
 # Every module with native code that a tool or a library it calls imports
 # inside a function, so nothing native is imported for the first time while
@@ -755,20 +757,22 @@ def _detach_child_stdin() -> None:
 
 def _ensure_imports():
     """Import torch, numpy and the model classes (once; later calls return at once)."""
-    global _torch, _F, _np, _models, _find_best_windows_fast
+    global _torch, _F, _np, _models, _find_best_windows_fast, _forward_in_chunks, _safe_forward_batch_size
     if _torch is not None:
         return
     import numpy as np
     import torch
     import torch.nn.functional as F
     import tfbs.nn.models as models
-    from tfbs.prediction.analysis import find_best_windows_fast
+    from tfbs.prediction.analysis import find_best_windows_fast, forward_in_chunks, safe_forward_batch_size
 
     _torch = torch
     _F = F
     _np = np
     _models = models
     _find_best_windows_fast = find_best_windows_fast
+    _forward_in_chunks = forward_in_chunks
+    _safe_forward_batch_size = safe_forward_batch_size
 
     # Verify the env-var GPU hint against actual torch capability
     if _ENV["default_device"] == "cuda" and not torch.cuda.is_available():
@@ -1948,7 +1952,13 @@ async def tfbs_predict(
                      known, and must not exceed the sequence length.
         batch_size: Batch size for processing.  Default null: the
                     server's default batch size (512 on GPU, 64 on CPU;
-                    see tfbs_server_info).
+                    see tfbs_server_info).  It changes speed and memory
+                    use, not the scores beyond floating-point rounding:
+                    each forward pass is split so that no activation is
+                    expected to exceed 2**29 elements (measured on a
+                    probe pass), below the 32-bit index limit of CUDA
+                    kernels (in window mode a sequence contributes one
+                    input per window).
         inverse_transform: Default null, because predictions are meant
                            to be read in the original label units (e.g.
                            log2 fold change): the scores of a regression
@@ -2051,8 +2061,9 @@ async def tfbs_predict(
     else:
         chunks = []
         with _torch.no_grad():
+            max_rows = _safe_forward_batch_size(model, X[:1].to(device))
             for k in range(0, n, batch_size):
-                chunks.append(model(X[k:k + batch_size].to(device)).cpu())
+                chunks.append(_forward_in_chunks(model, X[k:k + batch_size].to(device), max_rows).cpu())
         result = {"scores": _per_sequence(_torch.cat(chunks).numpy()), "num_sequences": n}
     result["inverse_transformed"] = inverse is not None
     result["units"] = _units(entry, inverse)

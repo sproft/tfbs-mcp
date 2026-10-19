@@ -11,12 +11,121 @@ from . import utils
 logger = logging.getLogger(__name__)
 
 
+#: Upper bound on the number of elements in any single activation of one forward pass.
+#: Several CUDA kernels index with 32-bit integers and fail with "an illegal memory access
+#: was encountered" once one tensor holds more than 2**31 elements.  Window-mode scoring of
+#: 500 bp sequences in batches of 512 reached 3.3e9 to 4.4e9 elements in the pooled output of
+#: the NKX2.1 VCNNBpnet models (num_channels x pool_output_size values per window).  A quarter
+#: of the limit leaves a margin for kernels whose internal buffers are larger than their output.
+MAX_ACTIVATION_ELEMENTS = 2 ** 29
+
+
+try:  # sees every tensor an operator returns, in functional code and TorchScript models too
+    from torch.utils._python_dispatch import TorchDispatchMode as _TorchDispatchMode
+except ImportError:  # pragma: no cover - torch without dispatch modes; forward hooks are used
+    _TorchDispatchMode = None
+
+if _TorchDispatchMode is not None:
+    class _OutputSizes(_TorchDispatchMode):
+        """Records the number of elements of every tensor an operator returns."""
+
+        def __init__(self):
+            super().__init__()
+            self.sizes = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            for t in (out if isinstance(out, (tuple, list)) else (out,)):
+                if isinstance(t, torch.Tensor):
+                    self.sizes.append(t.numel())
+            return out
+
+
+def _output_sizes(model: Module, x: torch.Tensor) -> list:
+    """Numbers of elements of the tensors produced in one forward pass of ``model`` on ``x``."""
+    if _TorchDispatchMode is not None:
+        with _OutputSizes() as recorder:
+            model(x)
+        return recorder.sizes
+    sizes = []
+
+    def _hook(_module, _inputs, output):
+        for t in (output if isinstance(output, (tuple, list)) else (output,)):
+            if torch.is_tensor(t):
+                sizes.append(t.numel())
+
+    handles = [m.register_forward_hook(_hook) for m in model.modules()]
+    try:
+        model(x)
+    finally:
+        for h in handles:
+            h.remove()
+    return sizes
+
+
+def largest_activation_per_sample(model: Module, sample: torch.Tensor) -> int:
+    """Largest number of elements per input in the input or any tensor of one forward pass.
+
+    Runs ``model`` on 2 and on 4 copies of ``sample[:1]`` and records the size of every
+    tensor an operator returns (module outputs only, through forward hooks, if this torch
+    has no dispatch modes).  The size per input of a tensor is its growth between the two
+    passes, halved, so that weights and other tensors that do not grow with the batch do not
+    count; if the two passes record different numbers of tensors, the largest tensor of the
+    second pass divided by 4 is used instead.  This assumes activations grow linearly with
+    the batch.  Both passes run in eval mode without gradients, and every submodule's mode
+    is restored afterwards.  Returns at least 1.
+    """
+    one = sample[:1]
+    x2 = one.expand(2, *one.shape[1:]).contiguous()
+    x4 = one.expand(4, *one.shape[1:]).contiguous()
+    modes = [(m, m.training) for m in model.modules()]
+    model.eval()
+    try:
+        with torch.no_grad():
+            s2 = _output_sizes(model, x2)
+            s4 = _output_sizes(model, x4)
+    finally:
+        for m, training in modes:
+            m.training = training
+    if s4 and len(s2) == len(s4):
+        per = max(-(-(b - a) // 2) for a, b in zip(s2, s4))
+    else:
+        per = -(-max(s4, default=0) // 4)
+    return max(1, per, one.numel())
+
+
+def safe_forward_batch_size(model: Module, sample: torch.Tensor,
+                            max_elements: int = MAX_ACTIVATION_ELEMENTS) -> int:
+    """Largest batch size whose activations stay at or below ``max_elements`` elements each.
+
+    Uses :func:`largest_activation_per_sample` on ``sample[:1]``, so it holds for
+    activations that grow linearly with the batch.  Returns at least 1.
+    """
+    return max(1, int(max_elements) // largest_activation_per_sample(model, sample))
+
+
+def forward_in_chunks(model: Module, x: torch.Tensor, max_batch: int) -> torch.Tensor:
+    """``model(x)``, computed in slices of at most ``max_batch`` inputs along dim 0 and concatenated.
+
+    The model must return one tensor whose first dimension is the batch; the output of a
+    slice that has no dimensions left (a batch of one squeezed to a scalar) counts as one
+    row.  Results equal a single pass up to the floating-point rounding of the kernels
+    chosen for each batch size.
+    """
+    max_batch = max(1, int(max_batch))
+    if x.shape[0] <= max_batch:
+        return model(x)
+    outs = [model(x[i:i + max_batch]) for i in range(0, x.shape[0], max_batch)]
+    return torch.cat([o.reshape(1) if o.dim() == 0 else o for o in outs], dim=0)
+
+
 def find_best_windows_fast(
     X: torch.Tensor,
     model: Module,
     window_size: int = 70,
     processing_batch_size: int = 128,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    max_activation_elements: int = MAX_ACTIVATION_ELEMENTS,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     For each sequence in X, efficiently find the window with the highest model score.
@@ -31,7 +140,15 @@ def find_best_windows_fast(
         window_size: The size of the sliding window.
         processing_batch_size: The number of sequences to process at a time.
                                Lower this number if you run out of memory.
+                               Each sequence contributes L - window_size + 1
+                               windows; the windows of a chunk are scored in
+                               forward passes small enough that no activation
+                               exceeds max_activation_elements, so the scores do
+                               not depend on this value beyond floating-point
+                               rounding.
         device: The device to run computations on ('cuda' or 'cpu').
+        max_activation_elements: Largest number of elements any activation may
+                                 hold in one forward pass (default 2**29).
 
     Returns:
         A tuple containing:
@@ -50,6 +167,7 @@ def find_best_windows_fast(
     final_all_scores, final_mean_scores = [], []
 
     logger.info("Processing %d sequences on device '%s'...", N, device)
+    max_windows = None
     with torch.no_grad():
         for i in range(0, N, processing_batch_size):
             X_chunk = X[i:i + processing_batch_size].to(device)
@@ -67,8 +185,12 @@ def find_best_windows_fast(
             # -> (chunk_N * num_windows, C, window_size)
             windows_batch = windows_permuted.reshape(-1, C, window_size)
 
-            # 3. Score all windows in the batch.
-            all_scores_chunk = model(windows_batch)
+            # 3. Score all windows of the chunk, in forward passes small enough that no
+            # activation reaches 2**31 elements (CUDA's 32-bit index limit).
+            if max_windows is None:
+                max_windows = safe_forward_batch_size(model, windows_batch[:1], max_activation_elements)
+                logger.debug("Scoring at most %d windows per forward pass.", max_windows)
+            all_scores_chunk = forward_in_chunks(model, windows_batch, max_windows)
 
             # 4. Reshape scores back to match the original chunk structure.
             # Shape: (chunk_N, num_windows)
