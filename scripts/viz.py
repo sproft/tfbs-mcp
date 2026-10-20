@@ -1,3 +1,4 @@
+import contextlib
 import os
 import io
 import base64
@@ -20,7 +21,7 @@ import pathlib
 # Custom model classes and tangermeme imports
 try:
     import tfbs.nn.models as models
-    from captum.attr import DeepLiftShap, InputXGradient
+    from captum.attr import DeepLift, InputXGradient
     
     # Import necessary functions from tangermeme
     from tangermeme.utils import random_one_hot, one_hot_encode, pwm_consensus
@@ -32,7 +33,7 @@ try:
     from tangermeme.seqlet import recursive_seqlets
     from tangermeme.annotate import annotate_seqlets, count_annotations
     from tangermeme.deep_lift_shap import deep_lift_shap as tangermeme_deep_lift_shap 
-    from tangermeme.deep_lift_shap import _captum_deep_lift_shap, hypothetical_attributions
+    from tangermeme.deep_lift_shap import hypothetical_attributions
     from tangermeme.variant_effect import substitution_effect, deletion_effect, insertion_effect
     try:
         # tangermeme >= 1.0 moved this out of tangermeme.ism.
@@ -226,12 +227,46 @@ class ModelLoader:
         return model.to(self.device)
 
 
+@contextlib.contextmanager
+def _gradient_mode(model: torch.nn.Module):
+    """Eval mode for an attribution pass, with recurrent layers in train mode.
+
+    cuDNN runs an RNN's backward pass only in train mode, so the recurrent layers are put in
+    train mode with their inter-layer dropout set to 0; every other module (Dropout, BatchNorm)
+    stays in eval mode, so attributions do not change from one call to the next and BatchNorm
+    statistics are not updated.  Every module's mode and every RNN's dropout are restored
+    afterwards.  Recurrent layers are found as torch.nn.RNNBase instances, so a TorchScript-
+    compiled RNN is not detected.  The rule during the pass is that of
+    tfbs.mcp.server._gradient_mode, which, unlike this one, leaves the model in eval mode
+    afterwards.
+    """
+    modes = [(m, m.training) for m in model.modules()]
+    rnns = [m for m in model.modules() if isinstance(m, torch.nn.RNNBase)]
+    dropouts = [m.dropout for m in rnns]
+    model.eval()
+    try:
+        for m in rnns:
+            m.dropout = 0.0
+            m.train()
+        yield
+    finally:
+        for m, p in zip(rnns, dropouts):
+            m.dropout = p
+        for m, training in modes:
+            m.training = training
+
+
+def _multipliers(multipliers, inputs, baselines):
+    """Captum custom_attribution_func that returns the DeepLift multipliers unchanged."""
+    return multipliers
+
+
 class AttributionCore:
     """
     Handles gradient-based attribution methods.
-    
-    CRITICAL FIX: Implements the cuDNN RNN backward pass fix by temporarily 
-    switching the model to .train() mode for gradient calculation.
+
+    Attributions run in eval mode, with only recurrent layers in train mode (cuDNN runs an
+    RNN's backward pass only in train mode); see _gradient_mode.
     """
     def __init__(self, model: torch.nn.Module, device: torch.device, tangermeme: bool):
         self.model = model
@@ -241,10 +276,17 @@ class AttributionCore:
     def run_deep_lift_shap(self, X_input: torch.Tensor, n_shuffles: int, random_state: int = 0, verbose: bool = True, raw_outputs: bool = False, hypothetical: bool = False) -> torch.Tensor:
         """
         Batched Captum DeepLiftShap with:
-         - raw_outputs (return multipliers per-shuffle: (N, n_shuffles, C, L))
+         - raw_outputs (return the multipliers of every (input, baseline) pair: (N, n_shuffles, C, L))
          - hypothetical (return attributions for all characters)
-         - memory-safe batching to avoid GPU OOM
-         - cuDNN RNN backward fix (temporary train() mode)
+         - memory-safe batching: Captum's DeepLift runs on (input, baseline) pairs, at most
+           max_pairs per call, and each input is paired only with the n_shuffles baselines
+           drawn for its block of up to max_pairs inputs, not with every baseline row of the call
+         - random baselines drawn from numpy.random.RandomState(random_state), so a call is
+           reproducible; every input of a block shares the same baselines, the baselines depend
+           on the block index, and calls with the same random_state draw the same ones
+         - cuDNN RNN backward fix (recurrent layers in train mode, every other module in eval
+           mode; see _gradient_mode).  This applies to the Captum path only: tangermeme's
+           deep_lift_shap puts the whole model in eval mode itself.
         """
         # If the user did not request the tangermeme backend keep the captum function
         if self.tangermeme:
@@ -260,6 +302,8 @@ class AttributionCore:
 
         torch.manual_seed(random_state)
         np.random.seed(random_state)
+        # random_one_hot draws from fresh entropy unless it is given a RandomState
+        rng = np.random.RandomState(random_state)
 
         device = self.device
         N, C, L = X_input.shape
@@ -267,12 +311,18 @@ class AttributionCore:
             # nothing to do
             return torch.empty((0, C, L), dtype=X_input.dtype).to(device) if not raw_outputs else torch.empty((0, n_shuffles, C, L), dtype=X_input.dtype)
 
-        # tuneable parameter to control memory usage: max number of (input,baseline) pairs per call
+        # tuneable parameter to control memory usage: max number of (input, baseline) pairs per
+        # call; one call runs the model on 2 * max_pairs sequences (the pairs' inputs and baselines)
         max_pairs = 256
 
-        # result containers on CPU to reduce GPU pressure
-        result_raw = torch.zeros((N, n_shuffles, C, L), dtype=X_input.dtype, device='cpu')
-        result_sum = torch.zeros((N, C, L), dtype=X_input.dtype, device='cpu')
+        # result container on CPU to reduce GPU pressure; only the one that is returned
+        if raw_outputs:
+            result_raw = torch.zeros((N, n_shuffles, C, L), dtype=X_input.dtype, device='cpu')
+        else:
+            result_sum = torch.zeros((N, C, L), dtype=X_input.dtype, device='cpu')
+
+        # the multipliers themselves (raw_outputs), or tangermeme's hypothetical attributions
+        custom_attr_func = _multipliers if raw_outputs else hypothetical_attributions
 
         i = 0
         while i < N:
@@ -282,73 +332,41 @@ class AttributionCore:
             shuffles_per_call = max(1, max_pairs // batch_N)
             shuffles_per_call = min(shuffles_per_call, n_shuffles)
 
-            X_batch = X_input[i:i + batch_N]  # keep on device
+            X_batch = X_input[i:i + batch_N].to(device)
 
             s0 = 0
             while s0 < n_shuffles:
                 s = min(shuffles_per_call, n_shuffles - s0)
 
-                # generate s baselines and tile per input in batch
-                baseline_block = random_one_hot((s, C, L)).float().to(device)  # (s, C, L)
-                # create (batch_N * s, C, L) baselines where each baseline_block repeats for each example
-                baselines_per_input = torch.cat([baseline_block for _ in range(batch_N)], dim=0).to(device)
+                # s baselines for this block of shuffles; every input of the batch is paired with each
+                baseline_block = random_one_hot((s, C, L), random_state=rng).float().to(device)  # (s, C, L)
+                # row j * s + k pairs input j with baseline k
+                X_pairs = X_batch.repeat_interleave(s, dim=0)
+                baseline_pairs = baseline_block.repeat(batch_N, 1, 1)
 
-                # repeat each input s times so ordering matches baselines_per_input
-                X_batch_repeated = X_batch.repeat_interleave(s, dim=0).to(device)
-
-                # decide custom attribution function for Captum
-                custom_attr_func = None if raw_outputs else hypothetical_attributions
-
-                # compute attributions for this chunk with train-mode toggle for RNNs
-                was_training = self.model.training
-                self.model.train()
-                try:
-                    dl_shap = DeepLiftShap(self.model)
-                    a_chunk = dl_shap.attribute(
-                        X_batch_repeated,
-                        baselines=baselines_per_input,
+                # DeepLift on the pairs.  Captum's DeepLiftShap would pair every row of X_pairs with
+                # every row of baseline_pairs, (batch_N * s)**2 pairs in one forward pass, which for
+                # large models exceeds the 32-bit index limit of CUDA kernels.
+                with _gradient_mode(self.model):
+                    a_chunk = DeepLift(self.model).attribute(
+                        X_pairs,
+                        baselines=baseline_pairs,
                         target=0,
                         return_convergence_delta=False,
                         custom_attribution_func=custom_attr_func
                     )
-                finally:
-                    if not was_training:
-                        self.model.eval()
 
-                # a_chunk is on device; handle shapes and semantics
+                if tuple(a_chunk.shape) != (batch_N * s, C, L):
+                    raise RuntimeError(f"Unexpected attribution chunk shape {tuple(a_chunk.shape)}, expected {(batch_N * s, C, L)}")
+                a_cpu = a_chunk.detach().cpu().reshape(batch_N, s, C, L)
 
-                # RAW outputs requested: store per-shuffle multipliers
                 if raw_outputs:
-                    if a_chunk.dim() == 3 and a_chunk.shape[0] == batch_N * s:
-                        # (batch_N * s, C, L) -> (batch_N, s, C, L)
-                        a_cpu = a_chunk.cpu().detach().reshape(batch_N, s, C, L)
-                    elif a_chunk.dim() == 4 and a_chunk.shape == (batch_N, s, C, L):
-                        a_cpu = a_chunk.cpu().detach()
-                    elif a_chunk.dim() == 3 and a_chunk.shape == (batch_N, C, L):
-                        # Captum returned averaged chunk; replicate across s
-                        a_cpu = a_chunk.cpu().detach().unsqueeze(1).expand(batch_N, s, C, L)
-                    else:
-                        raise RuntimeError(f"Unexpected attribution chunk shape {tuple(a_chunk.shape)} for raw_outputs, batch_N={batch_N}, s={s}")
-
-                    # place into result_raw in correct shuffle window
-                    result_raw[i:i + batch_N, s0:s0 + s] = a_cpu.to('cpu')
+                    # per-pair multipliers, in their shuffle slots
+                    result_raw[i:i + batch_N, s0:s0 + s] = a_cpu
                 else:
-                    # Processed outputs: sum multipliers/hypothetical attributions across shuffles.
+                    # Processed outputs: sum hypothetical attributions across shuffles.
                     # The final multiplication by input (if not hypothetical) happens at the end.
-                    if a_chunk.dim() == 3 and a_chunk.shape[0] == batch_N * s:
-                        # (batch_N * s, C, L) -> (batch_N, s, C, L) -> sum over s -> (batch_N, C, L)
-                        sum_for_chunk = a_chunk.reshape(batch_N, s, C, L).sum(dim=1)
-                    elif a_chunk.dim() == 4 and a_chunk.shape == (batch_N, s, C, L):
-                        # Already in (batch_N, s, C, L) format.
-                        sum_for_chunk = a_chunk.sum(dim=1)
-                    elif a_chunk.dim() == 3 and a_chunk.shape == (batch_N, C, L):
-                        # Captum may have already averaged over baselines; we need the sum.
-                        sum_for_chunk = a_chunk * s
-                    else:
-                        raise RuntimeError(f"Unexpected attribution chunk shape {tuple(a_chunk.shape)} for processed outputs, batch_N={batch_N}, s={s}")
-
-                    # accumulate sum on CPU
-                    result_sum[i:i + batch_N] += sum_for_chunk.cpu().detach()
+                    result_sum[i:i + batch_N] += a_cpu.sum(dim=1)
                 s0 += s
             i += batch_N
 
@@ -377,13 +395,9 @@ class AttributionCore:
         print("Calculating InputXGradient attributions...")
         ixg = InputXGradient(self.model)
         
-        # --- RNN FIX: Temporarily set model to training mode ---
-        self.model.train()
-        try:
+        # Eval mode, with only recurrent layers in train mode (cuDNN RNN backward fix)
+        with _gradient_mode(self.model):
             attributions = ixg.attribute(X_input, target=0)
-        finally:
-            # --- RNN FIX: Restore to evaluation mode ---
-            self.model.eval()
 
         print("InputXGradient calculation complete.")
         return attributions
@@ -515,7 +529,7 @@ class DataPreparer:
 
         if not X_promotor:
             # Fallback to random if no promoter sequences fit
-            X_promotor.append(random_one_hot((1, 4, self.input_length)).float())
+            X_promotor.append(random_one_hot((1, 4, self.input_length), random_state=np.random.RandomState(0)).float())
             test_names = ["Random Sequence"]
 
         X_promotor = torch.stack(X_promotor).float().to(self.device)
@@ -1115,7 +1129,8 @@ class GenomicInterpreter:
         motifs = {k: v for k, v in motifs.items() if v.shape[1] <= self.config.input_length}
         print(f"Loaded and filtered {len(motifs)} motifs.")
 
-        X_marginal_test = random_one_hot((5, 4, self.config.input_length)).float().to(self.device)
+        X_marginal_test = random_one_hot((5, 4, self.config.input_length),
+                                         random_state=np.random.RandomState(0)).float().to(self.device)
 
         print("\nPrediction Marginalization (Delta Prediction):")
         for name, pwm in motifs.items():
