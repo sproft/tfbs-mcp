@@ -2415,17 +2415,28 @@ def _gradient_mode(model):
     cuDNN runs an RNN's backward pass only in train mode, so the recurrent
     layers are put in train mode with their inter-layer dropout set to 0;
     every other module (Dropout, BatchNorm) stays in eval mode, so the
-    attributions do not change from one call to the next.
+    attributions do not change from one call to the next.  A forward
+    pre-hook on the model sets the recurrent layers so again before every
+    forward pass, because some attribution code calls model.eval() itself
+    (tangermeme's deep_lift_shap, which tfbs_seqlets uses).  A model
+    without recurrent layers gets no hook.
     """
     model.eval()
     rnns = [m for m in model.modules() if isinstance(m, _torch.nn.RNNBase)]
     dropouts = [m.dropout for m in rnns]
-    try:
+
+    def _recurrent_train(*_):
         for m in rnns:
             m.dropout = 0.0
             m.train()
+
+    handle = model.register_forward_pre_hook(_recurrent_train) if rnns else None
+    try:
+        _recurrent_train()
         yield
     finally:
+        if handle is not None:
+            handle.remove()
         for m, p in zip(rnns, dropouts):
             m.dropout = p
         model.eval()
@@ -6525,7 +6536,9 @@ async def tfbs_seqlets(
     and counts the matched motifs.  Warnings tangermeme raises during
     the attribution (e.g. "Convergence deltas too high", which the
     NKX2-1 VCNNBpnet models trigger) are returned under "warnings"
-    instead of being lost on the server's stderr.
+    instead of being lost on the server's stderr.  The model runs in eval
+    mode with only its recurrent layers in train mode (their dropout set
+    to 0), which cuDNN needs for their backward pass, as in tfbs_analyze.
 
     Requires tangermeme: pip install 'tfbs-mcp[viz]'
 
