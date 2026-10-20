@@ -593,3 +593,31 @@ def test_attribution_samples_no_dropout_and_runs_recurrent_layers_in_train_mode(
     assert calls[0]["attributions"] == calls[1]["attributions"]
     assert model.seen and set(model.seen) == {(False, True, 0.0)}
     assert not model.training and not model.gru.training and model.gru.dropout == 0.5
+
+
+def test_seqlets_runs_recurrent_layers_in_train_mode_although_tangermeme_calls_eval():
+    # tangermeme's deep_lift_shap puts the whole model in eval mode itself; the
+    # recurrent layers must still run in train mode (cuDNN's RNN backward), without
+    # dropout, as Supplementary Note S1 states for tfbs_seqlets.
+    pytest.importorskip("tangermeme")
+    model = DropoutGRU()
+    _register("drop", model)
+    try:
+        calls = [run(server.tfbs_seqlets("drop", sequences=SEQS_20[:3], n_shuffles=5))
+                 for _ in range(2)]
+    finally:
+        server._model_registry.pop("drop", None)
+    assert "error" not in calls[0], calls[0]
+    assert calls[0] == calls[1]
+    assert model.seen and set(model.seen) == {(False, True, 0.0)}
+    assert not model.training and not model.gru.training and model.gru.dropout == 0.5
+    assert not model._forward_pre_hooks
+
+
+def test_gradient_mode_adds_no_hook_to_a_model_without_recurrent_layers():
+    model = torch.nn.Sequential(torch.nn.Conv1d(4, 3, 3), torch.nn.ReLU(), torch.nn.Dropout(0.5))
+    model.train()
+    with server._gradient_mode(model):
+        assert not model._forward_pre_hooks
+        assert not any(m.training for m in model.modules())
+    assert not model._forward_pre_hooks and not model.training
