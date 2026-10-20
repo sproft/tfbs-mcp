@@ -9,7 +9,7 @@
 - The ChIP-seq method comparison and the ClinVar validation, given a
   structure, stop at startup without a FoldX binary, as the ReMap
   validation does, and all three name the tools' skip_foldx.
-- The package version is 1.0.1.
+- The package version is 1.0.2.
 """
 import ast
 import inspect
@@ -518,11 +518,11 @@ def test_remap_validation_names_skip_foldx(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# B3: version 1.0.1
+# B3: version 1.0.2
 # ---------------------------------------------------------------------------
 
-def test_the_package_version_is_1_0_0():
+def test_the_package_version_is_1_0_2():
     tomllib = pytest.importorskip("tomllib")
     with open(REPO / "pyproject.toml", "rb") as fh:
         project = tomllib.load(fh)["project"]
-    assert project["version"] == tfbs.__version__ == "1.0.1"
+    assert project["version"] == tfbs.__version__ == "1.0.2"
