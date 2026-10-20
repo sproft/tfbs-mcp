@@ -1,7 +1,8 @@
 """Tests for scripts/viz.py.
 
-The script depends on tangermeme, captum, and seaborn submodules that
-are heavy to install in CI. We mock them via a module-scoped fixture
+These tests run without the viz extra (tangermeme, captum, seaborn); the
+attribution code is tested with the real modules in test_viz_attribution.py.
+We mock them via a module-scoped fixture
 that installs the mocks, imports viz, then restores ``sys.modules`` so
 later test files (e.g. tests/test_mcp_tools.py) still see the real
 tangermeme implementation when they import it.
@@ -39,7 +40,7 @@ def _build_mocks():
     import torch
 
     mock_utils = types.SimpleNamespace(
-        random_one_hot=lambda shape: torch.rand(shape),
+        random_one_hot=lambda shape, **kw: torch.rand(shape),
         one_hot_encode=lambda seq: torch.nn.functional.one_hot(
             torch.tensor([0] * len(seq)), num_classes=4
         ).permute(1, 0).float()[:, : len(seq)],
@@ -76,7 +77,7 @@ def _build_mocks():
 
     mock_captum = types.ModuleType("captum")
     mock_captum_attr = types.ModuleType("captum.attr")
-    mock_captum_attr.DeepLiftShap = type("DeepLiftShap", (), {})
+    mock_captum_attr.DeepLift = type("DeepLift", (), {})
     mock_captum_attr.InputXGradient = type("InputXGradient", (), {})
 
     mock_seaborn = types.SimpleNamespace(set_style=lambda *a: None)
