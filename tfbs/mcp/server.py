@@ -6501,7 +6501,7 @@ async def tfbs_prepare_regression(
 # ---------------------------------------------------------------------------
 # Tool 24: tfbs_seqlets (motif seqlet discovery from attributions)
 # ---------------------------------------------------------------------------
-# TOMTOM always returns a closest motif, even at p = 1; only matches below
+# Tomtom always returns a closest motif, even at p = 1; only matches below
 # this p-value count as an annotation.
 _SEQLET_MOTIF_MAX_P = 0.05
 
@@ -6532,7 +6532,7 @@ async def tfbs_seqlets(
     shuffled references drawn with seed, so a repeated call returns the
     same seqlets), sums them over the four bases, and calls seqlets with
     tangermeme's recursive seqlet caller.  Optionally annotates each
-    seqlet with its best TOMTOM match in a MEME motif file (e.g. JASPAR)
+    seqlet with its best Tomtom match in a MEME motif file (e.g. JASPAR)
     and counts the matched motifs.  Warnings tangermeme raises during
     the attribution (e.g. "Convergence deltas too high", which the
     NKX2-1 VCNNBpnet models trigger) are returned under "warnings"
@@ -6569,7 +6569,7 @@ async def tfbs_seqlets(
         no seqlet is called, "note" says why (the caller found no
         significant span, or raised on flat attributions).  With
         motif_file, each returned seqlet also carries
-        motif_p_value (TOMTOM p-value of its closest motif) and motif (that
+        motif_p_value (Tomtom p-value of its closest motif) and motif (that
         motif's name when p < 0.05, else null), and top_motifs lists the 20
         motifs annotated on the most seqlets ({name, count}).  Annotation
         problems are reported in annotation_error without dropping the
@@ -6955,7 +6955,7 @@ async def tfbs_conv_filters(
         layer by max_activation, highest first.
       filters.meme: the PFMs in MEME format (one MOTIF <layer>_f<id>
         per filter with a PFM; letter-probability rows, nsites = the
-        fewest windows behind any covered column), ready for TOMTOM
+        fewest windows behind any covered column), ready for Tomtom
         against JASPAR.
       top_subsequences.json: per filter, the top_k_subsequences input
         windows with the highest activation (sequence_index, start,

@@ -393,7 +393,7 @@
    "n_shuffles": 10,
    "motif_file": "@MOTIF"
   },
-  "note": "Calls seqlets on the four sites and annotates them against @MOTIF with TOMTOM; good is a seqlets.tsv file and no annotation_error (num_seqlets may be 0 with a note)."
+  "note": "Calls seqlets on the four sites and annotates them against @MOTIF with Tomtom; good is a seqlets.tsv file and no annotation_error (num_seqlets may be 0 with a note)."
  },
  {
   "role": "tool",
