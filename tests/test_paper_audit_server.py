@@ -1,7 +1,7 @@
-"""Server behaviour that the application note and its supplement describe.
+"""Server behavior that the application note and its supplement describe.
 
 Each test pins one statement of the paper audit (A1 to A8) to the code:
-saturation mutagenesis returns the mean-centred change of all four bases;
+saturation mutagenesis returns the mean-centered change of all four bases;
 DeepLiftShap explains each sequence against seeded dinucleotide shuffles
 of itself; tfbs_epistasis takes batch_size; slurm_status tells NOT_FOUND
 from a failed lookup; tfbs_conv_filters keeps the strongest filters; the
@@ -78,7 +78,7 @@ def _env(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# A1 tfbs_mutagenesis: mean-centred changes of all four bases
+# A1 tfbs_mutagenesis: mean-centered changes of all four bases
 # ---------------------------------------------------------------------------
 
 def test_mutagenesis_scores_are_mean_centred_changes_of_all_four_bases():

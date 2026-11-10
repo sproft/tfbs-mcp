@@ -1,6 +1,6 @@
 """Load a trained model from either checkpoint format, for the server and the pipelines.
 
-Two formats are recognised by their content, not their file name:
+Two formats are recognized by their content, not their file name:
 
 * An inference checkpoint is a dict saved with ``torch.save`` that holds
   ``arch`` (a class name in ``tfbs.nn.models``), ``hyper_parameters``

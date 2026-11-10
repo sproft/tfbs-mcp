@@ -235,10 +235,10 @@ def _gradient_mode(model: torch.nn.Module):
     train mode with their inter-layer dropout set to 0; every other module (Dropout, BatchNorm)
     stays in eval mode, so attributions do not change from one call to the next and BatchNorm
     statistics are not updated.  Every module's mode and every RNN's dropout are restored
-    afterwards.  Recurrent layers are found as torch.nn.RNNBase instances, so a TorchScript-
+    afterward.  Recurrent layers are found as torch.nn.RNNBase instances, so a TorchScript-
     compiled RNN is not detected.  The rule during the pass is that of
     tfbs.mcp.server._gradient_mode, which, unlike this one, leaves the model in eval mode
-    afterwards.
+    afterward.
     """
     modes = [(m, m.training) for m in model.modules()]
     rnns = [m for m in model.modules() if isinstance(m, torch.nn.RNNBase)]

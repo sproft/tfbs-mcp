@@ -367,7 +367,7 @@ def extract_seq_pair(genome, chrom, pos, ref, alt, half_window, length=None):
 
     The window is ``length`` bases long (default 2 * half_window) and starts
     half_window bases before the variant, so an odd length such as the 11 bp
-    duplex of a crystal structure centres the variant exactly. The genome is
+    duplex of a crystal structure centers the variant exactly. The genome is
     looked up under the chromosome names of contig_candidates, so chr1 and 1
     both work. Returns (None, None) if the reference base does not match the
     genome, the window is cut short at a contig end, or it contains an

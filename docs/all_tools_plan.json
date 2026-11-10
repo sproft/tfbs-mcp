@@ -681,7 +681,7 @@
     "$ref": "45.job_id"
    }
   },
-  "note": "Checks the cancelled job; good is state CANCELLED (or a completing state seconds after the cancel)."
+  "note": "Checks the canceled job; good is state CANCELLED (or a completing state seconds after the cancel)."
  },
  {
   "role": "tool",

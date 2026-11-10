@@ -878,7 +878,7 @@ def _bigwig_interval(w_start: int, window: int, step: int) -> tuple[int, int]:
     """Interval that carries one window's value in the bigWig.
 
     bigWig entries must not overlap, so when windows overlap (step < window)
-    each value covers the step-wide bin centred on its window.
+    each value covers the step-wide bin centered on its window.
     """
     if window <= step:
         return w_start, w_start + window
@@ -1107,7 +1107,7 @@ async def tfbs_binding_scan(
     Windows start every ``step`` bp.  Each window is scored by threading
     the genomic sequence onto the structure's DNA (FoldX BuildModel) and
     running AnalyseComplex; the window's value is the lowest (most
-    favourable) interaction energy in kcal/mol over every placement of the
+    favorable) interaction energy in kcal/mol over every placement of the
     structure's DNA inside the window.  Produces a bigWig track.
 
     Args:
@@ -1162,7 +1162,7 @@ async def tfbs_binding_scan(
         their chunk boundaries); with slurm=true, also ``array_job_id``
         and ``merge_job_id``.  ``warning`` reports the FoldX run count when a
         window holds more than one placement.  When windows overlap, each
-        value covers the step-wide bigWig bin centred on its window.
+        value covers the step-wide bigWig bin centered on its window.
     """
     # --- Validate inputs -----------------------------------------------
     pdb = Path(structure_path).resolve()

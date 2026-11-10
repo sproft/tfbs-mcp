@@ -1,4 +1,4 @@
-"""Backwards-compatible shim.
+"""Backward-compatible shim.
 
 The pipeline moved into the installed package as ``tfbs.pipelines.remap_validation``,
 so the MCP tools can run it after a plain pip install

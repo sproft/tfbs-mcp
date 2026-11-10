@@ -1,7 +1,7 @@
 [
  {
   "role": "user",
-  "text": "Build an NKX2-1 classifier from the bundled thyroglobulin-promoter demo with GC-matched negatives (BPNetReal, 51 bp, train it here), then score the sites and the crystallised CAAG>CACG core mutant with the released FLANK model."
+  "text": "Build an NKX2-1 classifier from the bundled thyroglobulin-promoter demo with GC-matched negatives (BPNetReal, 51 bp, train it here), then score the sites and the crystallized CAAG>CACG core mutant with the released FLANK model."
  },
  {
   "role": "llm",

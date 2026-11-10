@@ -625,7 +625,7 @@ def test_binding_scan_default_window_is_dna_length(scan_inputs, fake_foldx, fake
 
 
 def test_binding_scan_explicit_window_scores_best_placement(scan_inputs, fake_foldx, fake_bigwig, tmp_path):
-    """An explicit window is honoured: its value is the best placement inside it."""
+    """An explicit window is honored: its value is the best placement inside it."""
     _, _, seq = scan_inputs
     result = _scan(scan_inputs, tmp_path / "out", region="chr1:200-260", window=8, step=2)
 

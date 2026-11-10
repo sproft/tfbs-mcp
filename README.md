@@ -1,6 +1,6 @@
 # tfbs-mcp
 
-tfbs-mcp lets you analyse transcription factor (TF) binding sites by asking Claude in plain language. Ask whether a variant weakens binding, train a binding-site model on your ChIP-seq peaks, see which bases a model relies on, compute the binding energy of a TF-DNA crystal structure, or test a model against ReMap peaks and ClinVar variants, head to head with motif scanning (FIMO) and structure-based energy (FoldX). Claude chooses the steps, runs them on your computer (or on a SLURM cluster) and answers with the numbers.
+tfbs-mcp lets you analyze transcription factor (TF) binding sites by asking Claude in plain language. Ask whether a variant weakens binding, train a binding-site model on your ChIP-seq peaks, see which bases a model relies on, compute the binding energy of a TF-DNA crystal structure, or test a model against ReMap peaks and ClinVar variants, head to head with motif scanning (FIMO) and structure-based energy (FoldX). Claude chooses the steps, runs them on your computer (or on a SLURM cluster) and answers with the numbers.
 
 ![What you ask, what Claude runs and what you get, for five typical questions](docs/figure1.png)
 
@@ -28,7 +28,7 @@ tfbs-mcp lets you analyse transcription factor (TF) binding sites by asking Clau
 
 **An example.** With the bundled demo registered and the released models downloaded, you type:
 
-> Load the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt (model type VCNNBpnet) and tell me whether the variant demo_chr8:830:T>G weakens NKX2-1 binding. Compare the 24 bp reference and variant windows centred on it, cut from the registered genome.
+> Load the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt (model type VCNNBpnet) and tell me whether the variant demo_chr8:830:T>G weakens NKX2-1 binding. Compare the 24 bp reference and variant windows centered on it, cut from the registered genome.
 
 Claude answers along these lines: *Yes. The predicted binding falls from 1.07 to -0.54 log2 fold change, a loss of 1.6, so binding at the variant site is predicted to be about 3 times weaker. The change turns the CAAG core of the motif (read on the minus strand) into CACG.* To get there it loaded the model, cut the reference and variant windows from the demo genome, scored both and compared them. To run this yourself: install (below), run `tfbs-mcp --setup --demo` ([details](#try-it-with-the-bundled-example)), download the released models ([link](#score-sequences-or-peaks-with-the-released-nkx2-1-models)), then paste the prompt with your models folder in place of `<models>`.
 
@@ -57,7 +57,7 @@ micromamba create -n tfbs-mcp python=3.13 -c conda-forge
 micromamba activate tfbs-mcp
 ```
 
-Your prompt now starts with `(tfbs-mcp)`, which means the environment is active. In a new terminal window, run the `micromamba activate` line again before using `pip` or `tfbs-mcp`. If `micromamba activate` instead says the shell is not initialised, run the `micromamba shell init` command it suggests, open a new terminal, and run the activate line again.
+Your prompt now starts with `(tfbs-mcp)`, which means the environment is active. In a new terminal window, run the `micromamba activate` line again before using `pip` or `tfbs-mcp`. If `micromamba activate` instead says the shell is not initialized, run the `micromamba shell init` command it suggests, open a new terminal, and run the activate line again.
 
 With venv instead (Python 3.10 to 3.13 must already be installed):
 
@@ -158,13 +158,13 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 
   Then restart Claude Code (`/exit`, then `claude`). For Claude Desktop, replace the `tfbs` entry in its config with the printed block, then quit and reopen the app. If the path was not printed, `python -c "from tfbs.mcp.cli import demo_dir; print(demo_dir())"` prints the demo folder.
 - **Say to Claude:**
-  > Extract 200 bp sequences around every peak in \<the demo_peaks.bed path> and tell me how many were extracted. Then scan GGGCTCCTCACTTGACCTTTGCTG, the centre of the second peak, for the NKX2-1 motif with FIMO.
+  > Extract 200 bp sequences around every peak in \<the demo_peaks.bed path> and tell me how many were extracted. Then scan GGGCTCCTCACTTGACCTTTGCTG, the center of the second peak, for the NKX2-1 motif with FIMO.
 - **What happens:** Claude cuts a 200 bp window around each peak from the demo genome and encodes it (`tfbs_extract_loci`), then scans the sequence with the registered motif (`tfbs_fimo`), using the MEME Suite's `fimo` program when it is installed and tangermeme's FIMO reimplementation otherwise.
 - **You get:** 4 windows in `sequences.pt`, with `regions.bed` and `scores.pt` (the motif scores from column 5 of the BED), and one FIMO hit: `CTCACTTGACCTT` on the plus strand, positions 7 to 19, p = 4e-5. It contains the NKX2-1 core `CACTTGA` and lies about 4.2 kb upstream of the thyroglobulin start. Next, download the released models and ask the [example question](#what-you-can-do) above.
 
 ### Get the data with Claude's help
 
-- **You need:** Claude Code and about 5 GB of disk. The downloads run in Claude Code's own shell, not in tfbs-mcp; Claude Desktop cannot run shell commands, so there you download the files from the links under [Registering your data](#registering-your-data). FoldX needs a licence registration, so you always download it yourself.
+- **You need:** Claude Code and about 5 GB of disk. The downloads run in Claude Code's own shell, not in tfbs-mcp; Claude Desktop cannot run shell commands, so there you download the files from the links under [Registering your data](#registering-your-data). FoldX needs a license registration, so you always download it yourself.
 - **Say to Claude:**
   > Download into <~/tfbs-data>: hg38.fa.gz from UCSC (then gunzip it); the ChIP-Atlas NKX2-1 peaks https://chip-atlas.dbcls.jp/data/hg38/assembled/Oth.ALL.10.NKX2-1.AllCell.bed (its first line is a track line, which the tools skip); the JASPAR motif https://jaspar.elixir.no/api/v1/matrix/MA1994.1.meme; the GRCh38 clinvar.vcf.gz from NCBI with its .tbi index; and the released NKX2-1 models https://zenodo.org/api/records/21399578/files/sproft/nkx2-1-tfbs-variants-v1.0.0.zip/content, unzipped. Then run `tfbs-mcp --setup --non-interactive` with `--genome`, `--motif` and `--clinvar` set to those files, replace my Claude Code registration of `tfbs` with the `claude mcp add` command it prints, and tell me where the models are.
 
@@ -189,11 +189,11 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 
 ### Score sequences or peaks with the released NKX2-1 models
 
-- **You need:** the NKX2-1 study's released checkpoints (doi:10.5281/zenodo.21399578, <https://doi.org/10.5281/zenodo.21399578>): download `nkx2-1-tfbs-variants-v1.0.0.zip` (30 MB) and unzip it, or let Claude do it (previous section). Its `models/` folder holds `core/`, `flank/` and `all/`, each with a `vcnnbpnet.pt`. They load directly with `tfbs_load_model` and model type `VCNNBpnet`, their label scaling included, and the ReMap, ClinVar and ChIP-Atlas tasks below take them as they are. The three were trained on EMSA-seq libraries of an NKX2-1 site in its thyroglobulin-promoter context that vary the 4 bp core (CORE), the 10 bp flanks (FLANK) or all 14 bp (ALL); FLANK generalises best and is the one the study recommends. Scoring peaks also needs a registered genome.
+- **You need:** the NKX2-1 study's released checkpoints (doi:10.5281/zenodo.21399578, <https://doi.org/10.5281/zenodo.21399578>): download `nkx2-1-tfbs-variants-v1.0.0.zip` (30 MB) and unzip it, or let Claude do it (previous section). Its `models/` folder holds `core/`, `flank/` and `all/`, each with a `vcnnbpnet.pt`. They load directly with `tfbs_load_model` and model type `VCNNBpnet`, their label scaling included, and the ReMap, ClinVar and ChIP-Atlas tasks below take them as they are. The three were trained on EMSA-seq libraries of an NKX2-1 site in its thyroglobulin-promoter context that vary the 4 bp core (CORE), the 10 bp flanks (FLANK) or all 14 bp (ALL); FLANK generalizes best and is the one the study recommends. Scoring peaks also needs a registered genome.
 - **Say to Claude:**
   > Load the released NKX2-1 model \<models>/flank/vcnnbpnet.pt as "flank" (model type VCNNBpnet) and score these 24 bp sequences: GGGCTCCTCACTTGACCTTTGCTG, <more 24 bp sequences>.
 
-  > Cut 24 bp windows centred on every peak in <peaks.bed> from the registered genome and score them all with the flank model.
+  > Cut 24 bp windows centered on every peak in <peaks.bed> from the registered genome and score them all with the flank model.
 
   For a model you trained, say *Load my checkpoint <path/to/best_VCNNBpnet.ckpt> as "mine" (model type VCNNBpnet)* and score with "mine".
 - **What happens:** Claude loads the model with its scaling (`tfbs_load_model`) and scores the sequences (`tfbs_predict`). For a BED it first cuts the 24 bp windows from the genome (`tfbs_extract_loci`). The models score 24 bp, the length of the library construct they were trained on (6 + 14 + 4 bp); to find the best site inside wider peaks, ask for 200 bp windows scored in sliding-window mode.
@@ -203,7 +203,7 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 
 - **You need:** a model loaded as above and a registered genome of the same build as the variant. A variant is written `chrom:pos:REF>ALT` with a 1-based position.
 - **Say to Claude:**
-  > With the flank model, score the variant demo_chr8:830:T>G: extract the 24 bp reference and alternative windows centred on it from the registered genome and compare their scores.
+  > With the flank model, score the variant demo_chr8:830:T>G: extract the 24 bp reference and alternative windows centered on it from the registered genome and compare their scores.
 - **What happens:** Claude cuts the reference window from the genome, checks that the genome base equals REF, builds the variant window, scores both and subtracts (`tfbs_extract_loci` with `variants`, `tfbs_predict` twice).
 - **You get:** two scores and their difference, with `ref_sequences.pt`, `alt_sequences.pt` and `variants.json` (window coordinates and sequences). With the demo genome this variant falls from 1.07 to -0.54, a loss of 1.6 log2 fold change. A REF that does not match the genome, usually a different genome build, is listed under `ref_mismatches` instead of being scored.
 
@@ -221,7 +221,7 @@ Each task says what you need, what to type into Claude's chat, what happens and 
 
 - **You need:** a BED of ChIP-seq peaks for your TF (ChIP-Atlas) and a registered genome. A laptop is enough for a few thousand windows (add "use at most 5000 peaks" to subsample a large file); larger sets go to a SLURM cluster.
 - **Say to Claude:**
-  > Train an NKX2-1 binding-site classifier on the ChIP-Atlas peaks in <peaks.bed>. Use 24 bp windows centred on the peaks as positives and GC-matched genomic windows from the registered reference genome as negatives. Build the train, validation and test split, write the training config for the VCNNBpnet architecture, and train it here on this computer. Report the numbers of positives and negatives, the split sizes, the validation metrics and the checkpoint.
+  > Train an NKX2-1 binding-site classifier on the ChIP-Atlas peaks in <peaks.bed>. Use 24 bp windows centered on the peaks as positives and GC-matched genomic windows from the registered reference genome as negatives. Build the train, validation and test split, write the training config for the VCNNBpnet architecture, and train it here on this computer. Report the numbers of positives and negatives, the split sizes, the validation metrics and the checkpoint.
 
   GC-matched negatives are random genome windows with the same GC content as the peaks, so the model cannot tell the classes apart by base composition alone. VCNNBpnet is the architecture of the published models. Its config uses a three-layer stack by default, because the published models' five layers can stay at a constant output on a few thousand windows; to train the published five-layer stack, add "with model_params dilations [1, 1, 2, 4, 8]" to the config request. The other architectures are listed in [docs/development.md](docs/development.md#available-model-architectures). For a cluster, replace "train it here on this computer" with "submit the training as a SLURM job on the \<partition> partition with 64 GB of memory" and follow the job as in [Run on a SLURM cluster](#run-on-a-slurm-cluster). For a model that predicts peak strength instead of yes or no, say "train a regression model on the peak signal in column 5" instead of asking for negatives.
 - **What happens:** Claude cuts the windows and draws one GC-matched negative per peak (`tfbs_extract_loci`), labels positives 1 and negatives 0 (`tfbs_prepare_classification`), splits 64/16/20 into train, validation and test (`tfbs_prepare_dataset`), writes the config (`tfbs_config`) and trains, waiting at most an hour (`tfbs_train`).
@@ -263,7 +263,7 @@ Each task says what you need, what to type into Claude's chat, what happens and 
   > Validate the released NKX2-1 FLANK model \<models>/flank/vcnnbpnet.pt (model type VCNNBpnet) against ReMap 2022: use the NKX2-1 peaks in <remap.bed> (experiment count in column 5) with dinucleotide-shuffled negatives, and compare it head to head with FIMO and FoldX using the registered motif, structure and genome, writing to \<project>/results/remap_nkx2-1. Run it directly rather than as a SLURM job, score this checkpoint and not the study's saved models, and report the ROC-AUC of each method with the numbers of positives and negatives.
 
   For a model you trained, name its `.ckpt` (e.g. <path/to/best_VCNNBpnet.ckpt>) instead.
-- **What happens:** Claude runs `tfbs_remap_validation`: up to 500 peaks seen in at least 4 experiments are the positives, shuffled copies of them (same dinucleotide content, motifs destroyed) the negatives. The network scores the best 24 bp stretch of each region, FIMO scans the region and FoldX scores its 11 bp centre. Without "run it directly" it becomes a SLURM job; Claude then reports a job ID, and later you ask it to read `summary.csv`. Add "skip FoldX" for a quick run. The network's scores are its raw outputs, for the released models in their standardized training scale; the ROC-AUC is the same in either scale.
+- **What happens:** Claude runs `tfbs_remap_validation`: up to 500 peaks seen in at least 4 experiments are the positives, shuffled copies of them (same dinucleotide content, motifs destroyed) the negatives. The network scores the best 24 bp stretch of each region, FIMO scans the region and FoldX scores its 11 bp center. Without "run it directly" it becomes a SLURM job; Claude then reports a job ID, and later you ask it to read `summary.csv`. Add "skip FoldX" for a quick run. The network's scores are its raw outputs, for the released models in their standardized training scale; the ROC-AUC is the same in either scale.
 - **You get:** `summary.csv`, two score tables and `roc_all_methods.png` in the output folder; when run directly, the reply holds the ROC-AUC of each method with the numbers of positives and negatives.
 
 ### Check ClinVar disease variants in your TF's peaks
@@ -331,7 +331,7 @@ Three more variables are optional and not asked by `--setup`; add them to the `-
 
 ## Uninstall
 
-Remove the server from Claude Code with `claude mcp remove tfbs --scope user`. For Claude Desktop, open **Settings > Developer > Edit Config**, delete the `"tfbs": {...}` entry from `"mcpServers"` (and the comma that separated it from a neighbouring entry), save, then quit and reopen the app.
+Remove the server from Claude Code with `claude mcp remove tfbs --scope user`. For Claude Desktop, open **Settings > Developer > Edit Config**, delete the `"tfbs": {...}` entry from `"mcpServers"` (and the comma that separated it from a neighboring entry), save, then quit and reopen the app.
 
 Remove the package with `pip uninstall tfbs-mcp`, or remove the whole environment instead. With micromamba, run `micromamba deactivate` first, because an active environment cannot be removed, then `micromamba env remove -n tfbs-mcp`. With venv, delete the folder: `rm -rf ~/tfbs-env`. Finally, delete the data files you downloaded (the genome, motif, ClinVar, model and PDB files) if you no longer need them. Structures fetched by `tfbs_fetch_structure` without an output folder are in `<results>/structures/<id>/`, where `<results>` is the `results_dir` that `tfbs_server_info` reports; the repaired copies that `tfbs_binding_energy` keeps are saved there too.
 

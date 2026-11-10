@@ -1642,7 +1642,7 @@ def test_a_result_hook_that_raises_still_returns_the_tool_value(monkeypatch, tmp
     monkeypatch.setenv("TFBS_CALL_LOG", str(log))
 
     def broken(result):
-        raise RuntimeError("cannot serialise")
+        raise RuntimeError("cannot serialize")
 
     monkeypatch.setattr(server, "_call_log_result", broken)
     returned = _call_via_mcp("tfbs_classify_metrics",
@@ -1651,7 +1651,7 @@ def test_a_result_hook_that_raises_still_returns_the_tool_value(monkeypatch, tmp
 
     (record,) = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert record["tool"] == "tfbs_classify_metrics"
-    assert record["result"] == {"error": "result not loggable: cannot serialise"}
+    assert record["result"] == {"error": "result not loggable: cannot serialize"}
     assert record["is_error"] is False
 
 

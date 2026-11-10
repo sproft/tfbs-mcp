@@ -36,7 +36,7 @@ FIMO_REQUIRED = (
 # report them without importing the MCP server.
 FOLDX_MISSING = "FoldX binary not found on PATH."
 FOLDX_MISSING_FIX = (
-    "Install FoldX (https://foldxsuite.crg.eu/, free academic licence), put "
+    "Install FoldX (https://foldxsuite.crg.eu/, free academic license), put "
     "'foldx' or 'foldx5' on the PATH of the MCP server process, and restart "
     "the server."
 )

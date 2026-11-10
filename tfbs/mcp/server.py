@@ -198,7 +198,7 @@ def _call_log_result(result: Any) -> tuple[Any, bool]:
     is not JSON, or {"truncated": true, "bytes": N, "head": ...} when the
     returned text exceeds CALL_LOG_MAX_RESULT_BYTES (UTF-8).  The size is
     checked on the text before it is parsed, so a large answer is never
-    parsed or serialised again just to be cut; its is_error is read from
+    parsed or serialized again just to be cut; its is_error is read from
     the head (an error answer starts with {"error": ...).
     """
     text = _call_result_text(result)
@@ -494,12 +494,12 @@ class _PipelineRun:
     def start(self, cmd: list[str], cwd: Path):
         with self.lock:
             if self.cancelled:
-                raise subprocess.SubprocessError("cancelled before it started")
+                raise subprocess.SubprocessError("canceled before it started")
             self.proc = _spawn_pipeline(cmd, cwd)
             return self.proc
 
     def cancel(self):
-        """Mark the run cancelled; the process to stop, if it has started."""
+        """Mark the run canceled; the process to stop, if it has started."""
         with self.lock:
             self.cancelled = True
             return self.proc
@@ -525,7 +525,7 @@ async def _run_pipeline(cmd: list[str], cwd: Path, timeout: int, label: str):
     """Run a pipeline in a subprocess: (CompletedProcess, None) or (None, error JSON).
 
     The process runs in a worker thread, so the server keeps answering
-    other calls meanwhile; when the MCP call is cancelled, the pipeline's
+    other calls meanwhile; when the MCP call is canceled, the pipeline's
     whole process group (process tree on Windows) is killed.
     """
     run = _PipelineRun()
@@ -1379,7 +1379,7 @@ def _load_sequence_input(
         core = suffixes[:-1] if suffixes[-1:] == [".gz"] else suffixes
         if core[-1:] == [] or core[-1] not in _FASTA_SUFFIXES:
             return None, None, _error(
-                f"Unrecognised sequence file type: {path.name}",
+                f"Unrecognized sequence file type: {path.name}",
                 "Use a .pt tensor or a FASTA file ending in .fa, .fasta, .fna "
                 "or .fas (optionally .gz).",
             )
@@ -2756,7 +2756,7 @@ async def tfbs_mutagenesis(
         JSON with "scores" (shape N x 4 x (end - start), the whole length
         by default: per sequence, for each position and each of the four
         bases the change in prediction when that base is put there (0
-        for the observed base), mean-centred across the four bases at
+        for the observed base), mean-centered across the four bases at
         each position; all four bases are kept, nothing is projected onto
         the observed base) and "shape", or with
         raw_outputs=true: "original_scores" and "mutant_scores"; always
@@ -2802,7 +2802,7 @@ async def tfbs_mutagenesis(
         _input_key(sequences, sequences_path), start, end, raw_outputs,
     )
 
-    # hypothetical=True keeps the mean-centred change of all four bases;
+    # hypothetical=True keeps the mean-centered change of all four bases;
     # tangermeme's default multiplies it by the one-hot input, which would
     # keep only the observed base's entry.
     result = saturation_mutagenesis(
@@ -2955,7 +2955,7 @@ async def tfbs_marginalize(
     if start is not None and not 0 <= start <= L - len(motif):
         return _error(
             f"start {start} does not fit the {len(motif)} bp motif into {L} bp backgrounds.",
-            f"Pass start from 0 to {L - len(motif)}, or omit it to insert at the centre.",
+            f"Pass start from 0 to {L - len(motif)}, or omit it to insert at the center.",
         )
 
     X = X.to(device)
@@ -4128,7 +4128,7 @@ async def tfbs_train(
                        least 1); the trainer runs in a process group of
                        its own, and that whole group (the process tree,
                        on Windows) is killed after that, and also when
-                       the MCP call is cancelled.
+                       the MCP call is canceled.
         cpus_per_task: CPUs the SLURM job requests (config mode,
                        #SBATCH --cpus-per-task).  Default: the config's
                        data.num_workers (the DataLoader worker processes;
@@ -5027,7 +5027,7 @@ async def tfbs_validate(
                      (results_dir in tfbs_server_info).  Jobs that may
                      run at the same time should each get their own
                      output_file (e.g. validation_<model>_<dataset>.csv)
-                     and be combined afterwards: one shared file is
+                     and be combined afterward: one shared file is
                      appended to by whichever job finishes, so a row can
                      be lost when two finish together.
         partition: SLURM partition.  Defaults to the server's
@@ -5600,7 +5600,7 @@ async def tfbs_extract_loci(
     """Extract one-hot DNA windows from a reference genome: BED peaks,
     matched negatives for them, and ref/alt windows around variants.
 
-    Peaks: reads a BED file, centres a window of in_window bp on each
+    Peaks: reads a BED file, centers a window of in_window bp on each
     peak midpoint, drops windows that leave the chromosome or contain a
     base other than A/C/G/T, one-hot encodes the rest (N, 4, in_window)
     and optionally keeps a continuous score column for regression.
@@ -5855,7 +5855,7 @@ async def tfbs_extract_loci(
 
 def _extract_bed_windows(bed, genome, chrom_lengths, in_window, max_sequences,
                          score_column, random_seed) -> dict[str, Any] | str:
-    """Windows centred on the BED intervals; an error JSON string on failure.
+    """Windows centered on the BED intervals; an error JSON string on failure.
 
     Blank lines and lines starting with #, track or browser are skipped
     (tfbs.bedio); a "#" inside a line, such as "Catalog#: ..." in column 4
@@ -6949,7 +6949,7 @@ async def tfbs_conv_filters(
     the result carries a "warning" naming that receptive field.
 
     Writes to output_dir:
-      filter_summary.json: one record per analysed filter (layer,
+      filter_summary.json: one record per analyzed filter (layer,
         filter_id, kernel_size, max_activation, num_activating,
         pfm_sites, pfm_width, in_meme), layer by layer and within a
         layer by max_activation, highest first.
@@ -6968,7 +6968,7 @@ async def tfbs_conv_filters(
                     <results>/<model_id>/tfbs_conv_filters/<digest>/,
                     with <results> the results_dir of tfbs_server_info
                     and <digest> a hash of the sequences and settings.
-        top_n_filters: Filters summarised per layer (default 50): those
+        top_n_filters: Filters summarized per layer (default 50): those
                        with the highest maximum activation over all
                        sequences and positions, so a layer with more
                        filters keeps its strongest ones, whatever their
@@ -7466,7 +7466,7 @@ async def tfbs_chipseq_benchmark(
     """Run ChIP-seq benchmark analysis comparing NN models against ChIP-Atlas data.
 
     Evaluates the NN models in three ways, on the merged peaks of each TF
-    (windows centred on the peak midpoints):
+    (windows centered on the peak midpoints):
     1. Classification against negative TFs: the positive TF's peaks
        against the peaks of each negative TF (ROC curves,
        classification_vs_negatives.csv).
@@ -7935,7 +7935,7 @@ async def tfbs_remap_validation(
     All three method families are scored on the same regions: the NN
     takes the max over nn_window-bp tiles, FIMO scans the full region
     with the supplied JASPAR motif, and FoldX scores the foldx_window-bp
-    centre of the region against the supplied TF-DNA crystal.
+    center of the region against the supplied TF-DNA crystal.
 
     This is a complement to tfbs_chipseq_method_comparison, which runs
     positive-TF-peaks vs negative-TF-peaks classification. ReMap

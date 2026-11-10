@@ -73,7 +73,7 @@ def largest_activation_per_sample(model: Module, sample: torch.Tensor) -> int:
     count; if the two passes record different numbers of tensors, the largest tensor of the
     second pass divided by 4 is used instead.  This assumes activations grow linearly with
     the batch.  Both passes run in eval mode without gradients, and every submodule's mode
-    is restored afterwards.  Returns at least 1.
+    is restored afterward.  Returns at least 1.
     """
     one = sample[:1]
     x2 = one.expand(2, *one.shape[1:]).contiguous()

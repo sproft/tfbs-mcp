@@ -9,7 +9,7 @@ parameters:
     distribution: log_uniform_values
     min: 0.00001 # FIXED: Using standard float notation (1e-5)
     max: 0.001 # FIXED: Using standard float notation (1e-3)
-  # Only lr reaches the optimiser (Adam); the RNN's dropout rates are its own
+  # Only lr reaches the optimizer (Adam); the RNN's dropout rates are its own
   # parameters below, and VCNNBpnet and BPNetReal have no dropout.
     
   # Fixed parameters passed via CLI in the SLURM script need to be included 

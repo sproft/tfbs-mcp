@@ -4,7 +4,7 @@ tfbs/configs/models/VCNNBpnet.yaml carries the NKX2-1 study's tuned
 settings (do_train_final.sh, all_mean, 24 bp) except the depth: dilations
 [1, 1, 2] instead of the study's [1, 1, 2, 4, 8].  As a classifier on small
 sets at batch size 64 the five-layer stack can stay at a constant output
-(loss ln 2, AUC 0.5); its output std at initialisation is about 1e-6,
+(loss ln 2, AUC 0.5); its output std at initialization is about 1e-6,
 that of the three-layer stack about 1e-4.  tfbs_config's
 model_params={"dilations": [1, 1, 2, 4, 8]} restores the study's stack, and
 checkpoints of that stack keep loading, because the loader rebuilds a model
