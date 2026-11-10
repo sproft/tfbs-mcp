@@ -9,7 +9,7 @@ A new row is appended under the file's header.  When a run reports a metric
 column the header lacks, the whole file is rewritten through a temporary file
 in the same directory and swapped in with os.replace, so a reader never sees a
 half-written CSV.  Neither path locks the file: concurrent jobs should write
-separate output files (one per job) and merge them afterwards, because a row
+separate output files (one per job) and merge them afterward, because a row
 another job appends during a rewrite is lost.
 
 --checkpoint_path takes a PyTorch Lightning checkpoint or an inference

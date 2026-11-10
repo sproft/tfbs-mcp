@@ -392,7 +392,7 @@ def test_sequence_file_errors_are_json(tmp_path):
         model_id="mean", sequences_path=str(bad_shape)))["error"]
     other = tmp_path / "seqs.txt"
     other.write_text("ACGT\n")
-    assert "Unrecognised" in run(server.tfbs_predict(
+    assert "Unrecognized" in run(server.tfbs_predict(
         model_id="mean", sequences_path=str(other)))["error"]
     fasta = tmp_path / "n.fasta"
     fasta.write_text(">a\nACGT\n>b\nACNT\n")

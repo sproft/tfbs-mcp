@@ -726,7 +726,7 @@ def test_developer_guide_describes_local_training_as_the_tool_does():
     assert "`best_epoch` and `epochs_run`" in guide
     assert "no CSVLogger or the run wrote no fresh `metrics.csv`" in guide
     assert "`val_auc` is null, with a note, when the validation split holds a single class" in guide
-    assert "the whole group is killed when `local_timeout` runs out or the MCP call is cancelled" in guide
+    assert "the whole group is killed when `local_timeout` runs out or the MCP call is canceled" in guide
     assert "last validation metrics" not in guide
 
 

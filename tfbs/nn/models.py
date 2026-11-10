@@ -492,7 +492,7 @@ class EquiNet(BaseModel):
         # equirc's IrrepBatchNorm registers running_sigma_{a,b} as ZEROS, and its
         # eval branch divides by them -- so a freshly built EquiNet returns NaN in
         # eval() before it has ever seen a training batch.  torch's own BatchNorm
-        # initialises running_var to ones; do the same here.  Loading a trained
+        # initializes running_var to ones; do the same here.  Loading a trained
         # checkpoint overwrites these buffers, so this only affects fresh models.
         for _bn in [self.first_bn, *self.bn_layers]:
             for _buf_name in ("running_sigma_a", "running_sigma_b"):

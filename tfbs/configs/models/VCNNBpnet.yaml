@@ -13,7 +13,7 @@
 # five-layer stack [1, 1, 2, 4, 8], which every study VCNNBpnet in
 # do_train_final.sh (all, core and flank) uses.  Trained as a classifier on
 # small sets at batch size 64, the five-layer stack can sit at a constant
-# output (loss ln 2, AUC 0.5): its output std at initialisation is about
+# output (loss ln 2, AUC 0.5): its output std at initialization is about
 # 1e-6 (about 1e-4 for three layers).  On planted-motif sets of 24 bp
 # (Adam lr 0.001) it stayed constant in 3 of 10 seeds on 2,000 sequences and
 # stayed at a loss of ln 2 (with a varying output) in 3 of 10 seeds on 3,000

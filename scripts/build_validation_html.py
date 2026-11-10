@@ -140,7 +140,7 @@ as input.
 </p>
 <p>
 For an independent test we pulled NKX2-1 ChIP-seq peaks from
-<a href="https://remap.univ-amu.fr">ReMap 2022</a>, a public catalogue of
+<a href="https://remap.univ-amu.fr">ReMap 2022</a>, a public catalog of
 uniformly reprocessed ChIP-seq experiments. NKX2-1 in ReMap 2022 has four
 experiments across three lung adenocarcinoma cell lines (NCI-H2087,
 NCI-H1819, NCI-H3122) and H9 embryonic stem cells. The non-redundant peak
@@ -225,7 +225,7 @@ full operating-point range.
 {img(s2_shuffle / 'roc_all_methods.png')}
 <p>
 The score >= 2 set has five times the sample size and the conclusion is
-the same. The smaller score >= 4 set was not a small-sample artefact.
+the same. The smaller score >= 4 set was not a small-sample artifact.
 </p>
 
 <h2>Same comparison against random genomic regions instead of shuffles</h2>
@@ -245,7 +245,7 @@ NKX2-1 binding sites in the chr14 NKX2-1 TAD to the public AlphaFold 3
 server. For each site, AlphaFold 3 predicts a 3D structure of full-length
 NKX2-1 (371 aa) bound to the 30 bp DNA from that site, and reports
 several confidence metrics. The most relevant for protein-DNA binding is
-<strong>iptm</strong> (interface predicted Template Modelling score):
+<strong>iptm</strong> (interface predicted Template Modeling score):
 values above 0.6 indicate the model is confident in the protein-DNA
 interface; values above 0.7 are interpreted as high confidence in the
 literature.

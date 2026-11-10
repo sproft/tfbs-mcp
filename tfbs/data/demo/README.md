@@ -5,7 +5,7 @@ Three small files so that a fresh install can try the data tools without downloa
 | File | What it is |
 |---|---|
 | `demo_genome.fa` and `demo_genome.fa.fai` | one record, `demo_chr8`: 10,001 bp of human chromosome 8 around the thyroglobulin (TG) promoter, with its pyfaidx index |
-| `demo_peaks.bed` | four 200 bp intervals centred on the strongest NKX2-1 motif matches in that slice |
+| `demo_peaks.bed` | four 200 bp intervals centered on the strongest NKX2-1 motif matches in that slice |
 | `MA1994.1.meme` | the JASPAR NKX2-1 motif in MEME format |
 
 ## Provenance
@@ -13,7 +13,7 @@ Three small files so that a fresh install can try the data tools without downloa
 - Assembly: GRCh38.p14, RefSeq accession GCF_000001405.40, downloaded from NCBI Datasets (<https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000001405.40/>).
 - Region: record `NC_000008.11` (chromosome 8), positions 132,861,953 to 132,871,953, 1-based and inclusive. The record was renamed `demo_chr8`; the sequence is unchanged (uppercase).
 - Landmark: the TG transcription start (Ensembl gene ENSG00000042832, plus strand, GRCh38 start 132,866,953) is at position 5,001 of the slice, so positions 1 to 5,000 are upstream of the gene.
-- Peaks: every 13 bp window on both strands was scored with log2-odds from the MA1994.1 letter-probability matrix against the background frequencies in the same file (pseudocount 0.01). The four highest non-overlapping hits at least 101 bp from either end were kept, and each became a 200 bp interval centred on the hit. Coordinates are relative to the slice, 0-based and half-open, as `tfbs_extract_loci` expects. Columns: chrom, start, end, name, log-odds score, strand of the hit.
+- Peaks: every 13 bp window on both strands was scored with log2-odds from the MA1994.1 letter-probability matrix against the background frequencies in the same file (pseudocount 0.01). The four highest non-overlapping hits at least 101 bp from either end were kept, and each became a 200 bp interval centered on the hit. Coordinates are relative to the slice, 0-based and half-open, as `tfbs_extract_loci` expects. Columns: chrom, start, end, name, log-odds score, strand of the hit.
 
 | Hit | Slice position (1-based) | Strand | Matching sequence on that strand | Log-odds |
 |---|---|---|---|---|

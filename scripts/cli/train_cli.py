@@ -1,4 +1,4 @@
-"""Backwards-compatible shim.
+"""Backward-compatible shim.
 
 The training CLI moved into the installed package at ``tfbs.cli.train_cli`` so the
 ``tfbs-train`` console script resolves from a pip-installed wheel (the repo-local

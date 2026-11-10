@@ -119,7 +119,7 @@ def main() -> None:
         if stale.exists():
             stale.unlink()
     Fasta(str(fa_path))  # writes demo_genome.fa.fai next to the file
-    # pyfaidx writes the index in text mode, so normalise it to LF as well.
+    # pyfaidx writes the index in text mode, so normalize it to LF as well.
     fai_path = Path(str(fa_path) + ".fai")
     fai_path.write_bytes(fai_path.read_bytes().replace(b"\r\n", b"\n"))
 
